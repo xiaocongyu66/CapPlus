@@ -404,6 +404,7 @@ async fn challenge_inner(
         });
         seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
         let token = jwt_sign(&payload, &key.jwt_secret);
+        remember_challenge_env(&st, &token, &headers, &addr).await;
         return Json(json!({
             "token": token,
             "format": 2,
@@ -491,6 +492,7 @@ async fn challenge_inner(
     });
     seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
     let token = jwt_sign(&payload, &key.jwt_secret);
+    remember_challenge_env(&st, &token, &headers, &addr).await;
     Json(json!({
         "challenge": {"c": params.c, "s": params.s, "d": params.d},
         "token": token,
@@ -533,6 +535,13 @@ async fn redeem(
             .into_response();
     };
     // v1 solutions are bare integers; v2 solutions are objects per challenge.
+    if sols.len() > 4096 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid solutions"})),
+        )
+            .into_response();
+    }
     let solutions_raw: Vec<Value> = sols.clone();
 
     let key = match st.store.key(&site_key).await {
@@ -558,6 +567,19 @@ async fn redeem(
     };
     if claims.get("sk").and_then(Value::as_str) != Some(site_key.as_str()) {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "scope_mismatch"}))).into_response();
+    }
+    if let Err(reason) =
+        check_challenge_env(&st, token, &headers, &addr, key.config.require_session_bind).await
+    {
+        let _ = st
+            .kv
+            .hincrby(
+                &format!("metrics:failed:{site_key}"),
+                &hourly_bucket(now_ms()).to_string(),
+                1,
+            )
+            .await;
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": reason }))).into_response();
     }
     if let Err(reason) = check_integrity(&claims, &payload, &key.jwt_secret) {
         let _ = st
@@ -778,6 +800,7 @@ async fn redeem(
         )
             .into_response();
     }
+    let _ = st.kv.del(&format!("chalenv:{token}")).await;
     eprintln!("[redeem] site={site_key} issued token (verified)");
     let _ = st
         .store
@@ -1252,6 +1275,70 @@ fn parse_ua(ua: &str) -> (Option<&'static str>, Option<&'static str>) {
         None
     };
     (platform, os)
+}
+
+/// Record the UA/IP/host that asked for the challenge so redeem can reject a
+/// solve submitted from a different environment (`session_env_changed`).
+async fn remember_challenge_env(
+    st: &AppState,
+    token: &str,
+    headers: &HeaderMap,
+    addr: &SocketAddr,
+) {
+    let ua = header_str(headers, "user-agent");
+    let ip = client_ip(headers, &addr.ip().to_string());
+    let origin = header_str(headers, "origin");
+    let host = if origin.is_empty() {
+        header_str(headers, "referer")
+    } else {
+        origin
+    };
+    let doc = json!({
+        "ua": cap_core::sha256_hex(&ua)[..32].to_string(),
+        "ip": if ip.is_empty() { Value::Null } else { json!(ip) },
+        "host": if host.is_empty() { Value::Null } else { json!(host) },
+    });
+    let _ = st
+        .kv
+        .set_ex(
+            &format!("chalenv:{token}"),
+            &doc.to_string(),
+            CHALLENGE_TTL_MS / 1000,
+        )
+        .await;
+}
+
+/// Reject a redeem whose UA (or, with session binding, IP) differs from the
+/// challenge request.
+async fn check_challenge_env(
+    st: &AppState,
+    token: &str,
+    headers: &HeaderMap,
+    addr: &SocketAddr,
+    require_ip: bool,
+) -> Result<(), String> {
+    let Ok(Some(raw)) = st.kv.get(&format!("chalenv:{token}")).await else {
+        return Ok(());
+    };
+    let Ok(env) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(());
+    };
+    let ua = header_str(headers, "user-agent");
+    let ua_now = cap_core::sha256_hex(&ua)[..32].to_string();
+    if let Some(want) = env.get("ua").and_then(Value::as_str) {
+        if !want.is_empty() && want != ua_now {
+            return Err("session_env_changed".into());
+        }
+    }
+    if require_ip {
+        let ip_now = client_ip(headers, &addr.ip().to_string());
+        if let Some(want) = env.get("ip").and_then(Value::as_str) {
+            if !want.is_empty() && !ip_now.is_empty() && want != ip_now {
+                return Err("session_env_changed".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The operator's asset baseline (`settings:integrity`), or `None` when no
