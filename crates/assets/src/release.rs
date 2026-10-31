@@ -63,6 +63,29 @@ pub struct ServedFile {
     pub content_type: &'static str,
 }
 
+/// Defence in depth: even though `zip::read_zip` sanitises names, a release
+/// store must never build a path from archive input without checking it.
+fn safe_rel(name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty() || name.contains('\0') || name.contains('\\') {
+        return None;
+    }
+    let p = std::path::Path::new(name);
+    if p.is_absolute() {
+        return None;
+    }
+    if p.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(p.to_path_buf())
+}
+
 /// Files of the active release, ready to serve.
 #[derive(Debug, Default)]
 struct ActiveFiles {
@@ -166,10 +189,13 @@ impl ReleaseStore {
                 );
             }
         }
-        let entry = files
-            .keys()
-            .find(|k| matches!(k.as_str(), "widget.js" | "cap.min.js"))
-            .cloned();
+        let entry = if files.contains_key("widget.js") {
+            Some("widget.js".to_string())
+        } else if files.contains_key("cap.min.js") {
+            Some("cap.min.js".to_string())
+        } else {
+            None
+        };
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
         *active = ActiveFiles { id, files };
         if let Some(entry) = entry {
@@ -224,7 +250,10 @@ impl ReleaseStore {
         let mut entry = None;
 
         for item in entries {
-            let raw_path = raw_dir.join(&item.name);
+            let Some(rel) = safe_rel(&item.name) else {
+                return Err(format!("unsafe archive entry: {}", item.name));
+            };
+            let raw_path = raw_dir.join(&rel);
             if let Some(parent) = raw_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -234,7 +263,7 @@ impl ReleaseStore {
             if is_protected(&served) && !is_protected(&item.data) {
                 protected += 1;
             }
-            let dist_path = dist_dir.join(&item.name);
+            let dist_path = dist_dir.join(&rel);
             if let Some(parent) = dist_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -242,7 +271,7 @@ impl ReleaseStore {
 
             files += 1;
             bytes += served.len();
-            if matches!(item.name.as_str(), "widget.js" | "cap.min.js") {
+            if item.name == "widget.js" || (entry.is_none() && item.name == "cap.min.js") {
                 entry = Some(item.name.clone());
             }
         }
@@ -264,7 +293,6 @@ impl ReleaseStore {
         )
         .map_err(|e| e.to_string())?;
 
-        let meta = ReleaseMeta { builtin: false, ..meta };
         // An upload is meant to go live; the previous release stays on disk
         // for rollback.
         self.activate(&id)?;
@@ -303,29 +331,36 @@ impl ReleaseStore {
 
         let entries = read_zip(archive).map_err(|e: ZipError| e.0)?;
         let (raw_dir, dist_dir) = (dir.join("raw"), dir.join("dist"));
+        // A new bundle must not inherit files from the previous one (a removed
+        // debug.js or old wasm would otherwise keep being served).
+        let _ = std::fs::remove_dir_all(&raw_dir);
+        let _ = std::fs::remove_dir_all(&dist_dir);
         std::fs::create_dir_all(&raw_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&dist_dir).map_err(|e| e.to_string())?;
         std::fs::write(dir.join("source.zip"), archive).map_err(|e| e.to_string())?;
 
         let (mut files, mut bytes, mut protected, mut entry) = (0usize, 0usize, 0usize, None);
         for item in entries {
-            if let Some(parent) = raw_dir.join(&item.name).parent() {
+            let Some(rel) = safe_rel(&item.name) else {
+                return Err(format!("unsafe archive entry: {}", item.name));
+            };
+            if let Some(parent) = raw_dir.join(&rel).parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            std::fs::write(raw_dir.join(&item.name), &item.data).map_err(|e| e.to_string())?;
+            std::fs::write(raw_dir.join(&rel), &item.data).map_err(|e| e.to_string())?;
 
             let served = protect_js(&item.name, &item.data);
             if is_protected(&served) && !is_protected(&item.data) {
                 protected += 1;
             }
-            if let Some(parent) = dist_dir.join(&item.name).parent() {
+            if let Some(parent) = dist_dir.join(&rel).parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            std::fs::write(dist_dir.join(&item.name), &served).map_err(|e| e.to_string())?;
+            std::fs::write(dist_dir.join(&rel), &served).map_err(|e| e.to_string())?;
 
             files += 1;
             bytes += served.len();
-            if matches!(item.name.as_str(), "widget.js" | "cap.min.js") {
+            if item.name == "widget.js" || (entry.is_none() && item.name == "cap.min.js") {
                 entry = Some(item.name.clone());
             }
         }

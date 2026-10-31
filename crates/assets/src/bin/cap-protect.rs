@@ -24,10 +24,20 @@ fn main() -> ExitCode {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-o" | "--out" => out = args.next().map(PathBuf::from),
+            "-o" | "--out" => match args.next() {
+                Some(v) => out = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("-o requires an output directory");
+                    return ExitCode::FAILURE;
+                }
+            },
             "-h" | "--help" => {
                 print_help();
                 return ExitCode::SUCCESS;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown option: {other} (try --help)");
+                return ExitCode::FAILURE;
             }
             other => {
                 if input.is_none() {
@@ -44,22 +54,34 @@ fn main() -> ExitCode {
         print_help();
         return ExitCode::FAILURE;
     };
+    if !input.is_dir() {
+        let name = input
+            .file_name()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !(name.ends_with(".js") || name.ends_with(".mjs")) {
+            eprintln!("{name}: only .js and .mjs files can be protected");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let target = out.unwrap_or_else(|| {
         if input.is_dir() {
             PathBuf::from("protected")
         } else {
-            let stem = input
-                .file_stem()
+            // Keep the extension: `foo.mjs` must not become `foo.js`.
+            let file_name = input
+                .file_name()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "bundle".into());
-            input.with_file_name(format!("{stem}.protected.js"))
+                .unwrap_or_else(|| "bundle.js".into());
+            input.with_file_name(format!("{file_name}.protected"))
         }
     });
 
     match run(&input, &target) {
-        Ok((js, other, esm)) => {
+        Ok((js, other, unchanged)) => {
             println!(
-                "protected {js} JS file(s), copied {other} other file(s), left {esm} ES module(s) unchanged"
+                "protected {js} JS file(s), copied {other} other file(s), {unchanged} unchanged (already protected, module, or non-JS)"
             );
             println!("output: {}", target.display());
             ExitCode::SUCCESS
@@ -72,7 +94,7 @@ fn main() -> ExitCode {
 }
 
 fn print_help() {
-    eprintln!(
+    println!(
         "cap-protect — protect a widget build\n\n\
          usage: cap-protect <input-file-or-dir> [-o <output-dir>]\n\n\
          .js/.mjs files are obfuscated + RC4-encrypted; wasm/css/images are copied;\n\
@@ -95,9 +117,14 @@ fn run(input: &Path, target: &Path) -> Result<(usize, usize, usize), String> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let protected = cap_assets::protect_js(&name, &data);
-        std::fs::write(target, &protected).map_err(|e| e.to_string())?;
-        Ok((1, 0, 0))
+        let served = cap_assets::protect_js(&name, &data);
+        std::fs::write(target, &served).map_err(|e| e.to_string())?;
+        if served == data {
+            // Unchanged: already protected, a module, or empty.
+            Ok((0, 0, 1))
+        } else {
+            Ok((1, 0, 0))
+        }
     }
 }
 

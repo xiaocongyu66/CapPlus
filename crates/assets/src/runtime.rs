@@ -2,9 +2,12 @@
 //!
 //! Mirrors the JS server: refresh once at startup, then every `interval`
 //! (default 24h) — or sooner when the versions stored in the Redis key
-//! `asset:cache-config` change. Env config is re-read on every tick so a
-//! restart is not needed to pick up new `WIDGET_VERSION` / `WASM_VERSION`
-//! values, matching how the JS server recomputes its config each run.
+//! `asset:cache-config` change.
+//!
+//! The local `WIDGET_VERSION` / `WASM_VERSION` environment values are captured
+//! once, when this task is spawned: changing them requires a restart. Only the
+//! *remote* version record is re-read, which is what lets an instance pick up a
+//! version bump published by another instance.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,10 +70,39 @@ pub fn spawn_refresher(
         interval
     };
     tokio::spawn(async move {
-        let mut last_refresh_ms: u64 = 0;
+        // Start from the cache's own timestamp so a synchronous initial
+        // refresh is not immediately repeated by this loop.
+        let mut last_refresh_ms: u64 = cache.last_update_ms();
+        let mut conn: Option<redis::aio::MultiplexedConnection> = None;
+        let mut last_err_log_ms: u64 = 0;
+
         loop {
             let changed = match &redis_url {
-                Some(url) => versions_changed(url, &cfg).await,
+                Some(url) => {
+                    if conn.is_none() {
+                        conn = connect(url).await;
+                    }
+                    match conn.as_mut() {
+                        Some(c) => match read_remote_config(c).await {
+                            Ok(Some(doc)) => versions_differ(&doc, &cfg),
+                            Ok(None) => true,
+                            Err(err) => {
+                                // Drop the connection so the next tick retries;
+                                // log at most every 10 minutes.
+                                conn = None;
+                                let now = now_ms();
+                                if now.saturating_sub(last_err_log_ms) >= 600_000 {
+                                    eprintln!(
+                                        "📦 [asset server] could not read {CACHE_CONFIG_KEY}: {err}"
+                                    );
+                                    last_err_log_ms = now;
+                                }
+                                false
+                            }
+                        },
+                        None => false,
+                    }
+                }
                 None => false,
             };
             let due = last_refresh_ms == 0
@@ -101,8 +133,13 @@ pub fn spawn_refresher(
                         );
                         if updated > 0 {
                             last_refresh_ms = now_ms();
-                            if let Some(url) = &redis_url {
-                                persist_config(url, &cfg).await;
+                            if conn.is_none() {
+                                if let Some(url) = &redis_url {
+                                    conn = connect(url).await;
+                                }
+                            }
+                            if let Some(c) = conn.as_mut() {
+                                persist_config(c, &cfg).await;
                             }
                         }
                     }
@@ -112,32 +149,39 @@ pub fn spawn_refresher(
                 }
             }
 
-            tokio::time::sleep(interval.min(CONFIG_POLL)).await;
+            let sleep_for = if redis_url.is_some() {
+                interval.min(CONFIG_POLL)
+            } else {
+                interval
+            };
+            tokio::time::sleep(sleep_for).await;
         }
     })
 }
 
-async fn versions_changed(redis_url: &str, cfg: &AssetConfig) -> bool {
-    match read_remote_config(redis_url).await {
-        Ok(Some(doc)) => versions_differ(&doc, cfg),
-        Ok(None) => true, // nothing recorded yet -> refresh
+async fn connect(redis_url: &str) -> Option<redis::aio::MultiplexedConnection> {
+    let client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
         Err(err) => {
-            // Redis unavailable: fall back to interval-based refreshes.
-            eprintln!("📦 [asset server] could not read {CACHE_CONFIG_KEY}: {err}");
-            false
+            eprintln!("📦 [asset server] invalid redis url: {err}");
+            return None;
+        }
+    };
+    match client.get_multiplexed_async_connection().await {
+        Ok(c) => Some(c),
+        Err(err) => {
+            eprintln!("📦 [asset server] redis connect failed: {err}");
+            None
         }
     }
 }
 
-async fn read_remote_config(redis_url: &str) -> Result<Option<CacheConfigDoc>, String> {
-    let client = redis::Client::open(redis_url).map_err(|e| e.to_string())?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|e| e.to_string())?;
+async fn read_remote_config(
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> Result<Option<CacheConfigDoc>, String> {
     let raw: Option<String> = redis::cmd("GET")
         .arg(CACHE_CONFIG_KEY)
-        .query_async(&mut conn)
+        .query_async(conn)
         .await
         .map_err(|e| e.to_string())?;
     match raw {
@@ -148,7 +192,10 @@ async fn read_remote_config(redis_url: &str) -> Result<Option<CacheConfigDoc>, S
     }
 }
 
-async fn persist_config(redis_url: &str, cfg: &AssetConfig) {
+async fn persist_config(
+    conn: &mut redis::aio::MultiplexedConnection,
+    cfg: &AssetConfig,
+) {
     let doc = CacheConfigDoc {
         last_update: now_ms(),
         versions: VersionPair {
@@ -163,24 +210,10 @@ async fn persist_config(redis_url: &str, cfg: &AssetConfig) {
             return;
         }
     };
-    let client = match redis::Client::open(redis_url) {
-        Ok(client) => client,
-        Err(err) => {
-            eprintln!("📦 [asset server] invalid redis url: {err}");
-            return;
-        }
-    };
-    let mut conn = match client.get_multiplexed_async_connection().await {
-        Ok(conn) => conn,
-        Err(err) => {
-            eprintln!("📦 [asset server] could not connect to redis: {err}");
-            return;
-        }
-    };
     let result: redis::RedisResult<()> = redis::cmd("SET")
         .arg(CACHE_CONFIG_KEY)
         .arg(json)
-        .query_async(&mut conn)
+        .query_async(conn)
         .await;
     if let Err(err) = result {
         eprintln!("📦 [asset server] could not persist {CACHE_CONFIG_KEY}: {err}");

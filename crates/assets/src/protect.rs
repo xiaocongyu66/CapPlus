@@ -86,7 +86,7 @@ pub fn is_protected(src: &[u8]) -> bool {
 
 /// Protect a JS file. Non-JS or already-protected input is returned unchanged.
 pub fn protect_js(name: &str, src: &[u8]) -> Vec<u8> {
-    if !is_js(name) || is_protected(src) {
+    if is_module(name) || !is_js(name) || is_protected(src) {
         return src.to_vec();
     }
     // ES modules cannot run inside `new Function` (`import.meta` is a syntax
@@ -133,8 +133,14 @@ fn looks_like_esm(src: &[u8]) -> bool {
 }
 
 fn is_js(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".js") || lower.ends_with(".mjs")
+    name.to_ascii_lowercase().ends_with(".js")
+}
+
+/// `.mjs` is always a module: wrapping it in `new Function` would silently
+/// change strictness, binding scope and `this`, and a module without a top-level
+/// `import`/`export` would look like a script. Never protect it.
+fn is_module(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".mjs")
 }
 
 fn random_key() -> String {

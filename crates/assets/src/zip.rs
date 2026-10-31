@@ -47,6 +47,9 @@ const SIG_EOCD64: u32 = 0x0606_4b50;
 /// Normalise separators, drop empty/`.` segments and reject anything that
 /// escapes the release directory.
 pub fn sanitize_path(name: &str) -> Option<String> {
+    if name.contains('\0') || name.contains(':') {
+        return None;
+    }
     let name = name.replace('\\', "/");
     let mut parts: Vec<&str> = Vec::new();
     for seg in name.split('/') {
@@ -61,7 +64,7 @@ pub fn sanitize_path(name: &str) -> Option<String> {
     }
     let joined = parts.join("/");
     // Directory entries end with '/'; callers skip those.
-    (!joined.starts_with('/') && !joined.contains(':')).then_some(joined)
+    (!joined.starts_with('/')).then_some(joined)
 }
 
 /// A file extracted from the archive. `name` is already sanitised.
@@ -269,6 +272,8 @@ mod tests {
 
     #[test]
     fn sanitize_paths() {
+        assert_eq!(sanitize_path("a\0b.js"), None);
+        assert_eq!(sanitize_path("C:/x.js"), None);
         assert_eq!(sanitize_path("./js/a.js").as_deref(), Some("js/a.js"));
         assert_eq!(sanitize_path("public/js/a.js").as_deref(), Some("public/js/a.js"));
         assert_eq!(sanitize_path("../a.js"), None);
