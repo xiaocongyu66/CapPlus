@@ -44,6 +44,9 @@ pub struct ReleaseMeta {
     /// Bundled with the binary; cannot be deleted.
     #[serde(default)]
     pub builtin: bool,
+    /// Fingerprint of the bundled payload, so an upgrade re-publishes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build_id: String,
     /// Public URL of the widget entry point, when one is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
@@ -209,6 +212,7 @@ impl ReleaseStore {
             protected,
             active: false,
             builtin: false,
+            build_id: String::new(),
             entry,
         };
         std::fs::write(
@@ -227,9 +231,14 @@ impl ReleaseStore {
     /// Publish the bundle compiled into the binary. Idempotent: an existing
     /// builtin release is left untouched (so a user's rollback target keeps
     /// its files), and it becomes active only when nothing else is.
-    pub fn publish_builtin(&self, archive: &[u8]) -> Result<ReleaseMeta, String> {
+    pub fn publish_builtin(&self, archive: &[u8], build_id: &str) -> Result<ReleaseMeta, String> {
         let dir = self.release_dir(BUILTIN_ID);
-        if dir.join("dist").is_dir() {
+        let up_to_date = std::fs::read_to_string(dir.join(META_FILE))
+            .ok()
+            .and_then(|s| serde_json::from_str::<ReleaseMeta>(&s).ok())
+            .map(|m| m.build_id == build_id)
+            .unwrap_or(false);
+        if dir.join("dist").is_dir() && up_to_date {
             let mut meta = self
                 .list()
                 .into_iter()
@@ -242,6 +251,7 @@ impl ReleaseStore {
                     protected: 0,
                     active: false,
                     builtin: true,
+                    build_id: String::new(),
                     entry: None,
                 });
             meta.active = self.active_id().as_deref() == Some(BUILTIN_ID);
@@ -285,6 +295,7 @@ impl ReleaseStore {
             protected,
             active: false,
             builtin: true,
+            build_id: build_id.to_string(),
             entry,
         };
         std::fs::write(
@@ -325,6 +336,7 @@ impl ReleaseStore {
                     protected: 0,
                     active: false,
                     builtin: id == BUILTIN_ID,
+                    build_id: String::new(),
                     entry: None,
                 });
             meta.active = active.as_deref() == Some(id.as_str());

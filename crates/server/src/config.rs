@@ -139,6 +139,9 @@ static DASHBOARD_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dashboar
 /// The default widget bundle (widget.js + wasm), published on first start.
 pub static WIDGET_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/widget.zip"));
 
+/// Content fingerprint of the compiled-in widget bundle.
+pub static WIDGET_ID: &str = include_str!(concat!(env!("OUT_DIR"), "/widget-id.txt"));
+
 /// The prebuilt widget bundle, ready for [`cap_assets::ReleaseStore::publish_builtin`].
 pub fn builtin_widget_zip() -> Vec<u8> {
     WIDGET_ZIP.to_vec()

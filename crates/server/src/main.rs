@@ -2545,7 +2545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Ship the compiled-in widget as the default release, so a fresh install
     // serves /assets/* locally instead of depending on the CDN.
-    match releases.publish_builtin(&config::builtin_widget_zip()) {
+    match releases.publish_builtin(&config::builtin_widget_zip(), config::WIDGET_ID.trim()) {
         Ok(meta) => eprintln!(
             "[cap] built-in widget release: {} file(s), {} protected, active={}",
             meta.files, meta.protected, meta.active

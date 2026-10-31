@@ -80,6 +80,23 @@ The widget and dashboard come from the upstream Cap project (Apache-2.0, see `LI
 Build the widget with `cd widget-source && bun install && bun run build`, then zip
 `widget-source/src/*.js` + `*.wasm` and publish it from **Settings → Front-end**.
 
+## Building the protected widget
+
+`bun run build` only applies the upstream obfuscator. Anything served directly
+(CDN, another host) must also go through the protector, or the bundle ships
+without the encryption shell and the hidden notice:
+
+```bash
+cd widget-source && bun run build && cd ..
+cargo run --release -p cap-assets --bin cap-protect -- widget-source/src -o widget-dist
+# protected N JS file(s), copied M other file(s), left E ES module(s) unchanged
+```
+
+`cap-protect` obfuscates + RC4-encrypts `.js`/`.mjs`, copies wasm/css/images,
+and leaves ES modules (`import.meta`) untouched so the wasm-bindgen glue keeps
+working. Publishing a zip through the dashboard or `POST /server/releases`
+applies the same transform server-side, so that path is always protected.
+
 ## Front-end releases (zip upload + auto protection)
 
 Settings → **Front-end** in the dashboard uploads a zip of the verification

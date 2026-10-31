@@ -113,7 +113,7 @@ fn try_build_widget(manifest: &Path) -> bool {
     matches!(status, Ok(s) if s.success())
 }
 
-fn bundle(name: &str, dir: &Path, out_dir: &Path) {
+fn bundle(name: &str, dir: &Path, out_dir: &Path) -> u64 {
     let mut files = Vec::new();
     collect(dir, dir, &mut files);
     if files.is_empty() {
@@ -123,6 +123,17 @@ fn bundle(name: &str, dir: &Path, out_dir: &Path) {
         );
     }
     write_stored_zip(&files, &out_dir.join(format!("{name}.zip"))).expect("write zip");
+    // FNV-1a over sorted (name, bytes) so an upgrade can tell whether the
+    // bundle changed and must be re-published (and re-encrypted).
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (name, data) in &files {
+        for b in name.as_bytes().iter().chain(data.iter()) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
 }
 
 fn main() {
@@ -150,5 +161,7 @@ fn main() {
     };
     println!("cargo:warning=widget bundle: {}", dist.display());
     println!("cargo:rerun-if-changed={}", dist.display());
-    bundle("widget", &dist, &out_dir);
+    let widget_hash = bundle("widget", &dist, &out_dir);
+    std::fs::write(out_dir.join("widget-id.txt"), format!("{widget_hash:016x}"))
+        .expect("write widget-id.txt");
 }
