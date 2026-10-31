@@ -51,6 +51,19 @@ default `redis://127.0.0.1:6379`).
 
 See `MIGRATION.md` for the Bun → Rust cutover runbook (shared Redis, per-key rollout, rollback).
 
+## Source layout
+
+| path | contents |
+|---|---|
+| `crates/` | Rust server, admin API, detection, storage, assets |
+| `frontend/` | admin dashboard (`cap/standalone/public`) — served by the Rust server and embedded in the binary |
+| `widget-source/` | the verification widget sources (`cap.js`, `worker.js`, `cap.css`, i18n, floating widget) plus its build script and tests |
+| `wasm-source/` | the `cap_wasm` / `hashwx` WASM crate and its browser/node build outputs |
+
+The widget and dashboard come from the upstream Cap project (Apache-2.0, see `LICENSE`).
+Build the widget with `cd widget-source && bun install && bun run build`, then zip
+`widget-source/src/*.js` + `*.wasm` and publish it from **Settings → Front-end**.
+
 ## Front-end releases (zip upload + auto protection)
 
 Settings → **Front-end** in the dashboard uploads a zip of the verification

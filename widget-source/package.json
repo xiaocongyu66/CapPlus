@@ -1,0 +1,20 @@
+{
+  "name": "widget",
+  "private": true,
+  "scripts": {
+    "test": "bun test test/unit.test.js && bun test test/e2e.test.js && bun test test/e2e-instrumentation.test.js && bun test test/e2e-regression.test.js && bun test test/e2e-worker.test.js && bun test test/e2e-hashwx.test.js",
+    "test:unit": "bun test test/unit.test.js",
+    "test:e2e": "bun test test/e2e.test.js && bun test test/e2e-instrumentation.test.js && bun test test/e2e-regression.test.js && bun test test/e2e-worker.test.js && bun test test/e2e-hashwx.test.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "javascript-obfuscator": "4.2.2",
+    "lightningcss": "1.33.0",
+    "playwright": "1.64.1",
+    "terser": "5.51.2"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
