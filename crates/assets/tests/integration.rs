@@ -114,7 +114,7 @@ fn cache_get_set_len_remove() {
 
     cache.set("widget.js", b"console.log(1)".to_vec());
     let (bytes, ctype) = cache.get("widget.js").expect("cached");
-    assert_eq!(bytes, b"console.log(1)");
+    assert_eq!(&bytes[..], b"console.log(1)");
     assert_eq!(ctype, "application/javascript");
 
     cache.set("cap_wasm_bg.wasm", vec![0, 1, 2, 3]);
@@ -147,7 +147,7 @@ fn refresh_success_populates_every_asset() {
     assert_eq!(cache.len(), 4);
 
     let (widget, ctype) = cache.get("widget.js").unwrap();
-    assert_eq!(widget, b"/* fake widget.js */");
+    assert_eq!(&widget[..], b"/* fake widget.js */");
     assert_eq!(ctype, "application/javascript");
     assert_eq!(cache.versions(), Some(("1.2.3".to_string(), "0.4.5".to_string())));
     assert!(cache.last_update_ms() > 0);
@@ -217,5 +217,5 @@ fn refresh_keeps_previous_body_when_a_later_fetch_fails() {
     let (updated, errors) = refresh_with_config(&cache, &cfg, &fake(bodies));
     assert_eq!(updated, 3);
     assert_eq!(errors.len(), 1);
-    assert_eq!(cache.get("widget.js").unwrap().0, b"/* fake widget.js */");
+    assert_eq!(&cache.get("widget.js").unwrap().0[..], b"/* fake widget.js */");
 }

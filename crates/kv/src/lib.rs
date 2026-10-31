@@ -118,6 +118,36 @@ impl Kv {
         self.query(redis::cmd("INCR").arg(key).clone()).await
     }
 
+    /// `INCR` + `EXPIRE` in a single round trip (fixed window: the TTL is set
+    /// only when the counter is created).
+    pub async fn incr_with_expire(&self, key: &str, secs: i64) -> KvResult<i64> {
+        let mut conn = self.conn.clone();
+        redis::Script::new(
+            "local c = redis.call('INCR', KEYS[1]) \
+             if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end \
+             return c",
+        )
+        .key(key)
+        .arg(secs.max(1))
+        .invoke_async(&mut conn)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Several `HINCRBY`s in one pipeline round trip.
+    pub async fn hincrby_many(&self, items: &[(String, String, i64)]) -> KvResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut pipe = redis::pipe();
+        for (name, field, by) in items {
+            pipe.cmd("HINCRBY").arg(name).arg(field).arg(*by).ignore();
+        }
+        let mut conn = self.conn.clone();
+        pipe.query_async::<()>(&mut conn).await?;
+        Ok(())
+    }
+
     /// `EXPIRE key secs`.
     pub async fn expire(&self, key: &str, secs: i64) -> KvResult<()> {
         self.query::<i64>(redis::cmd("EXPIRE").arg(key).arg(secs.max(1)).clone())

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use bytes::Bytes;
+
 use crate::{content_type_or_default, MAX_BODY_BYTES};
 
 /// Metadata about the last successful refresh.
@@ -18,7 +20,7 @@ struct Meta {
 /// reader can never take down asset serving.
 #[derive(Debug)]
 pub struct AssetCache {
-    assets: RwLock<HashMap<&'static str, Vec<u8>>>,
+    assets: RwLock<HashMap<&'static str, Bytes>>,
     meta: RwLock<Meta>,
 }
 
@@ -27,11 +29,11 @@ impl AssetCache {
         Self::default()
     }
 
-    fn read_assets(&self) -> RwLockReadGuard<'_, HashMap<&'static str, Vec<u8>>> {
+    fn read_assets(&self) -> RwLockReadGuard<'_, HashMap<&'static str, Bytes>> {
         self.assets.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn write_assets(&self) -> RwLockWriteGuard<'_, HashMap<&'static str, Vec<u8>>> {
+    fn write_assets(&self) -> RwLockWriteGuard<'_, HashMap<&'static str, Bytes>> {
         self.assets.write().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -45,7 +47,7 @@ impl AssetCache {
 
     /// Fetch a cached asset with its content type. `None` means "not cached"
     /// (the server answers 404).
-    pub fn get(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
+    pub fn get(&self, name: &str) -> Option<(Bytes, &'static str)> {
         let assets = self.read_assets();
         let bytes = assets.get(name)?;
         Some((bytes.clone(), content_type_or_default(name)))
@@ -62,7 +64,7 @@ impl AssetCache {
             );
             return;
         }
-        self.write_assets().insert(name, bytes);
+        self.write_assets().insert(name, Bytes::from(bytes));
     }
 
     /// Drop a cached asset (e.g. one that is no longer servable upstream).

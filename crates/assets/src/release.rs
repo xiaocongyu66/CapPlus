@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::protect::{is_protected, protect_js};
@@ -56,7 +57,7 @@ pub struct ReleaseMeta {
 #[derive(Debug, Default)]
 struct ActiveFiles {
     id: String,
-    files: HashMap<String, (Vec<u8>, &'static str)>,
+    files: HashMap<String, (Bytes, &'static str)>,
 }
 
 #[derive(Debug)]
@@ -120,7 +121,7 @@ impl ReleaseStore {
                     continue;
                 };
                 let ct = content_type_for(&key).unwrap_or("application/octet-stream");
-                files.insert(key, (bytes, ct));
+                files.insert(key, (Bytes::from(bytes), ct));
             }
         }
         let entry = files
@@ -137,7 +138,7 @@ impl ReleaseStore {
 
     /// A file from the active release. Names are exact relative paths; a bare
     /// basename also resolves when it is unambiguous.
-    pub fn get(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
+    pub fn get(&self, name: &str) -> Option<(Bytes, &'static str)> {
         let active = self.active.read().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = active.files.get(name) {
             return Some(hit.clone());
@@ -444,7 +445,7 @@ mod tests {
         assert!(ct.starts_with("application/javascript"));
         assert!(crate::is_protected(&js), "served JS is protected");
         let (raw, _) = store.get("cap_wasm_bg.wasm").unwrap();
-        assert_eq!(raw, b"\0asm\x01\x00\x00\x00", "wasm untouched");
+        assert_eq!(&raw[..], b"\0asm\x01\x00\x00\x00", "wasm untouched");
         // Raw copy is preserved unmodified.
         let raw_js = std::fs::read(dir.join("releases").join(&meta.id).join("raw/widget.js")).unwrap();
         assert_eq!(raw_js, b"var a = 1; // hi\n");

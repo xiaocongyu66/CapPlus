@@ -279,11 +279,10 @@ async fn record_latency(st: &AppState, site_key: &str, ms: i64) {
     let bucket = hourly_bucket(now_ms()).to_string();
     let _ = st
         .kv
-        .hincrby(&format!("metrics:latency_sum:{site_key}"), &bucket, ms)
-        .await;
-    let _ = st
-        .kv
-        .hincrby(&format!("metrics:latency_count:{site_key}"), &bucket, 1)
+        .hincrby_many(&[
+            (format!("metrics:latency_sum:{site_key}"), bucket.clone(), ms),
+            (format!("metrics:latency_count:{site_key}"), bucket, 1),
+        ])
         .await;
 }
 
@@ -355,20 +354,20 @@ async fn challenge_inner(
             .into_response();
     }
 
-    // Platform / OS tallies for the Location & Networks charts.
+    // Platform / OS tallies for the Location & Networks charts (one pipeline).
     let ua = header_str(&headers, "user-agent");
     let (platform, os) = parse_ua(&ua);
+    let platform_key = format!("metrics:platform:{site_key}");
+    let os_key = format!("metrics:os:{site_key}");
+    let mut metrics = Vec::with_capacity(2);
     if let Some(p) = platform {
-        let _ = st
-            .kv
-            .hincrby(&format!("metrics:platform:{site_key}"), p, 1)
-            .await;
+        metrics.push((platform_key, p.to_string(), 1i64));
     }
     if let Some(o) = os {
-        let _ = st
-            .kv
-            .hincrby(&format!("metrics:os:{site_key}"), o, 1)
-            .await;
+        metrics.push((os_key, o.to_string(), 1i64));
+    }
+    if !metrics.is_empty() {
+        let _ = st.kv.hincrby_many(&metrics).await;
     }
 
     if cfg.protocol == "hashwx" {

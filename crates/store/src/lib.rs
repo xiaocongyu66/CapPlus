@@ -277,10 +277,7 @@ impl Store {
         let window_secs = ((window_ms as f64) / 1000.0).ceil() as i64;
         let window = now_ms() / window_ms;
         let key = format!("rl:{scope}:{ip}:{window_ms}:{window}");
-        let count = self.kv.incr(&key).await?;
-        if count == 1 {
-            self.kv.expire(&key, window_secs + 1).await?;
-        }
+        let count = self.kv.incr_with_expire(&key, window_secs + 1).await?;
         Ok(count <= max)
     }
 
