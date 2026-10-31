@@ -1,0 +1,389 @@
+{
+  "capturedAt": "2026-10-30T01:09:18.723Z",
+  "challenge": {
+    "format": 2,
+    "protocols": [
+      "hashwx",
+      "hashwx",
+      "hashwx",
+      "hashwx",
+      "instrumentation"
+    ],
+    "nonce": true
+  },
+  "instr": {
+    "i": "8181016f955a0492e6d4843d46cc311c",
+    "state": {
+      "eajabxdmcdzu": 972830,
+      "jcgtb0mszrvj": 928725,
+      "abwpwlqt7d4y": 706148,
+      "m8gjfb87ahk2": 790489
+    },
+    "p": {
+      "plugins": {
+        "length": 5
+      },
+      "nativeShape": {
+        "len": 33,
+        "nl": false
+      },
+      "notifPerm": "denied",
+      "productSub": "20030107",
+      "webdriver": false,
+      "isExtended": false,
+      "cdp": {
+        "tap": 0,
+        "objTap": 0,
+        "stackTap": 0,
+        "protoTap": 0,
+        "dbgPause": false,
+        "errPrep": false,
+        "aut": 0,
+        "webdriver": false
+      },
+      "engine": {
+        "hasMozInnerScreenX": false,
+        "hasChrome": true
+      },
+      "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36",
+      "deviceMemory": 8,
+      "evalShape": {
+        "len": 33,
+        "nl": false
+      },
+      "languages": {
+        "lang": "en-US",
+        "langs": [
+          "en-US",
+          "en"
+        ]
+      },
+      "tamper": {
+        "getParameterWebGL": true,
+        "toDataURL": true,
+        "getImageData": true,
+        "permissionsQuery": true,
+        "fnToString": true,
+        "cryptoSign": true,
+        "cryptoImportKey": true,
+        "cryptoDigest": true
+      },
+      "uaDataPresent": true,
+      "chromeShape": {
+        "runtime": false,
+        "loadTimes": true,
+        "csi": true,
+        "app": true
+      },
+      "pdfViewerEnabled": true,
+      "fontWidths": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "uaData": {
+        "mobile": false,
+        "brands": [
+          "Not;A=Brand/8",
+          "Chromium/150"
+        ]
+      },
+      "outerWH": [
+        0,
+        0
+      ],
+      "screen": {
+        "width": 800,
+        "height": 600
+      },
+      "mimeCount": 2,
+      "oscpu": "__undefined",
+      "emoji": null,
+      "audio": 172.67165096606914,
+      "webgl": null,
+      "canvas": null,
+      "canvasStable": null,
+      "platform": "Linux x86_64",
+      "hardwareConcurrency": 8,
+      "workerUA": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36",
+      "workerInfo": {
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36",
+        "platform": "Linux x86_64",
+        "hardwareConcurrency": 8,
+        "evalShape": {
+          "nl": false,
+          "len": 33
+        }
+      },
+      "active": {
+        "mediaApi": {
+          "md": "object",
+          "ed": "function"
+        },
+        "media": {
+          "pointerFine": false,
+          "hoverHover": false,
+          "anyPointerFine": false
+        },
+        "codecs": {
+          "mp4": "probably",
+          "webm": "probably"
+        },
+        "connection": {
+          "effectiveType": "3g",
+          "downlink": 1.75
+        },
+        "rtc": true,
+        "permState": "denied",
+        "permIsPromise": true,
+        "battery": {
+          "charging": true,
+          "level": 1
+        },
+        "devices": {
+          "audioin": 0,
+          "videoin": 0,
+          "audioout": 0
+        },
+        "deviceCount": 0
+      },
+      "webgpu": {
+        "ok": false
+      },
+      "storageQuota": null
+    },
+    "ts": 1793322557291,
+    "mac": "243e3be04af79a557144b3de9ba021aa7fda41656493090bc175feb0621e6dfe",
+    "vp": [
+      780,
+      437
+    ],
+    "scriptHash": "f2b1577e6bd2b85370abcfd16cd48b97b0fbf9a9f7c3116175218eea90028f7c",
+    "top": {
+      "canvas": "f77d8974",
+      "webgl": {
+        "ok": false
+      },
+      "emoji": {
+        "style": "apple-like",
+        "width": 133
+      },
+      "storageQuota": 10737418240,
+      "automationGlobals": []
+    }
+  },
+  "solutions": [
+    {
+      "nonce": "402989"
+    },
+    {
+      "nonce": "442605"
+    },
+    {
+      "nonce": "220109"
+    },
+    {
+      "nonce": "357615"
+    },
+    {
+      "instr": {
+        "i": "8181016f955a0492e6d4843d46cc311c",
+        "state": {
+          "eajabxdmcdzu": 972830,
+          "jcgtb0mszrvj": 928725,
+          "abwpwlqt7d4y": 706148,
+          "m8gjfb87ahk2": 790489
+        },
+        "p": {
+          "plugins": {
+            "length": 5
+          },
+          "nativeShape": {
+            "len": 33,
+            "nl": false
+          },
+          "notifPerm": "denied",
+          "productSub": "20030107",
+          "webdriver": false,
+          "isExtended": false,
+          "cdp": {
+            "tap": 0,
+            "objTap": 0,
+            "stackTap": 0,
+            "protoTap": 0,
+            "dbgPause": false,
+            "errPrep": false,
+            "aut": 0,
+            "webdriver": false
+          },
+          "engine": {
+            "hasMozInnerScreenX": false,
+            "hasChrome": true
+          },
+          "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36",
+          "deviceMemory": 8,
+          "evalShape": {
+            "len": 33,
+            "nl": false
+          },
+          "languages": {
+            "lang": "en-US",
+            "langs": [
+              "en-US",
+              "en"
+            ]
+          },
+          "tamper": {
+            "getParameterWebGL": true,
+            "toDataURL": true,
+            "getImageData": true,
+            "permissionsQuery": true,
+            "fnToString": true,
+            "cryptoSign": true,
+            "cryptoImportKey": true,
+            "cryptoDigest": true
+          },
+          "uaDataPresent": true,
+          "chromeShape": {
+            "runtime": false,
+            "loadTimes": true,
+            "csi": true,
+            "app": true
+          },
+          "pdfViewerEnabled": true,
+          "fontWidths": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "uaData": {
+            "mobile": false,
+            "brands": [
+              "Not;A=Brand/8",
+              "Chromium/150"
+            ]
+          },
+          "outerWH": [
+            0,
+            0
+          ],
+          "screen": {
+            "width": 800,
+            "height": 600
+          },
+          "mimeCount": 2,
+          "oscpu": "__undefined",
+          "emoji": null,
+          "audio": 172.67165096606914,
+          "webgl": null,
+          "canvas": null,
+          "canvasStable": null,
+          "platform": "Linux x86_64",
+          "hardwareConcurrency": 8,
+          "workerUA": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36",
+          "workerInfo": {
+            "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36",
+            "platform": "Linux x86_64",
+            "hardwareConcurrency": 8,
+            "evalShape": {
+              "nl": false,
+              "len": 33
+            }
+          },
+          "active": {
+            "mediaApi": {
+              "md": "object",
+              "ed": "function"
+            },
+            "media": {
+              "pointerFine": false,
+              "hoverHover": false,
+              "anyPointerFine": false
+            },
+            "codecs": {
+              "mp4": "probably",
+              "webm": "probably"
+            },
+            "connection": {
+              "effectiveType": "3g",
+              "downlink": 1.75
+            },
+            "rtc": true,
+            "permState": "denied",
+            "permIsPromise": true,
+            "battery": {
+              "charging": true,
+              "level": 1
+            },
+            "devices": {
+              "audioin": 0,
+              "videoin": 0,
+              "audioout": 0
+            },
+            "deviceCount": 0
+          },
+          "webgpu": {
+            "ok": false
+          },
+          "storageQuota": null
+        },
+        "ts": 1793322557291,
+        "mac": "243e3be04af79a557144b3de9ba021aa7fda41656493090bc175feb0621e6dfe",
+        "vp": [
+          780,
+          437
+        ],
+        "scriptHash": "f2b1577e6bd2b85370abcfd16cd48b97b0fbf9a9f7c3116175218eea90028f7c",
+        "top": {
+          "canvas": "f77d8974",
+          "webgl": {
+            "ok": false
+          },
+          "emoji": {
+            "style": "apple-like",
+            "width": 133
+          },
+          "storageQuota": 10737418240,
+          "automationGlobals": []
+        }
+      }
+    }
+  ],
+  "integrity": {
+    "capWasm": "e4f3c00246a775193661f9277ca1288cd310a6514de166ecc2176ccd26fb06a9",
+    "hashwxWasm": "b1a0dbb3ef444d3c7069e0a5e0a0273ffa4cf8fef62cbbe43761c02f7cd6aff5",
+    "widget": "e87dac7bbcb3f6f643d887790ec697d653e5b2509ac996da96fcdf5f4b2d6bf1",
+    "scriptHash": "f2b1577e6bd2b85370abcfd16cd48b97b0fbf9a9f7c3116175218eea90028f7c",
+    "widgetSelf": true,
+    "ts": 1793322557641,
+    "proof": "55a3cceecbe695e4a8a0bf5dc60ec515719c586a425b5a5902ae45490735e275"
+  }
+}

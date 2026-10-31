@@ -1,0 +1,33 @@
+[package]
+name = "cap-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cap-core = { path = "../core" }
+cap-store = { path = "../store" }
+cap-detect = { path = "../detect" }
+cap-embed = { path = "../embed" }
+cap-verify = { path = "../verify" }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+base64 = "0.22"
+form_urlencoded = "1"
+cap-proto = { path = "../proto" }
+cap-instr = { path = "../instr" }
+cap-assets = { path = "../assets" }
+cap-admin = { path = "../admin" }
+cap-kv = { path = "../kv" }
+toml = "0.8"
+aes-gcm = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+
+[[bin]]
+name = "cap-server"
+path = "src/main.rs"

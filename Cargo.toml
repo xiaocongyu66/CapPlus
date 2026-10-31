@@ -1,0 +1,27 @@
+[workspace]
+members = [
+  "crates/core",
+  "crates/store",
+  "crates/detect",
+  "crates/embed",
+  "crates/verify",
+  "crates/server",
+  "crates/proto",
+  "crates/instr",
+  "crates/admin",
+  "crates/assets",
+  "crates/kv",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
