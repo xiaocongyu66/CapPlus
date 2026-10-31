@@ -27,6 +27,11 @@ pub fn protect_js(name: &str, src: &[u8]) -> Vec<u8> {
     if !is_js(name) || is_protected(src) {
         return src.to_vec();
     }
+    // ES modules cannot run inside `new Function` (`import.meta` is a syntax
+    // error there). Leave them intact so wasm-bindgen glue keeps working.
+    if looks_like_esm(src) {
+        return src.to_vec();
+    }
     let Ok(text) = std::str::from_utf8(src) else {
         return src.to_vec();
     };
@@ -45,6 +50,20 @@ o[c]=String.fromCharCode(b.charCodeAt(c)^s[(s[i]+s[j])&255])}}\
 (new Function(o.join(\"\")))()}}();"
     );
     loader.into_bytes()
+}
+
+/// Cheap ESM probe: `import.meta` or a top-level `import`/`export`.
+fn looks_like_esm(src: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(src) else {
+        return false;
+    };
+    if text.contains("import.meta") {
+        return true;
+    }
+    text.lines().take(400).any(|line| {
+        let t = line.trim_start();
+        t.starts_with("import ") || t.starts_with("export ") || t.starts_with("export{")
+    })
 }
 
 fn is_js(name: &str) -> bool {
@@ -322,6 +341,13 @@ mod tests {
             .decode(payload)
             .unwrap();
         assert_eq!(rc4(key, &raw), b"var total = 1 + 2;\n");
+    }
+
+    #[test]
+    fn esm_files_are_left_alone() {
+        let glue = b"const url = new URL('cap_wasm_bg.wasm', import.meta.url);";
+        assert_eq!(protect_js("cap_wasm.js", glue), glue);
+        assert_eq!(protect_js("m.js", b"export function f(){}"), b"export function f(){}");
     }
 
     #[test]

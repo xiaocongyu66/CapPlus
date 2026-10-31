@@ -362,6 +362,7 @@
     "Demo": "演示",
     // ---- front-end releases ------------------------------------------------
     "Front-end": "前端",
+    "built-in": "内置",
     "Front-end releases": "前端发布",
     "Upload zip": "上传 zip",
     "Download": "下载",

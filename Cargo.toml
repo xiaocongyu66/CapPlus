@@ -11,6 +11,7 @@ members = [
   "crates/admin",
   "crates/assets",
   "crates/kv",
+  "crates/ipdb",
 ]
 resolver = "2"
 

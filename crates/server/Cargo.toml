@@ -22,6 +22,7 @@ cap-instr = { path = "../instr" }
 cap-assets = { path = "../assets" }
 cap-admin = { path = "../admin" }
 cap-kv = { path = "../kv" }
+cap-ipdb = { path = "../ipdb" }
 toml = "0.8"
 aes-gcm = "0.10"
 rand = "0.8"

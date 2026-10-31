@@ -98,23 +98,57 @@ fn write_stored_zip(files: &[(String, Vec<u8>)], out: &Path) -> std::io::Result<
     f.write_all(&body)
 }
 
+/// Optional: rebuild the widget when its toolchain is available. Any failure
+/// falls back to the prebuilt files in `widget-dist/`.
+fn try_build_widget(manifest: &Path) -> bool {
+    let widget_dir = manifest.join("../../widget-source");
+    if !widget_dir.join("node_modules").is_dir() {
+        return false;
+    }
+    let status = std::process::Command::new("bun")
+        .arg("run")
+        .arg("build")
+        .current_dir(&widget_dir)
+        .status();
+    matches!(status, Ok(s) if s.success())
+}
+
+fn bundle(name: &str, dir: &Path, out_dir: &Path) {
+    let mut files = Vec::new();
+    collect(dir, dir, &mut files);
+    if files.is_empty() {
+        println!(
+            "cargo:warning={name} sources not found at {}; the binary will not bundle them",
+            dir.display()
+        );
+    }
+    write_stored_zip(&files, &out_dir.join(format!("{name}.zip"))).expect("write zip");
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    // Vendored copy first (what the repo ships), then the neighbouring Cap
-    // checkout used during development.
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+
+    // Dashboard: vendored copy first, then the neighbouring Cap checkout.
     let vendored = manifest.join("../../frontend");
     let sibling = manifest.join("../../../cap/standalone/public");
     let dashboard = if vendored.join("index.html").is_file() { vendored } else { sibling };
-    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("dashboard.zip");
     println!("cargo:rerun-if-changed={}", dashboard.display());
+    bundle("dashboard", &dashboard, &out_dir);
 
-    let mut files = Vec::new();
-    collect(&dashboard, &dashboard, &mut files);
-    if files.is_empty() {
-        println!(
-            "cargo:warning=dashboard sources not found at {}; the binary will have no admin panel",
-            dashboard.display()
-        );
-    }
-    write_stored_zip(&files, &out).expect("write dashboard.zip");
+    // Widget: refresh from source when `bun` and the toolchain are present,
+    // otherwise ship the prebuilt bundle committed under widget-dist/.
+    let widget_src = manifest.join("../../widget-source");
+    println!("cargo:rerun-if-changed={}", widget_src.display());
+    let rebuilt = try_build_widget(&manifest);
+    let dist = if rebuilt {
+        // build.js writes the minified files into widget-source/src/.
+        let d = widget_src.join("src");
+        if d.join("cap.min.js").is_file() { d } else { manifest.join("../../widget-dist") }
+    } else {
+        manifest.join("../../widget-dist")
+    };
+    println!("cargo:warning=widget bundle: {}", dist.display());
+    println!("cargo:rerun-if-changed={}", dist.display());
+    bundle("widget", &dist, &out_dir);
 }

@@ -51,6 +51,8 @@ struct AppState {
     admin_cfg: Arc<cap_admin::AdminConfig>,
     assets: Arc<cap_assets::AssetCache>,
     releases: Arc<cap_assets::ReleaseStore>,
+    kv: cap_kv::Kv,
+    ipdb: Arc<cap_ipdb::IpDb>,
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +587,8 @@ async fn redeem(
         .incr_metric(&format!("metrics:verified:{site_key}"), now / 3_600_000)
         .await;
 
+    record_geo(&st, &site_key, &headers, &addr).await;
+
     Json(json!({
         "success": true,
         "token": redeem_token,
@@ -987,6 +991,261 @@ async fn share_page() -> Response {
     serve_dashboard_file("share.html", "no-cache").await
 }
 
+/// Attribute a successful solve to a country / ASN. Explicit proxy headers
+/// (configured in Settings → IP data) win over the local database.
+async fn record_geo(st: &AppState, site_key: &str, headers: &HeaderMap, addr: &SocketAddr) {
+    let ip = client_ip(headers, &addr.ip().to_string());
+    let header = |name: &str| -> Option<String> {
+        if name.is_empty() {
+            return None;
+        }
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    let cfg = st
+        .kv
+        .get("settings:headers")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+
+    let country = header(cfg.get("countryHeader").and_then(Value::as_str).unwrap_or(""));
+    let asn = header(cfg.get("asnHeader").and_then(Value::as_str).unwrap_or(""));
+
+    let (db_country, db_asn) = match ip.parse::<std::net::IpAddr>() {
+        Ok(addr) => cap_ipdb::lookup(&st.ipdb, addr),
+        Err(_) => (None, None),
+    };
+
+    if let Some(code) = country.or(db_country) {
+        let _ = st
+            .kv
+            .hincrby(&format!("metrics:country:{site_key}"), &code, 1)
+            .await;
+    }
+    if let Some(net) = asn.or(db_asn.map(|n| n.to_string())) {
+        let _ = st
+            .kv
+            .hincrby(&format!("metrics:asn:{site_key}"), &net, 1)
+            .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IP database settings (download, progress, delete)
+// ---------------------------------------------------------------------------
+
+async fn ipdb_status(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_admin(&st, &headers).await {
+        return r;
+    }
+    let stored = st
+        .kv
+        .get("settings:ipdb")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let mode = st.ipdb.mode();
+    let progress = st.ipdb.progress();
+    json_resp(
+        StatusCode::OK,
+        json!({
+            "mode": mode.as_str(),
+            "provider": mode.as_str(),
+            "configured": mode != cap_ipdb::Mode::None,
+            "country": if st.ipdb.country_exists() {
+                json!({ "exists": true, "size": st.ipdb.country_size() })
+            } else {
+                json!({ "exists": false })
+            },
+            "asn": if st.ipdb.asn_exists() {
+                json!({ "exists": true, "size": st.ipdb.asn_size() })
+            } else {
+                json!({ "exists": false })
+            },
+            "loaded": {
+                "country": st.ipdb.country_exists(),
+                "asn": st.ipdb.asn_exists(),
+            },
+            "lastUpdated": stored.get("updatedAt").cloned().unwrap_or(Value::Null),
+            "error": progress.error,
+            "progress": {
+                "active": progress.active,
+                "file": progress.file,
+                "downloaded": progress.downloaded,
+                "total": progress.total,
+            },
+            "sources": {
+                "maxmind": {
+                    "accountIdSet": stored.get("maxmindAccountId").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false),
+                    "keySet": stored.get("maxmindKey").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false),
+                },
+                "ipinfo": {
+                    "tokenSet": stored.get("ipinfoToken").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false),
+                },
+            },
+        }),
+    )
+}
+
+async fn ipdb_put(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = require_admin(&st, &headers).await {
+        return r;
+    }
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        return json_resp(
+            StatusCode::BAD_REQUEST,
+            json!({ "success": false, "error": "Invalid body" }),
+        );
+    };
+    let provider = payload
+        .get("provider")
+        .or_else(|| payload.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let Some(mode) = cap_ipdb::Mode::parse(provider) else {
+        return json_resp(
+            StatusCode::BAD_REQUEST,
+            json!({ "success": false, "error": "provider must be none, dbip, maxmind or ipinfo" }),
+        );
+    };
+
+    let mut doc = serde_json::Map::new();
+    doc.insert("provider".into(), json!(mode.as_str()));
+    doc.insert("mode".into(), json!(mode.as_str()));
+    for field in ["maxmindAccountId", "maxmindKey", "ipinfoToken"] {
+        if let Some(v) = payload.get(field) {
+            if let Some(s) = v.as_str() {
+                doc.insert(field.into(), json!(s));
+            }
+        }
+    }
+    doc.insert(
+        "updatedAt".into(),
+        json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+    );
+    let raw = Value::Object(doc).to_string();
+    if st.kv.set("settings:ipdb", &raw).await.is_err() {
+        return json_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "success": false, "error": "storage error" }),
+        );
+    }
+    json_resp(StatusCode::OK, json!({ "success": true }))
+}
+
+async fn ipdb_download(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = require_admin(&st, &headers).await {
+        return r;
+    }
+    let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let stored = st
+        .kv
+        .get("settings:ipdb")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+
+    let provider = payload
+        .get("provider")
+        .or_else(|| payload.get("mode"))
+        .and_then(Value::as_str)
+        .or_else(|| stored.get("provider").and_then(Value::as_str))
+        .unwrap_or("none");
+    let Some(mode) = cap_ipdb::Mode::parse(provider) else {
+        return json_resp(
+            StatusCode::BAD_REQUEST,
+            json!({ "success": false, "error": "unknown provider" }),
+        );
+    };
+    if mode == cap_ipdb::Mode::None {
+        return json_resp(
+            StatusCode::BAD_REQUEST,
+            json!({ "success": false, "error": "pick a provider first" }),
+        );
+    }
+
+    let pick = |name: &str| -> String {
+        payload
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                stored
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    };
+    let creds = cap_ipdb::Credentials {
+        maxmind_account_id: pick("maxmindAccountId"),
+        maxmind_key: pick("maxmindKey"),
+        ipinfo_token: pick("ipinfoToken"),
+    };
+
+    // Persist credentials alongside the provider.
+    if let Value::Object(obj) = &payload {
+        let mut doc = stored.as_object().cloned().unwrap_or_default();
+        for (k, v) in obj {
+            if matches!(k.as_str(), "maxmindAccountId" | "maxmindKey" | "ipinfoToken") {
+                doc.insert(k.clone(), v.clone());
+            }
+        }
+        doc.insert("provider".into(), json!(mode.as_str()));
+        doc.insert("mode".into(), json!(mode.as_str()));
+        let _ = st.kv.set("settings:ipdb", &Value::Object(doc).to_string()).await;
+    }
+
+    if !st.ipdb.start_download(mode, creds) {
+        return json_resp(
+            StatusCode::CONFLICT,
+            json!({ "success": false, "error": "A download is already running" }),
+        );
+    }
+    json_resp(StatusCode::OK, json!({ "success": true, "started": true }))
+}
+
+async fn ipdb_progress(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_admin(&st, &headers).await {
+        return r;
+    }
+    let p = st.ipdb.progress();
+    json_resp(
+        StatusCode::OK,
+        json!({
+            "active": p.active,
+            "file": p.file,
+            "downloaded": p.downloaded,
+            "total": p.total,
+            "error": p.error,
+        }),
+    )
+}
+
+async fn ipdb_delete(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_admin(&st, &headers).await {
+        return r;
+    }
+    let _ = st.kv.del("settings:ipdb").await;
+    let _ = std::fs::remove_file(st.ipdb.country_path());
+    let _ = std::fs::remove_file(st.ipdb.asn_path());
+    st.ipdb.reload();
+    st.ipdb.set_mode(cap_ipdb::Mode::None);
+    json_resp(StatusCode::OK, json!({ "success": true }))
+}
+
 // ---------------------------------------------------------------------------
 // Front-end releases (upload a zip / list / activate / delete / download)
 // ---------------------------------------------------------------------------
@@ -1307,10 +1566,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let ipdb = Arc::new(
+        cap_ipdb::IpDb::open(&cfg.data_dir.join("ipdb"))
+            .map_err(|e| format!("cannot open ip database directory: {e}"))?,
+    );
+    if let Ok(Some(raw)) = kv.get("settings:ipdb").await {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let provider = doc
+                .get("provider")
+                .or_else(|| doc.get("mode"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
+            if let Some(mode) = cap_ipdb::Mode::parse(provider) {
+                ipdb.set_mode(mode);
+            }
+        }
+    }
+    eprintln!(
+        "[cap] ip database: mode={}, country={}, asn={}",
+        ipdb.mode().as_str(),
+        ipdb.country_exists(),
+        ipdb.asn_exists()
+    );
+
     let releases = Arc::new(
         cap_assets::ReleaseStore::open(&cfg.data_dir)
             .map_err(|e| format!("cannot open releases directory: {e}"))?,
     );
+    // Ship the compiled-in widget as the default release, so a fresh install
+    // serves /assets/* locally instead of depending on the CDN.
+    match releases.publish_builtin(&config::builtin_widget_zip()) {
+        Ok(meta) => eprintln!(
+            "[cap] built-in widget release: {} file(s), {} protected, active={}",
+            meta.files, meta.protected, meta.active
+        ),
+        Err(e) => eprintln!("[cap] could not publish the built-in widget: {e}"),
+    }
 
     let embed_widget_url = cfg.embed_widget_url.clone();
     let port = cfg.port;
@@ -1323,6 +1614,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_cfg: Arc::new(admin_cfg),
         assets,
         releases,
+        kv,
+        ipdb,
     };
 
     let app = Router::new()
@@ -1336,6 +1629,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/share", get(share_page))
         .route("/share/:token", get(admin_handler))
         .route("/share/:token/geo-stats", get(admin_handler))
+        .route(
+            "/server/settings/ipdb",
+            get(ipdb_status)
+                .put(ipdb_put)
+                .post(ipdb_download)
+                .delete(ipdb_delete),
+        )
+        .route("/server/settings/ipdb/download", post(ipdb_download))
+        .route("/server/settings/ipdb/progress", get(ipdb_progress))
         .route(
             "/server/releases",
             get(releases_list).post(release_upload),

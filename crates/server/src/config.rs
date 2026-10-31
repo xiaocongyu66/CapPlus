@@ -124,6 +124,14 @@ impl Settings {
 /// The dashboard bundled by `build.rs`.
 static DASHBOARD_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dashboard.zip"));
 
+/// The default widget bundle (widget.js + wasm), published on first start.
+pub static WIDGET_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/widget.zip"));
+
+/// The prebuilt widget bundle, ready for [`cap_assets::ReleaseStore::publish_builtin`].
+pub fn builtin_widget_zip() -> Vec<u8> {
+    WIDGET_ZIP.to_vec()
+}
+
 /// Extract the bundled dashboard into `target` (idempotent).
 fn unpack_embedded_dashboard(target: &std::path::Path) -> Result<usize, String> {
     let entries = cap_assets::read_zip(DASHBOARD_ZIP).map_err(|e| e.0)?;

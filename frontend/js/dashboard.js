@@ -3493,6 +3493,7 @@ async function loadReleases() {
           <div style="display:flex;align-items:center;gap:8px">
             <code style="font-size:12px">${escapeHtml(r.id)}</code>
             ${r.active ? '<span class="hint" style="color:var(--blue);font-weight:600">active</span>' : ""}
+            ${r.builtin ? '<span class="hint" style="opacity:.7">built-in</span>' : ""}
           </div>
           <div class="hint" style="margin-top:2px">
             ${formatRelative(r.created)} · ${r.files} files · ${(r.bytes / 1024).toFixed(1)} KB · ${r.protected} protected
@@ -3505,7 +3506,7 @@ async function loadReleases() {
         }
         <button class="modal-btn secondary releaseDownload" data-id="${escapeHtml(r.id)}">Download</button>
         ${
-          r.active
+          r.active || r.builtin
             ? ""
             : `<button class="modal-btn secondary releaseDelete" data-id="${escapeHtml(r.id)}">Delete</button>`
         }

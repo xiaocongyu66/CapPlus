@@ -282,6 +282,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-ipdb"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "flate2",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "cap-kv"
 version = "0.1.0"
 dependencies = [
@@ -316,6 +327,7 @@ dependencies = [
  "cap-detect",
  "cap-embed",
  "cap-instr",
+ "cap-ipdb",
  "cap-kv",
  "cap-proto",
  "cap-store",

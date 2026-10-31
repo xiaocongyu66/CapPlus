@@ -25,6 +25,8 @@ use crate::zip::{read_zip, ZipError};
 use crate::{content_type_for, now_ms};
 
 const ACTIVE_FILE: &str = "active";
+/// Fixed id of the bundle compiled into the binary.
+pub const BUILTIN_ID: &str = "builtin";
 const META_FILE: &str = "meta.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +42,9 @@ pub struct ReleaseMeta {
     pub protected: usize,
     #[serde(skip)]
     pub active: bool,
+    /// Bundled with the binary; cannot be deleted.
+    #[serde(default)]
+    pub builtin: bool,
     /// Public URL of the widget entry point, when one is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
@@ -204,6 +209,83 @@ impl ReleaseStore {
             bytes,
             protected,
             active: false,
+            builtin: false,
+            entry,
+        };
+        std::fs::write(
+            dir.join(META_FILE),
+            serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let meta = ReleaseMeta { builtin: false, ..meta };
+        // An upload is meant to go live; the previous release stays on disk
+        // for rollback.
+        self.activate(&id)?;
+        Ok(meta)
+    }
+
+    /// Publish the bundle compiled into the binary. Idempotent: an existing
+    /// builtin release is left untouched (so a user's rollback target keeps
+    /// its files), and it becomes active only when nothing else is.
+    pub fn publish_builtin(&self, archive: &[u8]) -> Result<ReleaseMeta, String> {
+        let dir = self.release_dir(BUILTIN_ID);
+        if dir.join("dist").is_dir() {
+            let mut meta = self
+                .list()
+                .into_iter()
+                .find(|m| m.id == BUILTIN_ID)
+                .unwrap_or_else(|| ReleaseMeta {
+                    id: BUILTIN_ID.to_string(),
+                    created: 0,
+                    files: 0,
+                    bytes: 0,
+                    protected: 0,
+                    active: false,
+                    builtin: true,
+                    entry: None,
+                });
+            meta.active = self.active_id().as_deref() == Some(BUILTIN_ID);
+            return Ok(meta);
+        }
+
+        let entries = read_zip(archive).map_err(|e: ZipError| e.0)?;
+        let (raw_dir, dist_dir) = (dir.join("raw"), dir.join("dist"));
+        std::fs::create_dir_all(&raw_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&dist_dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("source.zip"), archive).map_err(|e| e.to_string())?;
+
+        let (mut files, mut bytes, mut protected, mut entry) = (0usize, 0usize, 0usize, None);
+        for item in entries {
+            if let Some(parent) = raw_dir.join(&item.name).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(raw_dir.join(&item.name), &item.data).map_err(|e| e.to_string())?;
+
+            let served = protect_js(&item.name, &item.data);
+            if is_protected(&served) && !is_protected(&item.data) {
+                protected += 1;
+            }
+            if let Some(parent) = dist_dir.join(&item.name).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(dist_dir.join(&item.name), &served).map_err(|e| e.to_string())?;
+
+            files += 1;
+            bytes += served.len();
+            if matches!(item.name.as_str(), "widget.js" | "cap.min.js") {
+                entry = Some(item.name.clone());
+            }
+        }
+
+        let meta = ReleaseMeta {
+            id: BUILTIN_ID.to_string(),
+            created: now_ms() as i64,
+            files,
+            bytes,
+            protected,
+            active: false,
+            builtin: true,
             entry,
         };
         std::fs::write(
@@ -213,7 +295,7 @@ impl ReleaseStore {
         .map_err(|e| e.to_string())?;
 
         if self.active_release_id().is_none() {
-            self.activate(&id)?;
+            self.activate(BUILTIN_ID)?;
         }
         Ok(meta)
     }
@@ -243,6 +325,7 @@ impl ReleaseStore {
                     bytes: 0,
                     protected: 0,
                     active: false,
+                    builtin: id == BUILTIN_ID,
                     entry: None,
                 });
             meta.active = active.as_deref() == Some(id.as_str());
@@ -262,6 +345,9 @@ impl ReleaseStore {
     }
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
+        if id == BUILTIN_ID {
+            return Err("the built-in release cannot be deleted".into());
+        }
         if self.active_id().as_deref() == Some(id) {
             return Err("cannot delete the active release; activate another first".into());
         }

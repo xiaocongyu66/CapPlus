@@ -1,0 +1,12 @@
+[package]
+name = "cap-ipdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+base64 = "0.22"

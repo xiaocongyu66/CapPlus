@@ -11,6 +11,7 @@ verification, single ~1.3 MB static binary.
 | `cap-instr` | probe-script generator + JS-compatible MAC canonicaliser | 36 |
 | `cap-detect` | probe detector (57 checks, parity-tested vs JS) + trust scoring | 95 |
 | `cap-kv` | Redis key/value layer (shared by store + admin) | — |
+| `cap-ipdb` | MMDB reader (24/28/32-bit trees) + DB-IP/MaxMind downloader | 7 |
 | `cap-store` | Redis repository (verification flow) | 7 |
 | `cap-verify` | Turnstile siteverify contract | 25 |
 | `cap-embed` | embed iframe + parent loader | 17 |
@@ -47,7 +48,10 @@ default `redis://127.0.0.1:6379`).
 - Memory: ~1.3 MB binary, peak RSS ≈ 3 MB (Bun build: ~53 MB).
 - `hashwx` runs the original WASM hash module via `wasmi` (bit-identical), and
   instrumentation results are HMAC-verified (`instr_mac_mismatch` on tamper).
-- TODO: geo/IP database, demo mode, edge/WASM deployment.
+- IP geolocation: DB-IP Lite (free) and MaxMind GeoLite2 downloads are
+  handled in-process with a built-in MMDB reader; country/ASN are recorded per
+  verified solve, and proxy headers override the database when configured.
+- TODO: demo mode, edge/WASM deployment.
 
 See `MIGRATION.md` for the Bun → Rust cutover runbook (shared Redis, per-key rollout, rollback).
 
@@ -83,6 +87,15 @@ curl -X POST https://cap.example.com/server/releases \
   -H "Authorization: Bearer $(printf '{"token":"…","hash":"…"}' | base64 -w0)" \
   -H "Content-Type: application/zip" --data-binary @widget.zip
 ```
+
+## IP geolocation
+
+Settings → **IP data** can download **DB-IP Lite** (free, no key) or
+**MaxMind GeoLite2** (needs a license key) into `cappro/ipdb/`. The server
+parses the `.mmdb` files itself and records a country/ASN tally for every
+verified solve, which drives the Location / Networks charts. If you already
+send country or ASN headers from your proxy, configure them under **Proxy
+headers** and they take priority over the local database.
 
 ## Admin panel
 
