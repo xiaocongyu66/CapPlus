@@ -157,7 +157,11 @@ pub fn instrumentation_challenge(
 /// Verify a v2 solution list against the sealed expectations. Supports the
 /// `rsw` protocol; unknown protocols fail closed.
 pub fn verify_solutions(expected: &Value, solutions: &[Value]) -> Result<(), String> {
+    // JS seals `{ expected: [...] }`; older Rust builds sealed a bare array.
+    // Accept both so a challenge minted by either side still redeems.
     let expected = expected
+        .get("expected")
+        .unwrap_or(expected)
         .as_array()
         .ok_or_else(|| "invalid_expected".to_string())?;
     if expected.len() != solutions.len() {

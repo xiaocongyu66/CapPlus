@@ -116,8 +116,10 @@ pub fn jwt_sig_hex(token: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 pub const MAX_CHALLENGE_COUNT: u32 = 1000;
-pub const MAX_CHALLENGE_SIZE: u32 = 128;
-pub const MAX_CHALLENGE_DIFFICULTY: u32 = 8;
+// Match the JS reference (core/src/index.js): 256 / 16. Lower limits made the
+// Rust server reject challenges the JS backend had already issued.
+pub const MAX_CHALLENGE_SIZE: u32 = 256;
+pub const MAX_CHALLENGE_DIFFICULTY: u32 = 16;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PowParams {

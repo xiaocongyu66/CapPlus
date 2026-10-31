@@ -116,7 +116,13 @@ fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
 }
 
 fn client_ip(headers: &HeaderMap, peer: &str) -> String {
-    // An explicit IP header always wins when configured.
+    // Forwarded headers are client-controlled. Like cap.js `getClientIp`,
+    // they are only trusted when the operator declares a trusted proxy
+    // (CAP_TRUST_PROXY=true); otherwise the peer address wins, so a client
+    // cannot spoof an IP to dodge the limiter or the blocklist.
+    if !proxy_trusted(headers, peer) {
+        return peer.to_string();
+    }
     let configured = settings().ip_header.clone();
     if !configured.is_empty() {
         if let Some(v) = headers.get(configured.as_str()).and_then(|v| v.to_str().ok()) {
@@ -128,14 +134,12 @@ fn client_ip(headers: &HeaderMap, peer: &str) -> String {
             }
         }
     }
-    if proxy_trusted(headers, peer) {
-        for h in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"] {
-            if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
-                if let Some(first) = v.split(',').next() {
-                    let ip = first.trim();
-                    if !ip.is_empty() {
-                        return ip.to_string();
-                    }
+    for h in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"] {
+        if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
+            if let Some(first) = v.split(',').next() {
+                let ip = first.trim();
+                if !ip.is_empty() {
+                    return ip.to_string();
                 }
             }
         }
@@ -372,7 +376,9 @@ async fn challenge_inner(
 
     if cfg.protocol == "hashwx" {
         let Some((challs, expected)) = v2::hashwx_challenges(
-            cfg.hashwx_difficulty.max(1),
+            // cap.js clamps to [50_000, 5_000_000]; a tiny value makes the PoW
+            // trivial, a huge one makes it unsolvable.
+            cfg.hashwx_difficulty.clamp(50_000, 5_000_000),
             cap_proto::hashwx::DEFAULT_HASHWX_NONCES_PER_HASH,
             cap_proto::hashwx::DEFAULT_HASHWX_CHALLENGE_COUNT,
         ) else {
@@ -388,7 +394,11 @@ async fn challenge_inner(
         let mut challenges = challs;
         let mut expected_list = expected;
         append_instrumentation(&cfg, expires, &mut challenges, &mut expected_list);
-        let Some(ev2) = v2::encrypt_gcm(&json!(expected_list), &key.jwt_secret, v2::INFO_FMT2)
+        let Some(ev2) = v2::encrypt_gcm(
+            &json!({ "expected": expected_list }),
+            &key.jwt_secret,
+            v2::INFO_FMT2,
+        )
         else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -424,8 +434,9 @@ async fn challenge_inner(
             }
         };
         // RSA modexp: run on the blocking pool so a burst cannot stall the
-        // async workers.
-        let rsw_t = cfg.rsw_t;
+        // async workers. Clamp `t` like cap.js ([10_000, 300_000]) — a value
+        // above 2^31 wraps negative in the worker (`t | 0`) and never solves.
+        let rsw_t = cfg.rsw_t.clamp(10_000, 300_000);
         let Some((challenge, expected)) = tokio::task::spawn_blocking(move || {
             v2::rsw_challenge(&fields, rsw_t)
         })
@@ -448,7 +459,7 @@ async fn challenge_inner(
         append_instrumentation(&cfg, expires, &mut challenges, &mut expected_list);
 
         let Some(ev) = v2::encrypt_gcm(
-            &json!(expected_list),
+            &json!({ "expected": expected_list }),
             &key.jwt_secret,
             v2::INFO_FMT2,
         ) else {
@@ -458,10 +469,12 @@ async fn challenge_inner(
             )
                 .into_response();
         };
-        let payload = json!({
+        let mut payload = json!({
             "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev,
         });
+        seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
         let token = jwt_sign(&payload, &key.jwt_secret);
+        remember_challenge_env(&st, &token, &headers, &addr).await;
         return Json(json!({
             "token": token,
             "format": 2,
@@ -2384,6 +2397,17 @@ async fn admin_handler(
         body: &body,
     };
     let resp = cap_admin::handle(admin, st.admin_cfg.as_ref(), &req).await;
+    // A successful admin write must be visible immediately on this instance;
+    // otherwise a revoked key keeps redeeming (and a new one 404s) for up to
+    // the cache TTL.
+    if resp.status < 300
+        && matches!(
+            method,
+            axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE
+        )
+    {
+        st.cache.clear();
+    }
     let mut out_headers = HeaderMap::new();
     for (k, v) in &resp.headers {
         if let (Ok(name), Ok(value)) = (
