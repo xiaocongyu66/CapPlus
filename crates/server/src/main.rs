@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, RawQuery, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -602,7 +602,7 @@ async fn redeem(
         return (StatusCode::FORBIDDEN, Json(json!({"error": "expired"}))).into_response();
     }
     let is_v2 = claims.get("f").and_then(Value::as_u64) == Some(2);
-    let mut v2_trust: Option<(i32, String, cap_detect::Action)> = None;
+    let mut v2_trust: Option<(cap_detect::Trust, cap_detect::Action)> = None;
     if is_v2 {
         let Some(ev) = claims.get("ev").and_then(Value::as_str) else {
             return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid_token"}))).into_response();
@@ -700,7 +700,7 @@ async fn redeem(
                 owned.iter().map(|s| s.as_signal()).collect();
             let trust = cap_detect::compute_trust_signals(&sigs, None, Some(outcome.pass));
             let action = cap_detect::trust_action(&trust);
-            v2_trust = Some((trust.score, format!("{:?}", trust.level).to_lowercase(), action));
+            v2_trust = Some((trust, action));
         }
         if let Err(reason) = v2::verify_solutions(&expected, &solutions_raw) {
             let _ = st
@@ -769,18 +769,22 @@ async fn redeem(
         }
     }
 
-    if let Some((score, level, action)) = &v2_trust {
-        eprintln!("[redeem] site={site_key} trust score={score} level={level} action={action:?}");
+    if let Some((trust, action)) = &v2_trust {
+        eprintln!(
+            "[redeem] site={site_key} trust score={} level={:?} action={action:?}",
+            trust.score, trust.level
+        );
         if matches!(action, cap_detect::Action::Deny) && key.config.block_on_deny {
             let _ = st
                 .store
                 .incr_metric(&format!("metrics:failed:{site_key}"), hourly_bucket(now))
                 .await;
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"success": false, "error": "trust_denied", "level": level, "score": score})),
-            )
-                .into_response();
+            let mut doc = json!({ "success": false, "error": "trust_denied" });
+            if st.admin_cfg.demo {
+                doc["trust"] = trust_json(trust);
+                doc["action"] = json!(action_str(*action));
+            }
+            return (StatusCode::FORBIDDEN, Json(doc)).into_response();
         }
     }
 
@@ -809,13 +813,69 @@ async fn redeem(
 
     record_geo(&st, &site_key, &headers, &addr).await;
 
+    // Detection details are a probe oracle: only the demo mode exposes them.
+    let demo = st.admin_cfg.demo;
+    if demo {
+        if let Some((trust, action)) = &v2_trust {
+            let _ = st
+                .kv
+                .set_ex(
+                    &format!("demo:last-trust:{site_key}"),
+                    &json!({ "trust": trust_json(trust), "action": action_str(*action) })
+                        .to_string(),
+                    120,
+                )
+                .await;
+        }
+    }
+    let trust_block = if demo {
+        v2_trust
+            .as_ref()
+            .map(|(trust, action)| {
+                json!({ "trust": trust_json(trust), "action": action_str(*action) })
+            })
+            .unwrap_or_else(|| json!({}))
+    } else {
+        json!({})
+    };
     Json(json!({
         "success": true,
         "token": redeem_token,
         "expires": token_expires,
         "scope": site_key,
+        "trust": trust_block.get("trust").cloned().unwrap_or(Value::Null),
+        "action": trust_block.get("action").cloned().unwrap_or(Value::Null),
     }))
     .into_response()
+}
+
+/// Trust result in the shape the dashboard/test page expects
+/// (`{score, level, reasons, gatingFailure}`), with the JS level names.
+fn trust_json(trust: &cap_detect::Trust) -> Value {
+    let level = match trust.level {
+        cap_detect::Level::Clean => "trusted",
+        cap_detect::Level::Restricted => {
+            if trust.score >= 50 {
+                "neutral"
+            } else {
+                "suspicious"
+            }
+        }
+        cap_detect::Level::Hostile => "hostile",
+    };
+    json!({
+        "score": trust.score,
+        "level": level,
+        "reasons": trust.reasons,
+        "gatingFailure": trust.gating_failure,
+    })
+}
+
+fn action_str(action: cap_detect::Action) -> &'static str {
+    match action {
+        cap_detect::Action::Allow => "allow",
+        cap_detect::Action::Deny => "deny",
+    }
 }
 
 async fn verify_common(
@@ -1242,31 +1302,44 @@ async fn public_asset(State(st): State<AppState>, Path(rel): Path<String>, heade
 /// exercised from one page. Everything else (layout, log box, messages) is the
 /// upstream file, unmodified.
 async fn demo_page(State(st): State<AppState>) -> Response {
-    // The upstream demo page (cap/demo/index.html), served as-is: one widget,
-    // one floating widget and the trigger button. Only the two script sources
-    // and the API endpoint change, because this server serves the bundled
-    // widget and mounts per-site-key endpoints.
-    let (site_key, _secret) = match demo_widget_credentials(&st).await {
+    if !st.admin_cfg.demo {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    // The reputation test page: click "开始验证", and the panel underneath
+    // shows the score, level, recommended action and every penalty reason.
+    let (site_key, secret) = match demo_widget_credentials(&st).await {
         Ok(k) => k,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("demo key: {e}")).into_response()
         }
     };
 
-    let path = dashboard_root().join("demo.html");
+    let path = dashboard_root().join("reputation.html");
     let html = match tokio::fs::read_to_string(&path).await {
         Ok(h) => h,
         Err(_) => {
-            return (StatusCode::NOT_FOUND, "demo.html is missing from the dashboard bundle")
+            return (
+                StatusCode::NOT_FOUND,
+                "reputation.html is missing from the dashboard bundle",
+            )
                 .into_response()
         }
     };
     let html = html
-        .replace(r#"data-cap-api-endpoint="/api/""#, &format!(r#"data-cap-api-endpoint="/{site_key}/""#))
-        .replace(r#"<script src="/cap.js"></script>"#, r#"<script src="/assets/widget.js"></script>"#)
         .replace(
-            r#"<script src="/cap-floating.js"></script>"#,
-            r#"<script src="/assets/floating.js"></script>"#,
+            r#"<cap-embed id="cap" data-site-key=""></cap-embed>"#,
+            &format!(r#"<cap-embed id="cap" data-site-key="{site_key}"></cap-embed>"#),
+        )
+        .replace(
+            r#"<script src="/embed.js"></script>"#,
+            &format!(
+                "<script>window.CAP_SITE={:?};window.CAP_SECRET={:?};</script><script src=\"/embed.js\"></script>",
+                site_key, secret
+            ),
+        )
+        .replace(
+            r#"fetch("/verify""#,
+            &format!(r#"fetch("/demo/verify""#),
         );
 
     let mut headers = HeaderMap::new();
@@ -1276,6 +1349,58 @@ async fn demo_page(State(st): State<AppState>) -> Response {
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     (StatusCode::OK, headers, html).into_response()
+}
+
+/// `POST /demo/verify` — siteverify for the demo page (the secret never
+/// leaves the server; the page just forwards the token).
+async fn demo_verify(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !st.admin_cfg.demo {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let (site_key, secret) = match demo_widget_credentials(&st).await {
+        Ok(k) => k,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("demo key: {e}")).into_response()
+        }
+    };
+    let token = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("response").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    let payload = json!({ "secret": secret, "response": token });
+    let bytes = Bytes::from(payload.to_string());
+    // This is a server-to-server call on behalf of the browser that solved the
+    // challenge, so forward its UA for the session-binding check.
+    let mut fwd = headers.clone();
+    if let Some(ua) = headers.get(header::USER_AGENT) {
+        fwd.insert(HeaderName::from_static("x-cap-client-ua"), ua.clone());
+    }
+    let resp = verify_common(&st, &fwd, &bytes, Some(&site_key), true).await;
+    // Attach the score of the solve that produced this token.
+    let last = st
+        .kv
+        .get(&format!("demo:last-trust:{site_key}"))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let mut doc: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert(
+            "trust".into(),
+            last.get("trust").cloned().unwrap_or(Value::Null),
+        );
+        obj.insert(
+            "action".into(),
+            last.get("action").cloned().unwrap_or(Value::Null),
+        );
+    }
+    (status, Json(doc)).into_response()
 }
 
 /// A site key + secret for the demo page. Created on first use and kept in
@@ -2453,6 +2578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/login", get(login_page))
         .route("/public/*rest", get(public_asset))
         .route("/demo", get(demo_page))
+        .route("/demo/verify", post(demo_verify))
         .route("/tester", get(tester_page))
         .route("/share", get(share_page))
         .route("/share/:token", get(admin_handler))
