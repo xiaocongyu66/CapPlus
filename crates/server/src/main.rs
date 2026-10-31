@@ -2597,7 +2597,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Ship the compiled-in widget as the default release, so a fresh install
     // serves /assets/* locally instead of depending on the CDN.
-    match releases.publish_builtin(&config::builtin_widget_zip(), config::WIDGET_ID.trim()) {
+    match releases.publish_builtin(config::builtin_widget_zip(), config::WIDGET_ID.trim()) {
         Ok(meta) => eprintln!(
             "[cap] built-in widget release: {} file(s), {} protected, active={}",
             meta.files, meta.protected, meta.active
@@ -2680,6 +2680,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tick.tick().await;
                 let _ = metrics.flush(&kv).await;
+            }
+        });
+    }
+
+    // Expire stale cache entries (site keys, settings) every minute.
+    {
+        let cache = state.cache.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                cache.sweep();
             }
         });
     }

@@ -163,8 +163,18 @@ pub fn frame_policy(cors_origins: &[String], parent: &str) -> FramePolicy {
         .filter(|o| !o.trim().is_empty())
         .peekable();
 
+    // Fail closed: without a configured allow-list the embedding parent is
+    // unverifiable, and the token would be posted to whatever origin the
+    // attacker put in `?parent=`. An operator who really wants any origin can
+    // configure `"*"` explicitly.
     if configured.peek().is_none() {
-        return FramePolicy::Allow("*".to_string());
+        return FramePolicy::Deny;
+    }
+    if cors_origins.iter().any(|o| o.trim() == "*") {
+        return match parse_origin(parent) {
+            Some(origin) => FramePolicy::Allow(origin),
+            None => FramePolicy::Deny,
+        };
     }
 
     let Some(parent_origin) = parse_origin(parent) else {
@@ -314,17 +324,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_list_allows_anyone() {
-        assert_eq!(
-            frame_policy(&[], "https://app.example.com"),
-            FramePolicy::Allow("*".into())
-        );
-        assert_eq!(frame_policy(&[], "garbage"), FramePolicy::Allow("*".into()));
+    fn empty_list_denies_by_default() {
+        // Fail closed: an unconfigured site cannot verify the embedding parent.
+        assert_eq!(frame_policy(&[], "https://app.example.com"), FramePolicy::Deny);
+        assert_eq!(frame_policy(&[], "garbage"), FramePolicy::Deny);
         // The JS filters out empty strings, so a list of blanks behaves like empty.
+        assert_eq!(frame_policy(&list(&["", "  "]), ""), FramePolicy::Deny);
+
+        // An explicit "*" is the documented way to allow any origin.
         assert_eq!(
-            frame_policy(&list(&["", "  "]), ""),
-            FramePolicy::Allow("*".into())
+            frame_policy(&list(&["*"]), "https://app.example.com"),
+            FramePolicy::Allow("https://app.example.com".into())
         );
+        assert_eq!(frame_policy(&list(&["*"]), "garbage"), FramePolicy::Deny);
     }
 
     #[test]

@@ -133,7 +133,9 @@ fn random_prime(bits: usize) -> BigUint {
         x |= BigUint::one() << (bits - 2); // second top bit (JS parity)
         let mask = (BigUint::one() << bits) - 1u32;
         x &= mask;
-        if is_probable_prime(&x, 4) {
+        // 40 rounds: false-positive bound 4^-40 (~8e-25). Four rounds (1/256)
+        // is not acceptable for a keypair that lives for the whole process.
+        if is_probable_prime(&x, 40) {
             return x;
         }
     }

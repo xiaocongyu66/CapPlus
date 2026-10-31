@@ -139,12 +139,15 @@ static DASHBOARD_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dashboar
 /// The default widget bundle (widget.js + wasm), published on first start.
 pub static WIDGET_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/widget.zip"));
 
+/// Content fingerprint of the compiled-in dashboard bundle.
+pub static DASHBOARD_ID: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard-id.txt"));
+
 /// Content fingerprint of the compiled-in widget bundle.
 pub static WIDGET_ID: &str = include_str!(concat!(env!("OUT_DIR"), "/widget-id.txt"));
 
 /// The prebuilt widget bundle, ready for [`cap_assets::ReleaseStore::publish_builtin`].
-pub fn builtin_widget_zip() -> Vec<u8> {
-    WIDGET_ZIP.to_vec()
+pub fn builtin_widget_zip() -> &'static [u8] {
+    WIDGET_ZIP
 }
 
 /// Extract the bundled dashboard into `target` (idempotent).
@@ -166,7 +169,8 @@ fn unpack_embedded_dashboard(target: &std::path::Path) -> Result<usize, String> 
 /// `CAPPRO_DIR`, else `<dir of the executable>/cappro`, else `./cappro`.
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CAPPRO_DIR") {
-        if !dir.trim().is_empty() {
+        let dir = dir.trim();
+        if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
@@ -181,7 +185,12 @@ fn env_str(name: &str) -> Option<String> {
 }
 
 fn env_bool(name: &str) -> Option<bool> {
-    env_str(name).map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+    env_str(name).map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        )
+    })
 }
 
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -216,12 +225,25 @@ pub fn init() -> Result<Settings, String> {
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
 
-    // Unpack the embedded dashboard on first start so a single-binary
-    // install still has a login page and the admin panel.
+    // Unpack the embedded dashboard so a single-binary install still has a
+    // login page and the admin panel. Re-unpack when the embedded bundle
+    // changed, so files removed in a new build do not linger and keep being
+    // served. The directory is generated (not user-edited), so clearing it is
+    // safe.
     let dashboard_dir = dir.join("dashboard");
-    if !dashboard_dir.join("index.html").is_file() {
+    let stamp = dashboard_dir.join(".bundle-id");
+    let current = DASHBOARD_ID.trim();
+    let installed = std::fs::read_to_string(&stamp).unwrap_or_default();
+    if !dashboard_dir.join("index.html").is_file() || installed.trim() != current {
+        let _ = std::fs::remove_dir_all(&dashboard_dir);
         match unpack_embedded_dashboard(&dashboard_dir) {
-            Ok(n) => eprintln!("[cap] dashboard unpacked: {n} files → {}", dashboard_dir.display()),
+            Ok(n) => {
+                let _ = std::fs::write(&stamp, current);
+                eprintln!(
+                    "[cap] dashboard unpacked: {n} files → {}",
+                    dashboard_dir.display()
+                );
+            }
             Err(e) => eprintln!("[cap] could not unpack the embedded dashboard: {e}"),
         }
     }
@@ -262,7 +284,13 @@ pub fn init() -> Result<Settings, String> {
     Ok(Settings {
         hostname: env_str("SERVER_HOSTNAME").unwrap_or(file.server.hostname),
         port: env_str("SERVER_PORT")
-            .and_then(|p| p.parse().ok())
+            .and_then(|p| match p.trim().parse() {
+                Ok(port) => Some(port),
+                Err(_) => {
+                    eprintln!("[cap] SERVER_PORT={p:?} is not a number; using {}", file.server.port);
+                    None
+                }
+            })
             .unwrap_or(file.server.port),
         admin_key: env_str("ADMIN_KEY").unwrap_or(file.admin.admin_key),
         demo: env_bool("DEMO_MODE").unwrap_or(file.server.demo),

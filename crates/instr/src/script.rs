@@ -447,6 +447,7 @@ pub fn build_script(rng: &mut Rng, namer: &mut Namer, inp: &ScriptInput<'_>) -> 
         ),
     };
 
+    let go_key = format!("{}n", out_key);
     let owned: Vec<(String, String)> = vec![
         ("%HELPERS%".into(), helpers),
         ("%ENV%".into(), env),
@@ -457,6 +458,9 @@ pub fn build_script(rng: &mut Rng, namer: &mut Namer, inp: &ScriptInput<'_>) -> 
         ("%PROBE%".into(), probe),
         ("%AWAIT%".into(), await_pending),
         ("%POST%".into(), post),
+        // Named entry point for the load listener (avoids `window.onload`,
+        // which would clobber the widget's own handler).
+        ("%GO%".into(), go_key),
     ];
     let mut pairs: Vec<(String, String)> = owned;
     for (i, v) in inp.vars.iter().enumerate() {
@@ -466,7 +470,7 @@ pub fn build_script(rng: &mut Rng, namer: &mut Namer, inp: &ScriptInput<'_>) -> 
     let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
     let body = tmpl(
-        "(function(){window.onload=async function(){try {%HELPERS%const %DV%=await (async function(){%ENV%%BLOCK%var %V0%=%I0%;var %V1%=%I1%;var %V2%=%I2%;var %V3%=%I3%;%CLIENTEQ%var %OUT%={};%OUT%[\"%V0%\"]=%V0%;%OUT%[\"%V1%\"]=%V1%;%OUT%[\"%V2%\"]=%V2%;%OUT%[\"%V3%\"]=%V3%;return %OUT%;})();if (!%DV% || typeof %DV% !== 'object') return;%PROBE%%AWAIT%%POST%} catch {}};})();",
+        "(function(){async function %GO%(){try {%HELPERS%const %DV%=await (async function(){%ENV%%BLOCK%var %V0%=%I0%;var %V1%=%I1%;var %V2%=%I2%;var %V3%=%I3%;%CLIENTEQ%var %OUT%={};%OUT%[\"%V0%\"]=%V0%;%OUT%[\"%V1%\"]=%V1%;%OUT%[\"%V2%\"]=%V2%;%OUT%[\"%V3%\"]=%V3%;return %OUT%;})();if (!%DV% || typeof %DV% !== 'object') return;%PROBE%%AWAIT%%POST%} catch {}}if(document.readyState==='complete'){%GO%()}else{window.addEventListener('load',%GO%)};})();",
         &refs,
     );
 

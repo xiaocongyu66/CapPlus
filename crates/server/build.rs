@@ -145,7 +145,9 @@ fn main() {
     let sibling = manifest.join("../../../cap/standalone/public");
     let dashboard = if vendored.join("index.html").is_file() { vendored } else { sibling };
     println!("cargo:rerun-if-changed={}", dashboard.display());
-    bundle("dashboard", &dashboard, &out_dir);
+    let dashboard_hash = bundle("dashboard", &dashboard, &out_dir);
+    std::fs::write(out_dir.join("dashboard-id.txt"), format!("{dashboard_hash:016x}"))
+        .expect("write dashboard-id.txt");
 
     // Widget: refresh from source when `bun` and the toolchain are present,
     // otherwise ship the prebuilt bundle committed under widget-dist/.

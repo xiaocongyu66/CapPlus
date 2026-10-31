@@ -117,19 +117,35 @@ fn init_state() -> Result<HashwxState, String> {
     })
 }
 
-/// Lazily initialised, process-wide interpreter instance. `None` if init failed
-/// (logged once at initialisation time).
-fn state() -> Option<&'static Mutex<HashwxState>> {
-    static STATE: OnceLock<Option<Mutex<HashwxState>>> = OnceLock::new();
-    STATE
-        .get_or_init(|| match init_state() {
-            Ok(state) => Some(Mutex::new(state)),
-            Err(err) => {
-                eprintln!("[cap-proto] hashwx: wasm instantiation failed: {err}");
-                None
+/// Lazily initialised pool of interpreter instances.
+///
+/// One instance behind a single mutex serialised every verification in the
+/// process, so one client replaying a token with different nonces could stall
+/// all real redeems. Each `Store` is independent, so a small pool is safe.
+fn states() -> Option<&'static Vec<Mutex<HashwxState>>> {
+    static POOL: OnceLock<Option<Vec<Mutex<HashwxState>>>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let size = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8);
+        let mut pool = Vec::with_capacity(size);
+        for idx in 0..size {
+            match init_state() {
+                Ok(state) => pool.push(Mutex::new(state)),
+                Err(err) => {
+                    if idx == 0 {
+                        eprintln!("[cap-proto] hashwx: wasm instantiation failed: {err}");
+                        return None;
+                    }
+                    // Partial pool is fine: keep what worked.
+                    break;
+                }
             }
-        })
-        .as_ref()
+        }
+        (!pool.is_empty()).then_some(pool)
+    })
+    .as_ref()
 }
 
 impl HashwxState {
@@ -165,7 +181,10 @@ pub fn hashwx_seed(challenge: &[u8; HASHWX_CHALLENGE_SIZE], block: u64) -> [u8; 
 /// Hash `seed` with `nonce` via the embedded WASM module. `None` if the module
 /// could not be instantiated or a call trapped.
 pub fn hash_nonce(seed: &[u8; HASHWX_SEED_SIZE], nonce: u64) -> Option<u64> {
-    let mutex = state()?;
+    let pool = states()?;
+    // Spread by nonce so concurrent verifications rarely contend.
+    let idx = (nonce as usize) % pool.len();
+    let mutex = &pool[idx];
     let mut guard = mutex.lock().unwrap_or_else(|poison| poison.into_inner());
     guard.run(seed, nonce)
 }

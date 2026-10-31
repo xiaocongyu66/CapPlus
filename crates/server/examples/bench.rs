@@ -19,7 +19,7 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let url = args.next().expect("usage: bench <url> [concurrency] [seconds]");
     let conc: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(64);
-    let secs: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let secs: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(5).max(1);
     let method = if std::env::var("BENCH_GET").is_ok() { Method::GET } else { Method::POST };
 
     let uri: hyper::Uri = url.parse().expect("url");
@@ -27,10 +27,11 @@ async fn main() {
     let ok = Arc::new(AtomicU64::new(0));
     let err = Arc::new(AtomicU64::new(0));
     let lat = Arc::new(std::sync::Mutex::new(Vec::<u128>::new()));
+    let start = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(secs);
 
     let mut tasks = Vec::new();
-    for _ in 0..conc {
+    for worker_id in 0..conc {
         let client = client.clone();
         let uri = uri.clone();
         let ok = ok.clone();
@@ -39,12 +40,15 @@ async fn main() {
         let method = method.clone();
         tasks.push(tokio::spawn(async move {
             let mut local = Vec::new();
+            // Distinct IPs per worker: with CAP_TRUST_PROXY the server would
+            // otherwise put every request in one rate-limit bucket.
+            let xff = format!("10.{}.{}.1", worker_id % 250, (worker_id / 250) % 250);
             while Instant::now() < deadline {
                 let req = Request::builder()
                     .method(method.clone())
                     .uri(uri.clone())
                     .header("content-type", "application/json")
-                    .header("x-forwarded-for", "10.1.1.1")
+                    .header("x-forwarded-for", &xff)
                     .body(Empty::new())
                     .unwrap();
                 let t0 = Instant::now();
@@ -71,6 +75,7 @@ async fn main() {
         let _ = t.await;
     }
 
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
     let total = ok.load(Ordering::Relaxed);
     let errors = err.load(Ordering::Relaxed);
     let mut v = lat.lock().unwrap().clone();
@@ -84,7 +89,7 @@ async fn main() {
     };
     println!(
         "rps={:.0} ok={} err={} p50={:.2}ms p95={:.2}ms p99={:.2}ms",
-        total as f64 / secs as f64,
+        total as f64 / elapsed,
         total,
         errors,
         pct(0.5),

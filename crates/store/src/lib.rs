@@ -270,8 +270,10 @@ impl Store {
         window_ms: i64,
         max: i64,
     ) -> Result<bool, StoreError> {
-        if ip.is_empty() {
-            return Ok(true); // no client IP → limiter disabled (JS behaviour)
+        // `max <= 0` disables the limiter, matching LocalLimiter::hit; the
+        // two modes must not disagree about what 0 means.
+        if ip.is_empty() || max <= 0 {
+            return Ok(true); // no client IP / disabled → limiter off
         }
         let window_ms = window_ms.max(1);
         let window_secs = ((window_ms as f64) / 1000.0).ceil() as i64;

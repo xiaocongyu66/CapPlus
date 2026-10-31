@@ -17,6 +17,10 @@ use cap_store::{KeyInfo, Store};
 
 const TTL: Duration = Duration::from_millis(1000);
 
+/// Hard cap on cached site keys. Unauthenticated requests can present an
+/// unlimited number of bogus site keys; the negative cache must stay bounded.
+const MAX_KEYS: usize = 10_000;
+
 type Slot<T> = (Instant, Option<T>);
 
 pub struct ConfigCache {
@@ -52,14 +56,18 @@ impl ConfigCache {
         }
         let loaded = match store.key(site_key).await {
             Ok(k) => k.map(Arc::new),
-            // A storage error must not be cached as "missing"; fall through to
-            // an uncached answer.
-            Err(_) => return store.key(site_key).await.ok().flatten().map(Arc::new),
+            // A storage error must not be cached as "missing". Do not retry
+            // either: under a Redis outage that would double the load.
+            Err(_) => return None,
         };
-        self.keys
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(site_key.to_string(), (Instant::now(), loaded.clone()));
+        {
+            let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
+            // Do not let an attacker grow the map without bound; when full,
+            // skip caching (the answer is still returned, just not remembered).
+            if keys.len() < MAX_KEYS {
+                keys.insert(site_key.to_string(), (Instant::now(), loaded.clone()));
+            }
+        }
         loaded
     }
 
@@ -76,17 +84,38 @@ impl ConfigCache {
                 return hit.clone().unwrap_or(serde_json::Value::Null);
             }
         }
-        let value = kv
-            .get(name)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        let value = match kv.get(name).await {
+            // A read error is NOT "the setting is absent": caching it would
+            // silently disable integrity checking for a second. Cache only a
+            // real missing/parsed value.
+            Ok(raw) => Some(
+                raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()),
+            ),
+            Err(_) => None,
+        };
+        if value.is_none() {
+            return serde_json::Value::Null;
+        }
         self.settings
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(name.to_string(), (Instant::now(), value.clone()));
-        value.unwrap_or(serde_json::Value::Null)
+            .insert(name.to_string(), (Instant::now(), value.clone().flatten()));
+        value.flatten().unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Drop entries older than a few TTLs. Called from a background task so
+    /// the map cannot grow with every site key ever requested.
+    pub fn sweep(&self) {
+        let now = Instant::now();
+        let horizon = TTL * 10;
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (at, _)| now.duration_since(*at) < horizon);
+        self.settings
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (at, _)| now.duration_since(*at) < horizon);
     }
 
     /// Drop every cached entry (used after admin writes).

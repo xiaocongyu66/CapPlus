@@ -1833,7 +1833,10 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
         .filter(|c| !c.gating && !c.passed)
         .map(|c| c.id.clone())
         .collect();
-    let signals = collect_signals(&checks, opts.optional_fields, vector);
+    // Must see the same data the checks did: a field supplied only by the
+    // top frame (merged into `s`) would otherwise be treated as "missing" and
+    // its signal dropped, under-scoring the client.
+    let signals = collect_signals(&checks, opts.optional_fields, s);
 
     DetectOutcome {
         pass: blocked_by.is_empty(),
