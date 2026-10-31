@@ -8,11 +8,11 @@
 //!
 //! Phase-1 scope
 //! -------------
-//! * `obfuscation_level` is clamped to `1..=10` but only the level 1..=3
-//!   whitespace normalisation is applied. The JS implementation additionally
-//!   runs esbuild minification (levels 4..=7) and `javascript-obfuscator`
-//!   (levels 8..=10); those are native JS toolchains and are not ported yet, so
-//!   the level is a no-op beyond normalisation. `script_hash` is computed over
+//! * `obfuscation_level` is clamped to `1..=10` and currently a **no-op**: the
+//!   whitespace normalisation below is applied for every level. The JS
+//!   implementation runs esbuild minification (levels 4..=7) and
+//!   `javascript-obfuscator` (levels 8..=10); those are native JS toolchains
+//!   and are not ported yet. `script_hash` is computed over
 //!   the exact text returned in `script`.
 //! * `script` is the *uncompressed* body. The JS generator additionally
 //!   raw-deflates + base64-encodes it for transport (`instrumentation`); that

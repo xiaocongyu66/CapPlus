@@ -485,11 +485,13 @@ pub fn build_script(rng: &mut Rng, namer: &mut Namer, inp: &ScriptInput<'_>) -> 
 /// therefore currently a no-op beyond whitespace normalisation — documented in
 /// the crate docs.
 pub fn apply_obfuscation(script: String, level: u8) -> String {
-    let _level = level.clamp(1, 10);
+    // No-op for every level in phase 1 (see the module docs); the clamp only
+    // documents the accepted range.
+    let _ = level.clamp(1, 10);
     normalize_whitespace(&script)
 }
 
-/// The reference applies this transform for obfuscation levels 1..=3.
+/// Applied for every obfuscation level here (phase 1 is a no-op beyond this).
 pub fn normalize_whitespace(script: &str) -> String {
     let mut out = String::with_capacity(script.len() + 16);
     let mut first = true;

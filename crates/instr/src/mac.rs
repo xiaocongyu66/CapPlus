@@ -310,3 +310,56 @@ fn hex_val(b: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod kat {
+    use super::*;
+    use serde_json::json;
+
+    /// Reference values produced by Node/V8 (`JSON.stringify`) so a drift in
+    /// `js_f64`/escaping is caught here instead of by every real client.
+    #[test]
+    fn js_stringify_matches_node() {
+        let cases: &[(Value, &str)] = &[
+            (json!({"a":1,"b":[true,null,"x"]}), r#"{"a":1,"b":[true,null,"x"]}"#),
+            (json!({"f":0.1}), r#"{"f":0.1}"#),
+            (json!({"f":1e21}), r#"{"f":1e+21}"#),
+            (json!({"f":1e-7}), r#"{"f":1e-7}"#),
+            (json!({"f":1e-6}), r#"{"f":0.000001}"#),
+            (json!({"f":-0.0}), r#"{"f":0}"#),
+            (
+                json!({"f":1.7976931348623157e308}),
+                r#"{"f":1.7976931348623157e+308}"#,
+            ),
+            (json!({"f":5e-324}), r#"{"f":5e-324}"#),
+            (json!({"s":"a\"b\\c\u{8}"}), r#"{"s":"a\"b\\c\b"}"#),
+        ];
+        for (value, want) in cases {
+            assert_eq!(js_stringify(value), *want, "input: {value}");
+        }
+    }
+
+    /// Locks `js_stringify`, `js_f64` and the key encoding (ASCII bytes of the
+    /// 32-hex key) together: the digest was produced by Node's
+    /// `crypto.createHmac('sha256', Buffer.from(key,'utf8'))`.
+    #[test]
+    fn verify_result_mac_kat() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let state = json!({"a":1,"f":0.1});
+        let p = json!({"ua":"Mozilla/5.0","screen":{"width":1920,"height":1080}});
+        let mac = "0ffe4439f1951c9940650ef7dd3d1df4f1fde2775df35b71988c54014f734bd9";
+
+        assert!(verify_result_mac(key, "abcd1234", 1_700_000_000_000, &state, &p, mac));
+        // Any field change must invalidate it.
+        assert!(!verify_result_mac(key, "abcd1234", 1_700_000_000_001, &state, &p, mac));
+        assert!(!verify_result_mac(
+            key,
+            "abcd1234",
+            1_700_000_000_000,
+            &json!({"a":1,"f":0.2}),
+            &p,
+            mac
+        ));
+        assert!(!verify_result_mac("", "abcd1234", 1_700_000_000_000, &state, &p, mac));
+    }
+}

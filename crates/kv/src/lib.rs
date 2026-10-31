@@ -223,8 +223,10 @@ impl Kv {
             .await
     }
 
-    /// Atomically write several string keys with one TTL (used to issue a
-    /// verification token: `bind:`, `token:`, `verified:`).
+    /// Write several string keys with one TTL in a single MULTI/EXEC.
+    ///
+    /// Note: Redis does not roll back on execution-time errors (e.g. OOM), so a
+    /// partial write is possible; the TTL bounds how long it lingers.
     pub async fn set_many_ex(&self, items: &[(String, String)], secs: i64) -> KvResult<()> {
         if items.is_empty() {
             return Ok(());

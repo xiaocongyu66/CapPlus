@@ -288,6 +288,11 @@ impl RswMinter {
 
 /// Hex comparison with the JS normalisation (`0x` prefix, case, leading zeros).
 pub fn verify_solution(expected_y_hex: &str, claimed_y_hex: &str) -> bool {
+    // A literally empty claim normalises to "" and would otherwise match an
+    // empty expectation. "0"/"000" stay valid (y can legitimately be zero).
+    if claimed_y_hex.trim().is_empty() {
+        return false;
+    }
     fn norm(s: &str) -> String {
         let s = s.strip_prefix("0x").unwrap_or(s).to_ascii_lowercase();
         s.trim_start_matches('0').to_string()
