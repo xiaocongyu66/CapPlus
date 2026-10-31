@@ -31,6 +31,8 @@ pub struct FileConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerSection {
+    /// Bind address (`SERVER_HOSTNAME`).
+    pub hostname: String,
     pub port: u16,
     /// Directory of the official dashboard (`cap/standalone/public`). Empty =
     /// auto-discover.
@@ -40,7 +42,12 @@ pub struct ServerSection {
 
 impl Default for ServerSection {
     fn default() -> Self {
-        Self { port: 3000, dashboard_dir: String::new(), demo: false }
+        Self {
+            hostname: "0.0.0.0".into(),
+            port: 3000,
+            dashboard_dir: String::new(),
+            demo: false,
+        }
     }
 }
 
@@ -92,13 +99,18 @@ impl Default for AssetsSection {
 pub struct ProxySection {
     pub trust_proxy: bool,
     pub proxy_secret: String,
+    /// Header carrying the real client IP (`RATELIMIT_IP_HEADER`).
+    pub ip_header: String,
 }
 
 /// Resolved runtime configuration.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub data_dir: PathBuf,
+    pub hostname: String,
     pub port: u16,
+    pub ip_header: String,
+    pub rsw_bits: usize,
     pub admin_key: String,
     pub demo: bool,
     pub redis_url: String,
@@ -245,6 +257,7 @@ pub fn init() -> Result<Settings, String> {
     });
 
     Ok(Settings {
+        hostname: env_str("SERVER_HOSTNAME").unwrap_or(file.server.hostname),
         port: env_str("SERVER_PORT")
             .and_then(|p| p.parse().ok())
             .unwrap_or(file.server.port),
@@ -259,6 +272,10 @@ pub fn init() -> Result<Settings, String> {
         widget_version: env_str("WIDGET_VERSION").unwrap_or(file.assets.widget_version),
         wasm_version: env_str("WASM_VERSION").unwrap_or(file.assets.wasm_version),
         embed_widget_url: env_str("EMBED_WIDGET_URL").unwrap_or(file.assets.embed_widget_url),
+        ip_header: env_str("RATELIMIT_IP_HEADER").unwrap_or(file.proxy.ip_header),
+        rsw_bits: env_str("RSW_BITS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048),
         trust_proxy: env_bool("CAP_TRUST_PROXY").unwrap_or(file.proxy.trust_proxy),
         proxy_secret: env_str("CAP_PROXY_SECRET").unwrap_or(file.proxy.proxy_secret),
         data_dir: dir,

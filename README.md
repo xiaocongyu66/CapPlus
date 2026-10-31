@@ -54,7 +54,16 @@ default `redis://127.0.0.1:6379`).
 - Request filtering (`blockNonBrowserUA`, required headers), blocked IPs
   (exact / CIDR / country / ASN), CORS for cross-origin widgets, and
   per-key-or-global rate limiting with `metrics:ratelimited`.
-- TODO: demo mode, asset-integrity sealing, edge/WASM deployment.
+- Asset-integrity chain: the operator's WASM/widget SHA-256 baseline is
+  sealed into the challenge token and checked at redeem, including the
+  RFC-9421-style request proof (`nonce|ts|solutions|hashes`).
+- Instrumentation outcomes (`instr_blocked`, `instr_timeout`, sealed expiry,
+  accept-language cross-check) are enforced at redeem.
+- `DEMO_MODE=true` serves the dashboard without login, with seven synthetic
+  keys, charts, geo data and blocked IPs.
+- Latency metrics, siteverify rate limiting, `SERVER_HOSTNAME`, `RSW_BITS`,
+  `RATELIMIT_IP_HEADER`.
+- TODO: edge/WASM deployment.
 
 See `MIGRATION.md` for the Bun → Rust cutover runbook (shared Redis, per-key rollout, rollback).
 

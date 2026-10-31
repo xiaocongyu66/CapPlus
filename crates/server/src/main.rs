@@ -102,6 +102,18 @@ fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
 }
 
 fn client_ip(headers: &HeaderMap, peer: &str) -> String {
+    // An explicit IP header always wins when configured.
+    let configured = settings().ip_header.clone();
+    if !configured.is_empty() {
+        if let Some(v) = headers.get(configured.as_str()).and_then(|v| v.to_str().ok()) {
+            if let Some(first) = v.split(',').next() {
+                let ip = first.trim();
+                if !ip.is_empty() {
+                    return ip.to_string();
+                }
+            }
+        }
+    }
     if proxy_trusted(headers, peer) {
         for h in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"] {
             if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
@@ -249,6 +261,32 @@ async fn challenge(
     Path(site_key): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let started = std::time::Instant::now();
+    let resp = challenge_inner(st.clone(), addr, site_key.clone(), headers).await;
+    if resp.status().is_success() {
+        record_latency(&st, &site_key, started.elapsed().as_millis() as i64).await;
+    }
+    resp
+}
+
+async fn record_latency(st: &AppState, site_key: &str, ms: i64) {
+    let bucket = hourly_bucket(now_ms()).to_string();
+    let _ = st
+        .kv
+        .hincrby(&format!("metrics:latency_sum:{site_key}"), &bucket, ms)
+        .await;
+    let _ = st
+        .kv
+        .hincrby(&format!("metrics:latency_count:{site_key}"), &bucket, 1)
+        .await;
+}
+
+async fn challenge_inner(
+    st: AppState,
+    addr: SocketAddr,
+    site_key: String,
+    headers: HeaderMap,
+) -> Response {
     let key = match st.store.key(&site_key).await {
         Ok(Some(k)) => k,
         Ok(None) => {
@@ -361,9 +399,10 @@ async fn challenge(
                 .into_response();
         };
         let _ = ev;
-        let payload = json!({
+        let mut payload = json!({
             "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev2,
         });
+        seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
         let token = jwt_sign(&payload, &key.jwt_secret);
         return Json(json!({
             "token": token,
@@ -446,10 +485,11 @@ async fn challenge(
     let now = now_ms();
     let expires = now + CHALLENGE_TTL_MS;
     let nonce = random_hex(25);
-    let payload = json!({
+    let mut payload = json!({
         "n": nonce, "c": params.c, "s": params.s, "d": params.d,
         "exp": expires, "iat": now, "sk": site_key,
     });
+    seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
     let token = jwt_sign(&payload, &key.jwt_secret);
     Json(json!({
         "challenge": {"c": params.c, "s": params.s, "d": params.d},
@@ -519,6 +559,21 @@ async fn redeem(
     if claims.get("sk").and_then(Value::as_str) != Some(site_key.as_str()) {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "scope_mismatch"}))).into_response();
     }
+    if let Err(reason) = check_integrity(&claims, &payload, &key.jwt_secret) {
+        let _ = st
+            .kv
+            .hincrby(
+                &format!("metrics:failed:{site_key}"),
+                &hourly_bucket(now_ms()).to_string(),
+                1,
+            )
+            .await;
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "integrity", "reason": reason })),
+        )
+            .into_response();
+    }
     let now = now_ms();
     let exp = claims.get("exp").and_then(Value::as_i64).unwrap_or(0);
     if exp <= now {
@@ -533,6 +588,71 @@ async fn redeem(
         let Some(expected) = v2::decrypt_gcm(ev, &key.jwt_secret, v2::INFO_FMT2) else {
             return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid_token"}))).into_response();
         };
+        // Instrumentation outcomes the widget reports explicitly.
+        let blocked_flag = payload
+            .get("instr_blocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let timeout_flag = payload
+            .get("instr_timeout")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let instr_meta = expected
+            .as_array()
+            .and_then(|list| {
+                list.iter()
+                    .find(|c| c.get("protocol").and_then(Value::as_str) == Some("instrumentation"))
+            })
+            .and_then(|c| c.get("instrMeta"));
+        if let Some(meta) = instr_meta {
+            if let Some(sealed_exp) = meta.get("expires").and_then(Value::as_i64) {
+                if sealed_exp <= now {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": "instr_expired"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        if blocked_flag {
+            let automated = instr_meta
+                .and_then(|m| m.get("blockAutomatedBrowsers"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let _ = st
+                .kv
+                .hincrby(
+                    &format!("metrics:failed:{site_key}"),
+                    &hourly_bucket(now).to_string(),
+                    1,
+                )
+                .await;
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": if automated { "instr_automated_browser" } else { "instr_failed" },
+                    "instr_error": true,
+                })),
+            )
+                .into_response();
+        }
+        if timeout_flag {
+            let _ = st
+                .kv
+                .hincrby(
+                    &format!("metrics:failed:{site_key}"),
+                    &hourly_bucket(now).to_string(),
+                    1,
+                )
+                .await;
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "instr_timeout", "instr_error": true})),
+            )
+                .into_response();
+        }
+
         // Run the probe detector on the captured instrumentation payload and
         // remember the verdict; the deny decision is enforced after the nonce
         // has been consumed (same ordering as the JS server).
@@ -541,10 +661,16 @@ async fn redeem(
             eprintln!("[redeem] no probe captured (solutions={})", solutions_raw.len());
         }
         if let Some(cap) = captured {
+            let accept_language = header_str(&headers, "accept-language");
+            let primary_lang = accept_language
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             let opts = cap_detect::DetectOpts {
                 font_stack_count: Some(cap_detect::PROBE_FONT_STACK_COUNT),
                 optional_fields: &cap.optional_fields,
-                accept_language: None,
+                accept_language: primary_lang,
             };
             let outcome = cap_detect::detect_automation(&cap.p, &opts);
             let owned = outcome.signals.clone();
@@ -864,10 +990,20 @@ fn error_message(code: ErrorCode) -> &'static str {
 
 async fn siteverify(
     State(st): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(site_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // 300 verifications per 10 s per IP (matches siteverify.js).
+    let ip = client_ip(&headers, &addr.ip().to_string());
+    if let Ok(false) = st.store.rate_hit("siteverify", &ip, 10_000, 300).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(err_response(ErrorCode::BadRequest, "Rate limit exceeded")),
+        )
+            .into_response();
+    }
     verify_common(&st, &headers, &body, Some(&site_key), true).await
 }
 
@@ -1044,7 +1180,7 @@ async fn serve_dashboard_file(rel: &str, cache: &'static str) -> Response {
 /// `GET /` — the dashboard when `cap_authed=yes`, the login page otherwise
 /// (the same switch `standalone/src/index.js` makes).
 async fn root_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let page = if cookie_authed(&st, &headers).await {
+    let page = if st.admin_cfg.demo || cookie_authed(&st, &headers).await {
         "index.html"
     } else {
         "login.html"
@@ -1116,6 +1252,116 @@ fn parse_ua(ua: &str) -> (Option<&'static str>, Option<&'static str>) {
         None
     };
     (platform, os)
+}
+
+/// The operator's asset baseline (`settings:integrity`), or `None` when no
+/// usable sha256 hash is configured.
+async fn load_integrity(st: &AppState) -> Option<Value> {
+    let raw = st.kv.get("settings:integrity").await.ok().flatten()?;
+    let doc: Value = serde_json::from_str(&raw).ok()?;
+    let mut out = serde_json::Map::new();
+    for key in ["widget", "capWasm", "hashwxWasm"] {
+        if let Some(v) = doc.get(key).and_then(Value::as_str) {
+            let v = v.trim().to_ascii_lowercase();
+            if v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()) {
+                out.insert(key.to_string(), json!(v));
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Object(out))
+    }
+}
+
+/// Seal the baseline into the token: `ig` (encrypted) so the client cannot
+/// read or tamper with it.
+fn seal_integrity(payload: &mut Value, integrity: &Option<Value>, secret: &str) {
+    if let Some(ig) = integrity {
+        if let Some(blob) = v2::encrypt_gcm(ig, secret, "cap:integrity-v1") {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("ig".into(), json!(blob));
+            }
+        }
+    }
+}
+
+/// Verify the client's reported assets and request proof against the sealed
+/// baseline. `Err(reason)` means the solve must be rejected.
+fn check_integrity(claims: &Value, body: &Value, secret: &str) -> Result<(), String> {
+    let Some(blob) = claims.get("ig").and_then(Value::as_str) else {
+        return Ok(()); // legacy challenge without a baseline
+    };
+    let Some(expected) = v2::decrypt_gcm(blob, secret, "cap:integrity-v1") else {
+        return Err("integrity_corrupted".into());
+    };
+    let reported = body.get("integrity").cloned().unwrap_or(Value::Null);
+    if !reported.is_object() {
+        return Err("integrity_missing".into());
+    }
+
+    // Strong: WASM hashes must match exactly.
+    for key in ["capWasm", "hashwxWasm"] {
+        if let Some(want) = expected.get(key).and_then(Value::as_str) {
+            let got = reported
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|v| v.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if got != want {
+                return Err(format!("integrity_mismatch:{key}"));
+            }
+        }
+    }
+
+    // Request proof: sha256(nonce|ts|solDigest|hashes) with a replay window.
+    let Some(proof) = reported
+        .get("proof")
+        .and_then(Value::as_str)
+        .map(|v| v.trim().to_ascii_lowercase())
+    else {
+        return Err("proof_missing".into());
+    };
+    let Some(ts) = reported.get("ts").and_then(Value::as_i64).or_else(|| {
+        reported
+            .get("ts")
+            .and_then(Value::as_f64)
+            .map(|v| v as i64)
+    }) else {
+        return Err("proof_missing_ts".into());
+    };
+    if (now_ms() - ts).abs() > 120_000 {
+        return Err("proof_stale".into());
+    }
+    let Some(nonce) = claims
+        .get("n")
+        .or_else(|| claims.get("nonce"))
+        .and_then(Value::as_str)
+    else {
+        return Err("proof_no_nonce".into());
+    };
+    let solutions = body.get("solutions").cloned().unwrap_or(Value::Null);
+    let sol_digest = cap_core::sha256_hex(&serde_json::to_string(&solutions).unwrap_or_default());
+    let mut pairs: Vec<String> = ["capWasm", "hashwxWasm", "widget", "scriptHash"]
+        .iter()
+        .filter_map(|k| {
+            reported
+                .get(*k)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(|v| format!("{k}={v}"))
+        })
+        .collect();
+    pairs.sort();
+    let expected_proof = cap_core::sha256_hex(&format!(
+        "{nonce}|{ts}|{sol_digest}|{}",
+        pairs.join(",")
+    ));
+    if expected_proof != proof {
+        return Err("proof_mismatch".into());
+    }
+    Ok(())
 }
 
 /// `true` when the UA looks like a real browser (mirrors the JS check).
@@ -1363,7 +1609,8 @@ async fn ensure_rsw_keypair(st: &AppState) -> Result<std::collections::HashMap<S
     if !fields.is_empty() {
         return Ok(fields);
     }
-    let pair = tokio::task::spawn_blocking(|| cap_proto::generate_keypair(2048))
+    let bits = settings().rsw_bits.max(512) & !1; // even, at least 512
+    let pair = tokio::task::spawn_blocking(move || cap_proto::generate_keypair(bits))
         .await
         .map_err(|e| e.to_string())?;
     let pairs = [
@@ -2054,7 +2301,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let host = settings().hostname.clone();
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|e| format!("invalid SERVER_HOSTNAME {host}: {e}"))?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("cap-server (rust) listening on http://{addr}");
     axum::serve(

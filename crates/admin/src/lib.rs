@@ -10,6 +10,7 @@
 
 mod auth;
 mod blocked;
+mod demo;
 mod ipdb;
 mod rsw;
 mod keys;
@@ -196,8 +197,65 @@ pub async fn handle(
     }
 
     let body = parse_body(req.body);
+    if cfg.demo {
+        if let Some(resp) = demo_dispatch(req, &method, &body) {
+            return add_security_headers(resp);
+        }
+    }
     let resp = dispatch(store, cfg, req, &method, &scope, &body).await;
     add_security_headers(resp)
+}
+
+/// Demo-mode reads. Returns `None` for anything this module does not own, so
+/// the real handler (e.g. `/about`) still answers.
+fn demo_dispatch(req: &AdminRequest<'_>, method: &str, _body: &Value) -> Option<AdminResponse> {
+    if method != "GET" && method != "HEAD" {
+        return None;
+    }
+    let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
+    let duration = query_param(req.query, "chartDuration").unwrap_or("today");
+    Some(match segs.as_slice() {
+        ["keys"] => ok(demo::keys_list()),
+        ["keys", sk] => match demo::key_detail(sk, duration) {
+            Some(v) => ok(v),
+            None => ok(json!({ "success": false, "error": "Key not found" })),
+        },
+        ["keys", sk, "geo-stats"] => ok(demo::geo_stats(sk)),
+        ["keys", sk, "blocked-ips"] => ok(demo::blocked_ips(sk)),
+        ["keys", sk, "shares"] => ok(demo::shares(sk)),
+        ["settings", "sessions"] => ok(demo::sessions()),
+        ["settings", "apikeys"] => ok(demo::api_keys()),
+        ["settings", "headers"] => ok(json!({
+            "ipHeader": "CF-Connecting-IP",
+            "countryHeader": "CF-IPCountry",
+            "asnHeader": "CF-IPOrg",
+        })),
+        ["settings", "ratelimit"] => ok(json!({ "max": 30, "duration": 5000 })),
+        ["settings", "cors"] => ok(json!({ "origins": ["example.com", "www.example.com"] })),
+        ["settings", "filtering"] => ok(json!({
+            "blockNonBrowserUA": true,
+            "requiredHeaders": ["accept-language", "sec-ch-ua"],
+        })),
+        ["settings", "ipdb"] => ok(json!({
+            "mode": "dbip",
+            "provider": "dbip",
+            "configured": true,
+            "country": { "exists": true, "size": 8_300_000 },
+            "asn": { "exists": true, "size": 9_600_000 },
+            "loaded": { "country": true, "asn": true },
+            "lastUpdated": null,
+            "error": null,
+            "progress": { "active": false, "file": "", "downloaded": 0, "total": 0 },
+            "sources": { "maxmind": { "accountIdSet": false, "keySet": false }, "ipinfo": { "tokenSet": false } },
+        })),
+        ["settings", "ipdb", "progress"] => ok(json!({
+            "active": false, "file": "", "downloaded": 0, "total": 0, "error": null,
+        })),
+        ["settings", "rsw"] => ok(json!({ "success": true, "exists": true, "bits": 2048, "created": util::now_ms() })),
+        ["integrity"] => ok(json!({ "success": true, "baseline": null })),
+        ["shares"] => ok(demo::shares("a1b2c3d4e5")),
+        _ => return None,
+    })
 }
 
 async fn dispatch(
