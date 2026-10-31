@@ -1,7 +1,8 @@
 # CapPlus
 
 Rust port of Cap (self-hosted CAPTCHA). Verified-embed-only, Turnstile-compatible
-verification, single ~1.3 MB static binary.
+verification, single static binary (~6.8 MB release build; opt-level 3 for
+throughput, mimalloc allocator).
 
 ## Crates
 | crate | role | tests |
@@ -45,7 +46,7 @@ default `redis://127.0.0.1:6379`).
 - Verified end-to-end with the real JS widget inside the cross-origin iframe:
   solve → redeem (Origin==Host, verified marker) → siteverify (consume-once).
 - Headless Chromium scores 0 / hostile and is denied when `blockOnDeny`.
-- Memory: ~1.3 MB binary, peak RSS ≈ 3 MB (Bun build: ~53 MB).
+- Memory: ~6.8 MB binary (opt-level 3 + mimalloc), small steady-state RSS.
 - `hashwx` runs the original WASM hash module via `wasmi` (bit-identical), and
   instrumentation results are HMAC-verified (`instr_mac_mismatch` on tamper).
 - IP geolocation: DB-IP Lite (free) and MaxMind GeoLite2 downloads are
