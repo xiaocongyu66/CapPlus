@@ -315,7 +315,10 @@ async fn challenge_inner(
         return resp;
     }
     let ip = client_ip(&headers, &addr.ip().to_string());
-    if is_blocked(&st, &site_key, &ip, &headers).await {
+    // Geo headers are client-controlled unless a proxy is declared; a client
+    // must not be able to claim a blocked-country header (or avoid one).
+    let headers_trusted = proxy_trusted(&headers, &addr.ip().to_string());
+    if is_blocked(&st, &site_key, &ip, &headers, headers_trusted).await {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error": "blocked", "reason": "This IP, network or region is blocked for this site key"})),
@@ -1851,7 +1854,13 @@ fn cidr_match(net: &str, ip: &str) -> bool {
 
 /// Check `blocked:<siteKey>` for an exact IP, a CIDR, or a country/ASN match
 /// (the latter resolved through the local database or proxy headers).
-async fn is_blocked(st: &AppState, site_key: &str, ip: &str, headers: &HeaderMap) -> bool {
+async fn is_blocked(
+    st: &AppState,
+    site_key: &str,
+    ip: &str,
+    headers: &HeaderMap,
+    headers_trusted: bool,
+) -> bool {
     let Ok(entries) = st.kv.hgetall(&format!("blocked:{site_key}")).await else {
         return false;
     };
@@ -1907,8 +1916,16 @@ async fn is_blocked(st: &AppState, site_key: &str, ip: &str, headers: &HeaderMap
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let country = header_val(cfg.get("countryHeader").and_then(Value::as_str).unwrap_or(""));
-    let asn = header_val(cfg.get("asnHeader").and_then(Value::as_str).unwrap_or(""));
+    let country = if headers_trusted {
+        header_val(cfg.get("countryHeader").and_then(Value::as_str).unwrap_or(""))
+    } else {
+        None
+    };
+    let asn = if headers_trusted {
+        header_val(cfg.get("asnHeader").and_then(Value::as_str).unwrap_or(""))
+    } else {
+        None
+    };
     let (db_country, db_asn) = match ip.parse::<std::net::IpAddr>() {
         Ok(addr) => cap_ipdb::lookup(&st.ipdb, addr),
         Err(_) => (None, None),
@@ -1983,8 +2000,19 @@ async fn record_geo(st: &AppState, site_key: &str, headers: &HeaderMap, addr: &S
 
     let cfg = st.cache.setting(&st.kv, "settings:headers").await;
 
-    let country = header(cfg.get("countryHeader").and_then(Value::as_str).unwrap_or(""));
-    let asn = header(cfg.get("asnHeader").and_then(Value::as_str).unwrap_or(""));
+    // Geo headers are only trusted from a declared proxy: otherwise a client
+    // could claim any country/ASN and dodge a country blocklist.
+    let trusted = proxy_trusted(headers, &addr.ip().to_string());
+    let country = if trusted {
+        header(cfg.get("countryHeader").and_then(Value::as_str).unwrap_or(""))
+    } else {
+        None
+    };
+    let asn = if trusted {
+        header(cfg.get("asnHeader").and_then(Value::as_str).unwrap_or(""))
+    } else {
+        None
+    };
 
     let (db_country, db_asn) = match ip.parse::<std::net::IpAddr>() {
         Ok(addr) => cap_ipdb::lookup(&st.ipdb, addr),
