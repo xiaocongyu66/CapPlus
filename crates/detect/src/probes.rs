@@ -2936,8 +2936,16 @@ mod tests {
         manifest.join("..").join("..")
     }
 
-    /// `cap/core/src/detect.js`, when the sibling JS tree is present.
+    /// The vendored reference detector (`crates/detect/testdata/js/detect.js`),
+    /// falling back to the sibling Cap checkout for local development.
     fn js_reference_path() -> Option<std::path::PathBuf> {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let vendored = manifest.join("testdata").join("js").join("detect.js");
+        if vendored.is_file() {
+            if let Ok(p) = vendored.canonicalize() {
+                return Some(p);
+            }
+        }
         workspace_root()
             .join("..")
             .join("cap")

@@ -147,16 +147,16 @@ pub fn err_response(code: ErrorCode, message: &str) -> Value {
 pub enum SecretCheck {
     /// Fast hash compared (constant time); `true` = the secret matched.
     Fast(bool),
-    /// Stored hash is a legacy password-KDF (`$argon2…`). Phase 1 does not
-    /// ship an Argon2 verifier, so the caller must reject the request; the
-    /// hash is never regenerated here.
+    /// Stored hash is a legacy password-KDF (`$argon2…`) and the value did
+    /// not match. Kept for API compatibility.
     Argon2Unsupported,
 }
 
 /// Verify `provided` against a stored `secretHash`.
 ///
 /// * `sha256:<hex>` → constant-time comparison of `sha256(provided)`.
-/// * `$argon2…` → [`SecretCheck::Argon2Unsupported`] (legacy hashes, phase-1 gap).
+/// * `$argon2…` → verified with Argon2id/Argon2i/Argon2d (legacy keys created
+///   by the JS server).
 /// * anything else → [`SecretCheck::Fast`]`(false)`.
 pub fn check_secret(stored: &str, provided: &str) -> SecretCheck {
     const PREFIX: &str = "sha256:";
@@ -167,7 +167,15 @@ pub fn check_secret(stored: &str, provided: &str) -> SecretCheck {
         return SecretCheck::Fast(bool::from(ok));
     }
     if stored.starts_with("$argon2") {
-        return SecretCheck::Argon2Unsupported;
+        use argon2::PasswordVerifier as _;
+        let parsed = argon2::PasswordHash::new(stored);
+        return match parsed {
+            Ok(hash) => match argon2::Argon2::default().verify_password(provided.as_bytes(), &hash) {
+                Ok(()) => SecretCheck::Fast(true),
+                Err(_) => SecretCheck::Argon2Unsupported,
+            },
+            Err(_) => SecretCheck::Argon2Unsupported,
+        };
     }
     SecretCheck::Fast(false)
 }
@@ -580,5 +588,30 @@ mod tests {
         assert_eq!(parsed.ip.as_deref(), Some("1.2.3.4"));
         assert_eq!(parsed.ua, bind.ua);
         assert_eq!(parsed.ts, 7);
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+    use argon2::password_hash::{rand_core::OsRng, SaltString};
+    use argon2::{Argon2, PasswordHasher};
+
+    #[test]
+    fn argon2_legacy_hash_verifies() {
+        let salt = SaltString::generate(&mut OsRng);
+        let stored = Argon2::default()
+            .hash_password(b"sk-legacy-secret", &salt)
+            .unwrap()
+            .to_string();
+        assert_eq!(check_secret(&stored, "sk-legacy-secret"), SecretCheck::Fast(true));
+        assert_eq!(check_secret(&stored, "nope"), SecretCheck::Argon2Unsupported);
+    }
+
+    #[test]
+    fn sha256_hash_still_works() {
+        let stored = format!("sha256:{}", cap_core::sha256_hex("sk-x"));
+        assert_eq!(check_secret(&stored, "sk-x"), SecretCheck::Fast(true));
+        assert_eq!(check_secret(&stored, "sk-y"), SecretCheck::Fast(false));
     }
 }

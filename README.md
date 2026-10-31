@@ -51,7 +51,10 @@ default `redis://127.0.0.1:6379`).
 - IP geolocation: DB-IP Lite (free) and MaxMind GeoLite2 downloads are
   handled in-process with a built-in MMDB reader; country/ASN are recorded per
   verified solve, and proxy headers override the database when configured.
-- TODO: demo mode, edge/WASM deployment.
+- Request filtering (`blockNonBrowserUA`, required headers), blocked IPs
+  (exact / CIDR / country / ASN), CORS for cross-origin widgets, and
+  per-key-or-global rate limiting with `metrics:ratelimited`.
+- TODO: demo mode, asset-integrity sealing, edge/WASM deployment.
 
 See `MIGRATION.md` for the Bun → Rust cutover runbook (shared Redis, per-key rollout, rollback).
 

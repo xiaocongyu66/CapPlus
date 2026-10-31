@@ -39,6 +39,11 @@ const DEFAULT_RL_WINDOW_MS: i64 = 5_000;
 
 static SETTINGS: std::sync::OnceLock<config::Settings> = std::sync::OnceLock::new();
 
+/// JS-compatible metric bucket: epoch seconds rounded down to the hour.
+fn hourly_bucket(now_ms: i64) -> i64 {
+    (now_ms / 1000 / 3600) * 3600
+}
+
 fn settings() -> &'static config::Settings {
     SETTINGS.get().expect("settings initialised in main")
 }
@@ -173,6 +178,24 @@ fn html_response(status: StatusCode, csp: Option<&str>, body: String) -> Respons
 // handlers
 // ---------------------------------------------------------------------------
 
+/// Readiness probe: the storage backend must answer within 2 seconds.
+async fn health_check(State(st): State<AppState>) -> Response {
+    match tokio::time::timeout(std::time::Duration::from_secs(2), st.kv.get("__health__")).await {
+        Ok(Ok(_)) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "degraded", "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "degraded", "error": "storage timeout" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Liveness probe: the process is up.
 async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
@@ -245,15 +268,63 @@ async fn challenge(
     };
     let cfg = key.config.clone();
 
+    if let Some(resp) = filter_request(&st, &cfg, &headers, &site_key).await {
+        return resp;
+    }
     let ip = client_ip(&headers, &addr.ip().to_string());
-    let max = cfg.ratelimit_max.unwrap_or(DEFAULT_RL_MAX);
-    let window = cfg.ratelimit_duration.unwrap_or(DEFAULT_RL_WINDOW_MS);
+    if is_blocked(&st, &site_key, &ip, &headers).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "blocked", "reason": "This IP, network or region is blocked for this site key"})),
+        )
+            .into_response();
+    }
+    // Per-key limits win; otherwise the global `settings:ratelimit` applies.
+    let global_rl = st
+        .kv
+        .get("settings:ratelimit")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let max = cfg
+        .ratelimit_max
+        .or_else(|| global_rl.as_ref().and_then(|v| v.get("max").and_then(Value::as_i64)))
+        .unwrap_or(DEFAULT_RL_MAX);
+    let window = cfg
+        .ratelimit_duration
+        .or_else(|| global_rl.as_ref().and_then(|v| v.get("duration").and_then(Value::as_i64)))
+        .unwrap_or(DEFAULT_RL_WINDOW_MS);
     if let Ok(false) = st.store.rate_hit("challenge", &ip, window, max).await {
+        let _ = st
+            .kv
+            .hincrby(
+                &format!("metrics:ratelimited:{site_key}"),
+                &hourly_bucket(now_ms()).to_string(),
+                1,
+            )
+            .await;
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"error": "Rate limit exceeded"})),
         )
             .into_response();
+    }
+
+    // Platform / OS tallies for the Location & Networks charts.
+    let ua = header_str(&headers, "user-agent");
+    let (platform, os) = parse_ua(&ua);
+    if let Some(p) = platform {
+        let _ = st
+            .kv
+            .hincrby(&format!("metrics:platform:{site_key}"), p, 1)
+            .await;
+    }
+    if let Some(o) = os {
+        let _ = st
+            .kv
+            .hincrby(&format!("metrics:os:{site_key}"), o, 1)
+            .await;
     }
 
     if cfg.protocol == "hashwx" {
@@ -305,7 +376,7 @@ async fn challenge(
     }
 
     if cfg.protocol == "rsw" {
-        let fields = match st.store.hgetall("settings:rsw_keypair").await {
+        let fields = match ensure_rsw_keypair(&st).await {
             Ok(f) => f,
             Err(e) => {
                 return (
@@ -486,7 +557,7 @@ async fn redeem(
         if let Err(reason) = v2::verify_solutions(&expected, &solutions_raw) {
             let _ = st
                 .store
-                .incr_metric(&format!("metrics:failed:{site_key}"), now / 3_600_000)
+                .incr_metric(&format!("metrics:failed:{site_key}"), hourly_bucket(now))
                 .await;
             return (
                 StatusCode::FORBIDDEN,
@@ -519,7 +590,7 @@ async fn redeem(
         if !verify_pow(token, params, &solutions) {
             let _ = st
                 .store
-                .incr_metric(&format!("metrics:failed:{site_key}"), now / 3_600_000)
+                .incr_metric(&format!("metrics:failed:{site_key}"), hourly_bucket(now))
                 .await;
             return (
                 StatusCode::FORBIDDEN,
@@ -555,7 +626,7 @@ async fn redeem(
         if matches!(action, cap_detect::Action::Deny) && key.config.block_on_deny {
             let _ = st
                 .store
-                .incr_metric(&format!("metrics:failed:{site_key}"), now / 3_600_000)
+                .incr_metric(&format!("metrics:failed:{site_key}"), hourly_bucket(now))
                 .await;
             return (
                 StatusCode::FORBIDDEN,
@@ -584,7 +655,7 @@ async fn redeem(
     eprintln!("[redeem] site={site_key} issued token (verified)");
     let _ = st
         .store
-        .incr_metric(&format!("metrics:verified:{site_key}"), now / 3_600_000)
+        .incr_metric(&format!("metrics:verified:{site_key}"), hourly_bucket(now))
         .await;
 
     record_geo(&st, &site_key, &headers, &addr).await;
@@ -647,6 +718,21 @@ async fn verify_common(
         },
     };
 
+    // A site key in the path scopes the token: a secret for site B must not
+    // verify a token minted for site A.
+    if path_site_key.map(|sk| !sk.is_empty()).unwrap_or(false)
+        && !req.response.starts_with(&format!("{site_key}:"))
+    {
+        return (
+            StatusCode::OK,
+            Json(err_response(
+                ErrorCode::InvalidInputResponse,
+                error_message(ErrorCode::InvalidInputResponse),
+            )),
+        )
+            .into_response();
+    }
+
     let key = match st.store.key(&site_key).await {
         Ok(Some(k)) => k,
         _ => {
@@ -678,7 +764,7 @@ async fn verify_common(
                 StatusCode::OK,
                 Json(err_response(
                     ErrorCode::InvalidInputSecret,
-                    "Legacy argon2 secret hashes are not supported yet; rotate the secret key.",
+                    "The secret parameter is invalid or malformed.",
                 )),
             )
                 .into_response()
@@ -989,6 +1075,313 @@ async fn public_asset(State(st): State<AppState>, Path(rel): Path<String>, heade
 /// `GET /share/:token` — the public share page (its token lives in the URL hash).
 async fn share_page() -> Response {
     serve_dashboard_file("share.html", "no-cache").await
+}
+
+/// Platform / OS from a User-Agent string, matching `parseUA` in `cap.js`.
+fn parse_ua(ua: &str) -> (Option<&'static str>, Option<&'static str>) {
+    if ua.is_empty() {
+        return (None, None);
+    }
+    let os = if ua.contains("iPad") {
+        Some("iPadOS")
+    } else if ua.contains("iPhone") {
+        Some("iOS")
+    } else if ua.contains("Android") {
+        Some("Android")
+    } else if ua.contains("Macintosh") || ua.contains("Mac OS X") {
+        Some("macOS")
+    } else if ua.contains("Windows") {
+        Some("Windows")
+    } else if ua.contains("Linux") {
+        Some("Linux")
+    } else {
+        None
+    };
+    let platform = if ua.contains("iPhone")
+        || (ua.contains("Android") && ua.contains("Mobile"))
+    {
+        Some("Phone")
+    } else if ua.contains("iPad")
+        || (ua.contains("Android") && !ua.contains("Mobile"))
+        || ua.contains("Tablet")
+    {
+        Some("Tablet")
+    } else if ua.contains("Macintosh")
+        || ua.contains("Windows")
+        || ua.contains("Linux")
+        || ua.contains("CrOS")
+    {
+        Some("Desktop")
+    } else {
+        None
+    };
+    (platform, os)
+}
+
+/// `true` when the UA looks like a real browser (mirrors the JS check).
+fn is_browser_ua(ua: &str) -> bool {
+    if ua.is_empty() {
+        return false;
+    }
+    let lower = ua.to_ascii_lowercase();
+    lower.contains("mozilla/")
+        && !lower.contains("python-requests")
+        && !lower.contains("curl/")
+        && !lower.contains("wget/")
+        && !lower.contains("httpclient")
+        && !lower.contains("okhttp")
+        && !lower.contains("go-http-client")
+        && !lower.contains("node-fetch")
+        && !lower.contains("axios")
+        && !lower.contains("headlesschrome")
+}
+
+/// Per-key filtering: block non-browser UAs and requests missing the
+/// configured headers. Global settings apply unless the key overrides them.
+async fn filter_request(st: &AppState, cfg: &KeyConfig, headers: &HeaderMap, site_key: &str) -> Option<Response> {
+    let global = st
+        .kv
+        .get("settings:filtering")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+
+    let block_ua = cfg
+        .block_non_browser_ua
+        .or_else(|| global.get("blockNonBrowserUA").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let required: Vec<String> = cfg
+        .required_headers
+        .clone()
+        .or_else(|| {
+            global
+                .get("requiredHeaders")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        })
+        .unwrap_or_default();
+
+    let ua = header_str(headers, "user-agent");
+    let blocked = (block_ua && !is_browser_ua(&ua))
+        || required.iter().any(|name| {
+            headers
+                .get(name.as_str())
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+        });
+
+    if !blocked {
+        return None;
+    }
+    let _ = st
+        .kv
+        .hincrby(
+            &format!("metrics:failed:{site_key}"),
+            &hourly_bucket(now_ms()).to_string(),
+            1,
+        )
+        .await;
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "filtered", "reason": "Request does not look like a real browser"})),
+        )
+            .into_response(),
+    )
+}
+
+/// Permissive CORS for the challenge endpoints: the widget may run from a
+/// different origin, and the JS server's CORS layer allows it by default.
+/// Authentication still applies to the real (non-preflight) request.
+async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    if req.method() == axum::http::Method::OPTIONS {
+        let mut resp = Response::new(axum::body::Body::empty());
+        *resp.status_mut() = StatusCode::NO_CONTENT;
+        if let Some(origin) = &origin {
+            if let Ok(v) = HeaderValue::from_str(origin) {
+                let h = resp.headers_mut();
+                h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+                h.insert(
+                    header::ACCESS_CONTROL_ALLOW_METHODS,
+                    HeaderValue::from_static("GET, POST, OPTIONS"),
+                );
+                h.insert(
+                    header::ACCESS_CONTROL_ALLOW_HEADERS,
+                    HeaderValue::from_static(
+                        "content-type, authorization, x-requested-with, x-cap-client-ua, x-cap-client-host",
+                    ),
+                );
+                h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("3600"));
+                h.insert(header::VARY, HeaderValue::from_static("Origin"));
+            }
+        }
+        return resp;
+    }
+
+    let mut resp = next.run(req).await;
+    if let Some(origin) = origin {
+        if let Ok(v) = HeaderValue::from_str(&origin) {
+            resp.headers_mut()
+                .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+            resp.headers_mut()
+                .insert(header::VARY, HeaderValue::from_static("Origin"));
+        }
+    }
+    resp
+}
+
+/// Whether `ip` falls inside `net` (`a.b.c.d/len`, IPv4 only).
+fn cidr_match(net: &str, ip: &str) -> bool {
+    let (base, len) = match net.split_once('/') {
+        Some((b, l)) => (b, l),
+        None => return net == ip,
+    };
+    let Ok(len) = len.parse::<u32>() else {
+        return false;
+    };
+    if len > 32 {
+        return false;
+    }
+    let (Ok(base), Ok(ip)) = (
+        base.parse::<std::net::Ipv4Addr>(),
+        ip.parse::<std::net::Ipv4Addr>(),
+    ) else {
+        return false;
+    };
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    (u32::from(base) & mask) == (u32::from(ip) & mask)
+}
+
+/// Check `blocked:<siteKey>` for an exact IP, a CIDR, or a country/ASN match
+/// (the latter resolved through the local database or proxy headers).
+async fn is_blocked(st: &AppState, site_key: &str, ip: &str, headers: &HeaderMap) -> bool {
+    let Ok(entries) = st.kv.hgetall(&format!("blocked:{site_key}")).await else {
+        return false;
+    };
+    if entries.is_empty() {
+        return false;
+    }
+    let now = now_ms();
+    let mut expired = Vec::new();
+    let mut hit = false;
+    let mut wants_country = false;
+    let mut wants_asn = false;
+
+    for (field, value) in &entries {
+        let permanent = value == "0";
+        let expires = value.parse::<i64>().unwrap_or(0);
+        if !permanent && expires <= now {
+            expired.push(field.clone());
+            continue;
+        }
+        if field == ip {
+            hit = true;
+            break;
+        }
+        if let Some(net) = field.strip_prefix("cidr:") {
+            if cidr_match(net, ip) {
+                hit = true;
+                break;
+            }
+        } else if field.starts_with("country:") {
+            wants_country = true;
+        } else if field.starts_with("asn:") {
+            wants_asn = true;
+        }
+    }
+
+    if !expired.is_empty() {
+        let refs: Vec<&str> = expired.iter().map(String::as_str).collect();
+        let _ = st.kv.hdel_fields(&format!("blocked:{site_key}"), &refs).await;
+    }
+    if hit {
+        return true;
+    }
+    if !wants_country && !wants_asn {
+        return false;
+    }
+
+    // Header-configured values win, then the local database.
+    let cfg = st
+        .kv
+        .get("settings:headers")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let header_val = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let country = header_val(cfg.get("countryHeader").and_then(Value::as_str).unwrap_or(""));
+    let asn = header_val(cfg.get("asnHeader").and_then(Value::as_str).unwrap_or(""));
+    let (db_country, db_asn) = match ip.parse::<std::net::IpAddr>() {
+        Ok(addr) => cap_ipdb::lookup(&st.ipdb, addr),
+        Err(_) => (None, None),
+    };
+    let country = country.or(db_country);
+    let asn = asn.or(db_asn.map(|n| n.to_string()));
+
+    if wants_country {
+        if let Some(c) = country {
+            if entries.contains_key(&format!("country:{c}")) {
+                return true;
+            }
+        }
+    }
+    if wants_asn {
+        if let Some(a) = asn {
+            if entries.contains_key(&format!("asn:{a}")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Load the RSW keypair, generating it on first use (the JS server does the
+/// same at key creation and at challenge time).
+async fn ensure_rsw_keypair(st: &AppState) -> Result<std::collections::HashMap<String, String>, String> {
+    let fields = st
+        .store
+        .hgetall("settings:rsw_keypair")
+        .await
+        .map_err(|e| e.to_string())?;
+    if !fields.is_empty() {
+        return Ok(fields);
+    }
+    let pair = tokio::task::spawn_blocking(|| cap_proto::generate_keypair(2048))
+        .await
+        .map_err(|e| e.to_string())?;
+    let pairs = [
+        ("N", pair.n.to_str_radix(10)),
+        ("p", pair.p.to_str_radix(10)),
+        ("q", pair.q.to_str_radix(10)),
+        ("bits", pair.bits.to_string()),
+        ("created", now_ms().to_string()),
+    ];
+    st.kv
+        .hset_pairs("settings:rsw_keypair", &pairs)
+        .await
+        .map_err(|e| e.to_string())?;
+    eprintln!("[cap] generated the RSW keypair on first use");
+    st.store
+        .hgetall("settings:rsw_keypair")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Attribute a successful solve to a country / ASN. Explicit proxy headers
@@ -1619,7 +2012,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health_check))
+        .route("/health/live", get(health))
         .route("/embed.js", get(embed_js))
         .route("/embed/:siteKey", get(embed_page))
         .route("/assets/:name", get(asset_handler))
@@ -1656,6 +2050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/:siteKey/redeem", post(redeem))
         .route("/:siteKey/siteverify", post(siteverify))
         .route("/:siteKey/validate", post(validate))
+        .layer(axum::middleware::from_fn(cors_layer))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
 

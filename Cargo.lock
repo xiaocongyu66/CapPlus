@@ -357,6 +357,7 @@ dependencies = [
 name = "cap-verify"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "cap-core",
  "chrono",
  "form_urlencoded",
