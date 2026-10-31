@@ -304,6 +304,19 @@ pub fn verify_solution(spec: &HashwxSpec, nonce: u64) -> bool {
     }
 }
 
+
+/// JS parity tests are the only check that the Rust port matches the reference
+/// implementation. A missing toolchain must fail the suite, not silently pass:
+/// set `CAP_SKIP_JS_PARITY=1` to skip deliberately (e.g. on a machine without
+/// bun or the reference tree).
+fn parity_required(reason: &str) {
+    if std::env::var("CAP_SKIP_JS_PARITY").as_deref() == Ok("1") {
+        eprintln!("SKIP (CAP_SKIP_JS_PARITY=1): {reason}");
+        return;
+    }
+    panic!("{reason}; install bun and the reference tree, or set CAP_SKIP_JS_PARITY=1");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,7 +362,7 @@ console.log(JSON.stringify({seed:[...seed], hash:String(hashwxHash(st,seed,12345
     #[test]
     fn kat_matches_js_reference() {
         let Some((expected_seed, expected_hash)) = kat_expected() else {
-            eprintln!("SKIP: bun or the JS core tree is unavailable; KAT not checked");
+            parity_required("bun or the JS core tree is unavailable");
             return;
         };
         let challenge = [7u8; 32];

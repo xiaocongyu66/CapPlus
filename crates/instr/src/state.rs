@@ -186,6 +186,19 @@ pub fn plan_state(rng: &mut Rng, namer: &mut Namer) -> StatePlan {
     }
 }
 
+
+/// JS parity tests are the only check that the Rust port matches the reference
+/// implementation. A missing toolchain must fail the suite, not silently pass:
+/// set `CAP_SKIP_JS_PARITY=1` to skip deliberately (e.g. on a machine without
+/// bun or the reference tree).
+fn parity_required(reason: &str) {
+    if std::env::var("CAP_SKIP_JS_PARITY").as_deref() == Ok("1") {
+        eprintln!("SKIP (CAP_SKIP_JS_PARITY=1): {reason}");
+        return;
+    }
+    panic!("{reason}; install bun and the reference tree, or set CAP_SKIP_JS_PARITY=1");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,7 +244,7 @@ mod tests {
     #[test]
     fn emitted_equations_match_expected_vals() {
         if !bun_available() {
-            eprintln!("skipping: bun not available");
+            parity_required("bun not available");
             return;
         }
         for seed in [1u64, 2, 3, 4, 5, 99, 12345] {

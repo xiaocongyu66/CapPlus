@@ -1851,6 +1851,19 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
 // tests
 // ---------------------------------------------------------------------------
 
+
+/// JS parity tests are the only check that the Rust port matches the reference
+/// implementation. A missing toolchain must fail the suite, not silently pass:
+/// set `CAP_SKIP_JS_PARITY=1` to skip deliberately (e.g. on a machine without
+/// bun or the reference tree).
+fn parity_required(reason: &str) {
+    if std::env::var("CAP_SKIP_JS_PARITY").as_deref() == Ok("1") {
+        eprintln!("SKIP (CAP_SKIP_JS_PARITY=1): {reason}");
+        return;
+    }
+    panic!("{reason}; install bun and the reference tree, or set CAP_SKIP_JS_PARITY=1");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2983,12 +2996,12 @@ mod tests {
         let js = match js_reference_path() {
             Some(p) => p,
             None => {
-                eprintln!("SKIP: JS reference not found");
+                parity_required("JS reference not found");
                 return None;
             }
         };
         if !bun_available() {
-            eprintln!("SKIP: bun not installed");
+            parity_required("bun not installed");
             return None;
         }
 
@@ -3083,7 +3096,7 @@ mod tests {
         let raw = match std::fs::read(&fixture_path) {
             Ok(b) => b,
             Err(_) => {
-                eprintln!("SKIP: golden fixture not found");
+                parity_required("golden fixture not found");
                 return;
             }
         };
@@ -3093,7 +3106,7 @@ mod tests {
             p["top"] = top.clone();
         }
         let Some(ok) = compare_with_js(&p, &full_fields(), PROBE_FONT_STACK_COUNT, None) else {
-            eprintln!("SKIP: parity harness unavailable");
+            parity_required("parity harness unavailable");
             return;
         };
         assert!(ok, "parity mismatch against the JS reference");
@@ -3170,7 +3183,7 @@ mod tests {
             PROBE_FONT_STACK_COUNT,
             Some("en-US,en;q=0.9"),
         ) else {
-            eprintln!("SKIP: parity harness unavailable");
+            parity_required("parity harness unavailable");
             return;
         };
         assert!(ok, "parity mismatch against the JS reference");
@@ -3232,7 +3245,7 @@ mod tests {
         for case in &cases {
             let Some(ok) = compare_with_js(case, &full_fields(), PROBE_FONT_STACK_COUNT, None)
             else {
-                eprintln!("SKIP: parity harness unavailable");
+                parity_required("parity harness unavailable");
                 return;
             };
             assert!(ok, "parity mismatch against the JS reference");
