@@ -23,6 +23,7 @@ cap-assets = { path = "../assets" }
 cap-admin = { path = "../admin" }
 cap-kv = { path = "../kv" }
 cap-ipdb = { path = "../ipdb" }
+mimalloc = { version = "0.1", default-features = false }
 toml = "0.8"
 aes-gcm = "0.10"
 rand = "0.8"
@@ -32,3 +33,9 @@ hmac = "0.12"
 [[bin]]
 name = "cap-server"
 path = "src/main.rs"
+
+[dev-dependencies]
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"

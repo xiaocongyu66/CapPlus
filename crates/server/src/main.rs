@@ -25,6 +25,12 @@ use serde_json::{json, Value};
 
 mod config;
 mod v2;
+
+// mimalloc: per-thread heaps cut allocator contention on the request path
+// (short-lived Json/header/Bytes allocations dominate). Falls back to the
+// system allocator only if this line is removed.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use cap_core::{jwt_sign, jwt_sig_hex, jwt_verify, random_hex, verify_pow, PowParams, SessionBind};
 use cap_store::{now_ms, KeyConfig, Store};
 use cap_verify::{
