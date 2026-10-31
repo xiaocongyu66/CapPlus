@@ -257,6 +257,22 @@
           </button>
         </div>
 
+        <div id="twofaFields" hidden>
+          <label>Authentication code</label>
+          <input
+            type="text"
+            name="code"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            placeholder="123456"
+            class="password"
+            style="margin-bottom:8px"
+          />
+          <p class="hint" style="font-size:12px;margin:0 0 12px">
+            Lost your device? Enter one of your recovery codes in the field above.
+          </p>
+        </div>
+
         <button type="submit" class="submit">Continue to Cap</button>
         <p class="err"></p>
         <p class="bottom">
@@ -285,17 +301,33 @@
       document.querySelector("button[type=submit]").disabled = true;
 
       const loginUrl = new URL("auth/login", document.baseURI).toString();
-      const { success, session_token, hashed_token, expires } = await (
+      const code = document.querySelector("input[name=code]").value.trim();
+      const res = await (
         await fetch(loginUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({
-            admin_key,
-          }),
+          body: JSON.stringify(
+            code
+              ? { admin_key, ...(/^\d{6}$/.test(code) ? { code } : { recovery: code }) }
+              : { admin_key },
+          ),
         })
       ).json();
+      const { success, session_token, hashed_token, expires } = res;
+
+      if (res.twofa) {
+        document.getElementById("twofaFields").hidden = false;
+        document.querySelector("input[name=code]").focus();
+        const err = document.querySelector("p.err");
+        err.style.display = "block";
+        err.innerText = code
+          ? res.error || "Invalid authentication code"
+          : "Enter your authentication code";
+        document.querySelector("button[type=submit]").disabled = false;
+        return;
+      }
 
       if (success && session_token) {
         localStorage.setItem(

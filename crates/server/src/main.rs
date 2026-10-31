@@ -1567,7 +1567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let ipdb = Arc::new(
-        cap_ipdb::IpDb::open(&cfg.data_dir.join("ipdb"))
+        cap_ipdb::IpDb::open(&cfg.data_dir.join("ipdb"), &cfg.tmp_dir())
             .map_err(|e| format!("cannot open ip database directory: {e}"))?,
     );
     if let Ok(Some(raw)) = kv.get("settings:ipdb").await {

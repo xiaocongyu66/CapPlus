@@ -41,7 +41,7 @@ const HASHWX_INTERPRETED: i32 = 0;
 /// The exact module shipped with the JS core.
 static HASHWX_WASM: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../cap/core/src/hashwx.wasm"
+    "/assets/hashwx.wasm"
 ));
 
 /// A single minted challenge: hex-encoded 32-byte challenge `c`, the

@@ -2959,24 +2959,26 @@ mod tests {
     /// Run the JS reference `detectAutomation` on `probe` and compare ids,
     /// `passed`, gating, `blockedBy`, `riskFlags` and `pass` with the Rust port.
     /// Returns `false` (without failing) when bun or the JS tree is missing.
+    /// `None` means the JS reference or bun is unavailable (skip), `Some(ok)`
+    /// is the comparison result.
     fn compare_with_js(
         probe: &Value,
         optional: &[String],
         font_stack: usize,
         accept_language: Option<&str>,
-    ) -> bool {
+    ) -> Option<bool> {
         use std::process::Command;
 
         let js = match js_reference_path() {
             Some(p) => p,
             None => {
                 eprintln!("SKIP: JS reference not found");
-                return false;
+                return None;
             }
         };
         if !bun_available() {
             eprintln!("SKIP: bun not installed");
-            return false;
+            return None;
         }
 
         let optional_js = optional
@@ -3059,7 +3061,7 @@ mod tests {
             ours.blocked_by,
             ours.risk_flags
         );
-        true
+        Some(true)
     }
 
     /// Golden-fixture parity: the real captured probe must produce exactly the
@@ -3079,10 +3081,11 @@ mod tests {
         if let Some(top) = fixture["instr"].get("top") {
             p["top"] = top.clone();
         }
-        assert!(
-            compare_with_js(&p, &full_fields(), PROBE_FONT_STACK_COUNT, None),
-            "parity harness skipped"
-        );
+        let Some(ok) = compare_with_js(&p, &full_fields(), PROBE_FONT_STACK_COUNT, None) else {
+            eprintln!("SKIP: parity harness unavailable");
+            return;
+        };
+        assert!(ok, "parity mismatch against the JS reference");
         // Sanity: this fixture is a headless Chrome and must be blocked on it.
         let r = detect_automation(
             &p,
@@ -3150,15 +3153,16 @@ mod tests {
     /// GPU / emoji / active / cdp branches.
     #[test]
     fn synthetic_parity_with_js_reference() {
-        assert!(
-            compare_with_js(
-                &synthetic_base(),
-                &full_fields(),
-                PROBE_FONT_STACK_COUNT,
-                Some("en-US,en;q=0.9")
-            ),
-            "parity harness skipped"
-        );
+        let Some(ok) = compare_with_js(
+            &synthetic_base(),
+            &full_fields(),
+            PROBE_FONT_STACK_COUNT,
+            Some("en-US,en;q=0.9"),
+        ) else {
+            eprintln!("SKIP: parity harness unavailable");
+            return;
+        };
+        assert!(ok, "parity mismatch against the JS reference");
     }
 
     /// Bot-shaped mutations of the same probe: every failing (non-gating and
@@ -3215,10 +3219,12 @@ mod tests {
         cases.push(v);
 
         for case in &cases {
-            assert!(
-                compare_with_js(case, &full_fields(), PROBE_FONT_STACK_COUNT, None),
-                "parity harness skipped"
-            );
+            let Some(ok) = compare_with_js(case, &full_fields(), PROBE_FONT_STACK_COUNT, None)
+            else {
+                eprintln!("SKIP: parity harness unavailable");
+                return;
+            };
+            assert!(ok, "parity mismatch against the JS reference");
         }
     }
 }

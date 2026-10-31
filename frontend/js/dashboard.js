@@ -2915,6 +2915,13 @@ async function openSettings() {
         <div class="config-save-row">
           <button class="save-btn" id="saveFilteringBtn" disabled>Save</button>
         </div>
+
+        <hr class="settings-divider">
+
+        <h4 class="settings-group-title">Two-factor authentication</h4>
+        <p class="headers-description">Require a code from an authenticator app in addition to the admin key. Recovery codes are shown once when you enable it.</p>
+        <div id="twofaStatus" class="hint">Loading…</div>
+        <div class="config-save-row" id="twofaActions"></div>
       </div>
       <div class="settings-section" id="ipdataSection">
         <h4 class="settings-group-title">IP header</h4>
@@ -3291,6 +3298,7 @@ async function openSettings() {
 
   loadIPDBSettings();
   loadReleases();
+  loadTwoFactor();
 
   const sessions = await api("GET", "/settings/sessions");
   const currentHash = JSON.parse(localStorage.getItem("cap_auth"))?.hash || "";
@@ -3473,6 +3481,103 @@ const releaseAuthHeader = () => {
     Authorization: `Bearer ${btoa(JSON.stringify({ token: auth.token, hash: auth.hash }))}`,
   };
 };
+
+async function loadTwoFactor() {
+  const status = document.getElementById("twofaStatus");
+  const actions = document.getElementById("twofaActions");
+  if (!status || !actions) return;
+  const st = await api("GET", "/auth/2fa");
+  if (st.error) {
+    status.textContent = "Two-factor status unavailable.";
+    actions.innerHTML = "";
+    return;
+  }
+  if (st.enabled) {
+    status.innerHTML =
+      '<span style="color:var(--blue);font-weight:600">Enabled</span> · ' +
+      st.recoveryCodes +
+      " recovery codes left";
+    actions.innerHTML =
+      '<button class="save-btn" id="twofaDisableBtn">Disable 2FA</button>';
+    document.getElementById("twofaDisableBtn").addEventListener("click", openDisableTwoFactor);
+  } else {
+    status.textContent = "Not enabled.";
+    actions.innerHTML = '<button class="save-btn" id="twofaEnableBtn">Enable 2FA</button>';
+    document.getElementById("twofaEnableBtn").addEventListener("click", openSetupTwoFactor);
+  }
+}
+
+async function openSetupTwoFactor() {
+  const setup = await api("POST", "/auth/2fa/setup");
+  if (!setup.secret) {
+    showModal("Error", '<div class="modal-body"><p>Could not start two-factor setup.</p></div>');
+    return;
+  }
+  const modal = createModal(
+    "Enable two-factor authentication",
+    `
+    <div class="modal-body">
+      <p class="hint">Add this secret to your authenticator app, then enter the 6-digit code it shows.</p>
+      <div class="modal-field"><label>Secret</label>
+        <input type="text" value="${escapeHtml(setup.secret)}" readonly onclick="this.select()"></div>
+      <div class="modal-field"><label>otpauth URI</label>
+        <input type="text" value="${escapeHtml(setup.uri)}" readonly onclick="this.select()"></div>
+      <div class="modal-field"><label>Verification code</label>
+        <input type="text" id="twofaCode" inputmode="numeric" autocomplete="one-time-code" placeholder="123456"></div>
+      <p class="hint" id="twofaErr" style="color:var(--red,#f38ba8)" hidden></p>
+    </div>
+    <div class="modal-footer">
+      <button class="modal-btn secondary" onclick="closeModal()">Cancel</button>
+      <button class="modal-btn primary" id="twofaConfirm">Enable</button>
+    </div>`,
+  );
+  modal.querySelector("#twofaConfirm").addEventListener("click", async () => {
+    const code = modal.querySelector("#twofaCode").value.trim();
+    const res = await api("POST", "/auth/2fa/enable", { code });
+    if (!res.success) {
+      const err = modal.querySelector("#twofaErr");
+      err.textContent = res.error || "Invalid code";
+      err.hidden = false;
+      return;
+    }
+    closeModal();
+    showModal(
+      "Two-factor enabled",
+      `<div class="modal-body">
+        <p class="hint">Store these recovery codes somewhere safe. Each one can be used once if you lose your device.</p>
+        <pre style="white-space:pre-wrap;font-size:13px">${escapeHtml((res.recoveryCodes || []).join("\n"))}</pre>
+        <p class="hint">You will be asked for a code the next time you sign in.</p>
+      </div>
+      <div class="modal-footer"><button class="modal-btn primary" onclick="closeModal()">Done</button></div>`,
+    );
+    loadTwoFactor();
+  });
+}
+
+function openDisableTwoFactor() {
+  const modal = createModal(
+    "Disable two-factor authentication",
+    `
+    <div class="modal-body">
+      <div class="modal-field"><label>Admin key</label>
+        <input type="password" id="twofaAdminKey"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="modal-btn secondary" onclick="closeModal()">Cancel</button>
+      <button class="modal-btn primary" id="twofaDisableConfirm">Disable</button>
+    </div>`,
+  );
+  modal.querySelector("#twofaDisableConfirm").addEventListener("click", async () => {
+    const admin_key = modal.querySelector("#twofaAdminKey").value;
+    const res = await api("POST", "/auth/2fa/disable", { admin_key });
+    if (!res.success) {
+      showModal("Error", `<div class="modal-body"><p>${escapeHtml(res.error || "Incorrect admin key")}</p></div>`);
+      return;
+    }
+    closeModal();
+    loadTwoFactor();
+  });
+}
 
 async function loadReleases() {
   const list = document.getElementById("releaseList");

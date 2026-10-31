@@ -40,7 +40,6 @@ pub struct ReleaseMeta {
     pub bytes: usize,
     /// How many files were obfuscated + encrypted on publish.
     pub protected: usize,
-    #[serde(skip)]
     pub active: bool,
     /// Bundled with the binary; cannot be deleted.
     #[serde(default)]
@@ -453,13 +452,13 @@ mod tests {
             .publish(&zip_of(&[("widget.js", b"var v = 2;")]))
             .unwrap();
         assert_eq!(store.list().len(), 2);
-        assert_eq!(store.active_release_id().as_deref(), Some(first.id.as_str()));
-
-        store.activate(&second.id).unwrap();
+        // An upload goes live immediately.
         assert_eq!(store.active_release_id().as_deref(), Some(second.id.as_str()));
 
-        // Rollback to the earlier release.
         store.activate(&first.id).unwrap();
+        assert_eq!(store.active_release_id().as_deref(), Some(first.id.as_str()));
+
+        // The active flag is serialized for the dashboard.
         let active = store.list().into_iter().find(|m| m.active).unwrap();
         assert_eq!(active.id, first.id);
 

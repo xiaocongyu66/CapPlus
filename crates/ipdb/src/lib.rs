@@ -7,7 +7,7 @@
 
 pub mod mmdb;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +65,8 @@ pub struct Progress {
 #[derive(Debug)]
 pub struct IpDb {
     dir: PathBuf,
+    /// Scratch space for in-flight downloads (`<data>/tmp`).
+    tmp_dir: PathBuf,
     mode: RwLock<Mode>,
     country: RwLock<Option<Arc<Mmdb>>>,
     asn: RwLock<Option<Arc<Mmdb>>>,
@@ -73,10 +75,12 @@ pub struct IpDb {
 }
 
 impl IpDb {
-    pub fn open(dir: &Path) -> Result<Self, String> {
+    pub fn open(dir: &Path, tmp_dir: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(tmp_dir).map_err(|e| e.to_string())?;
         let db = Self {
             dir: dir.to_path_buf(),
+            tmp_dir: tmp_dir.to_path_buf(),
             mode: RwLock::new(Mode::None),
             country: RwLock::new(None),
             asn: RwLock::new(None),
@@ -172,8 +176,8 @@ impl IpDb {
             Mode::DbIp => {
                 let country = self.fetch_dbip("country")?;
                 let asn = self.fetch_dbip("asn")?;
-                self.install(country, self.country_path())?;
-                self.install(asn, self.asn_path())?;
+                self.install(&country, self.country_path())?;
+                self.install(&asn, self.asn_path())?;
                 self.set_mode(Mode::DbIp);
                 self.reload();
                 Ok(())
@@ -184,8 +188,8 @@ impl IpDb {
                 }
                 let country = self.fetch_maxmind("GeoLite2-Country", creds)?;
                 let asn = self.fetch_maxmind("GeoLite2-ASN", creds)?;
-                self.install(country, self.country_path())?;
-                self.install(asn, self.asn_path())?;
+                self.install(&country, self.country_path())?;
+                self.install(&asn, self.asn_path())?;
                 self.set_mode(Mode::MaxMind);
                 self.reload();
                 Ok(())
@@ -193,13 +197,21 @@ impl IpDb {
         }
     }
 
-    fn install(&self, data: Vec<u8>, path: PathBuf) -> Result<(), String> {
-        // Verify before replacing: a corrupt download must not clobber a
-        // working database.
-        if Mmdb::open(data.clone()).is_none() {
-            return Err(format!("downloaded file is not a valid MMDB: {}", path.display()));
+    /// Validate the downloaded file, then move it into place atomically. A
+    /// corrupt download must never clobber a working database.
+    fn install(&self, staged: &Path, dest: PathBuf) -> Result<(), String> {
+        let bytes = std::fs::read(staged).map_err(|e| e.to_string())?;
+        if Mmdb::open(bytes).is_none() {
+            let _ = std::fs::remove_file(staged);
+            return Err(format!(
+                "downloaded file is not a valid MMDB: {}",
+                staged.display()
+            ));
         }
-        std::fs::write(&path, data).map_err(|e| e.to_string())
+        std::fs::rename(staged, &dest).map_err(|e| {
+            let _ = std::fs::remove_file(staged);
+            e.to_string()
+        })
     }
 
     fn remove_files(&self) {
@@ -209,7 +221,7 @@ impl IpDb {
     }
 
     /// DB-IP publishes monthly files; try the current and two previous months.
-    fn fetch_dbip(&self, kind: &str) -> Result<Vec<u8>, String> {
+    fn fetch_dbip(&self, kind: &str) -> Result<PathBuf, String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -220,14 +232,19 @@ impl IpDb {
             let (y, m) = prev_month(year, month, back);
             let url = format!("https://download.db-ip.com/free/dbip-{kind}-lite-{y}-{m:02}.mmdb.gz");
             match self.get(&url, None, kind) {
-                Ok(gz) => return gunzip(&gz).map_err(|e| format!("{url}: {e}")),
+                Ok(gz_path) => {
+                    let out = self.tmp_dir.join(format!("dbip-{kind}.mmdb"));
+                    return gunzip_file(&gz_path, &out)
+                        .map(|_| out)
+                        .map_err(|e| format!("{url}: {e}"));
+                }
                 Err(e) => errors.push(format!("{url}: {e}")),
             }
         }
         Err(errors.join("; "))
     }
 
-    fn fetch_maxmind(&self, edition: &str, creds: &Credentials) -> Result<Vec<u8>, String> {
+    fn fetch_maxmind(&self, edition: &str, creds: &Credentials) -> Result<PathBuf, String> {
         let url = format!(
             "https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz"
         );
@@ -239,11 +256,18 @@ impl IpDb {
             )
         );
         let tar_gz = self.get(&url, Some(&auth), edition)?;
-        let tar = gunzip(&tar_gz).map_err(|e| format!("{edition}: {e}"))?;
-        extract_mmdb_from_tar(&tar).ok_or_else(|| format!("no .mmdb inside {edition} tarball"))
+        let tar = self.tmp_dir.join(format!("{edition}.tar"));
+        gunzip_file(&tar_gz, &tar).map_err(|e| format!("{edition}: {e}"))?;
+        let tar_bytes = std::fs::read(&tar).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&tar);
+        let mmdb = extract_mmdb_from_tar(&tar_bytes)
+            .ok_or_else(|| format!("no .mmdb inside {edition} tarball"))?;
+        let out = self.tmp_dir.join(format!("{edition}.mmdb"));
+        std::fs::write(&out, mmdb).map_err(|e| e.to_string())?;
+        Ok(out)
     }
 
-    fn get(&self, url: &str, auth: Option<&str>, label: &str) -> Result<Vec<u8>, String> {
+    fn get(&self, url: &str, auth: Option<&str>, label: &str) -> Result<PathBuf, String> {
         self.set_progress(Progress {
             active: true,
             file: label.to_string(),
@@ -266,24 +290,28 @@ impl IpDb {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
 
-        let mut buf = Vec::new();
+        let path = self.tmp_dir.join(format!("{label}.download"));
+        let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
         let mut reader = resp.into_reader();
         let mut chunk = [0u8; 64 * 1024];
+        let mut written = 0u64;
         loop {
             let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
             if n == 0 {
                 break;
             }
-            buf.extend_from_slice(&chunk[..n]);
+            file.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+            written += n as u64;
             self.set_progress(Progress {
                 active: true,
                 file: label.to_string(),
-                downloaded: buf.len() as u64,
+                downloaded: written,
                 total,
                 error: None,
             });
         }
-        Ok(buf)
+        file.flush().map_err(|e| e.to_string())?;
+        Ok(path)
     }
 }
 
@@ -306,12 +334,14 @@ pub fn lookup(db: &IpDb, ip: IpAddr) -> (Option<String>, Option<u64>) {
     (country, asn)
 }
 
-fn gunzip(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    flate2::read::GzDecoder::new(data)
-        .read_to_end(&mut out)
-        .map_err(|e| e.to_string())?;
-    Ok(out)
+/// Decompress `src` into `dest`, removing the source on success.
+fn gunzip_file(src: &Path, dest: &Path) -> Result<(), String> {
+    let input = std::fs::File::open(src).map_err(|e| e.to_string())?;
+    let mut decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(input));
+    let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    std::io::copy(&mut decoder, &mut out).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(src);
+    Ok(())
 }
 
 /// Pull the first `.mmdb` member out of an uncompressed tar archive.
