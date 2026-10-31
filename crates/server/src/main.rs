@@ -1215,6 +1215,12 @@ async fn login_page() -> Response {
     serve_dashboard_file("login.html", "no-cache").await
 }
 
+/// `GET /tester` — the challenge tester: solve against a site key and watch
+/// the solver log (progress, timing, token, siteverify result).
+async fn tester_page() -> Response {
+    serve_dashboard_file("tester.html", "no-cache").await
+}
+
 /// `GET /public/*` — assets behind the same authentication gate as the JS
 /// server: unauthenticated visitors only get the login page's own files.
 async fn public_asset(State(st): State<AppState>, Path(rel): Path<String>, headers: HeaderMap) -> Response {
@@ -1229,6 +1235,106 @@ async fn public_asset(State(st): State<AppState>, Path(rel): Path<String>, heade
     // stale cached script after an upgrade would break the UI.
     let cache = "no-cache";
     serve_dashboard_file(&rel, cache).await
+}
+
+/// `GET /demo` — the original challenge tester (`tester.html`) with the demo
+/// site key and secret pre-filled, so the whole solve → verify loop can be
+/// exercised from one page. Everything else (layout, log box, messages) is the
+/// upstream file, unmodified.
+async fn demo_page(State(st): State<AppState>) -> Response {
+    let key = match demo_widget_credentials(&st).await {
+        Ok(k) => k,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("demo key: {e}")).into_response()
+        }
+    };
+
+    let root = dashboard_root();
+    let path = root.join("tester.html");
+    let mut html = match tokio::fs::read_to_string(&path).await {
+        Ok(h) => h,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                "tester.html is missing from the dashboard bundle",
+            )
+                .into_response()
+        }
+    };
+
+    let prefill = format!(
+        r#"<script>
+window.addEventListener("DOMContentLoaded", function () {{
+  var k = document.getElementById("keyIdInput");
+  var s = document.getElementById("secretKeyInput");
+  if (k) k.value = "{sk}";
+  if (s) s.value = "{secret}";
+}});
+</script>
+</body>"#,
+        sk = key.0,
+        secret = key.1
+    );
+    html = html.replace("</body>", &prefill);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    (StatusCode::OK, headers, html).into_response()
+}
+
+/// A site key + secret for the demo page. Created on first use and kept in
+/// Redis under `demo:widget-key`; demo instances have no real keys otherwise.
+async fn demo_widget_credentials(st: &AppState) -> Result<(String, String), String> {
+    if let Ok(Some(existing)) = st.kv.get("demo:widget-key").await {
+        if let Some((sk, secret)) = existing.split_once(':') {
+            if st.kv.exists(&format!("key:{sk}")).await.unwrap_or(false) {
+                return Ok((sk.to_string(), secret.to_string()));
+            }
+        }
+    }
+
+    let site_key = random_hex(5);
+    let secret = format!("sk-{}", cap_core::random_hex(24));
+    let secret_hash = format!("sha256:{}", cap_core::sha256_hex(&secret));
+    let jwt_secret = format!("{}{}", random_hex(24), random_hex(8));
+    let config = serde_json::json!({
+        "protocol": "hashwx", "hashwxDifficulty": 1000000, "rsw": false,
+        "difficulty": 4, "challengeCount": 80, "saltSize": 32,
+        "instrumentation": true, "obfuscationLevel": 5,
+        "blockAutomatedBrowsers": false, "ratelimitMax": null,
+        "ratelimitDuration": null, "corsOrigins": null,
+        "blockNonBrowserUA": false, "requiredHeaders": null,
+        // Demo only: let headless/automated browsers through so the test
+        // page always reaches siteverify.
+        "blockOnDeny": false,
+    });
+    st.kv
+        .hset_pairs(
+            &format!("key:{site_key}"),
+            &[
+                ("name", "demo-widget".to_string()),
+                ("secretHash", secret_hash),
+                ("jwtSecret", jwt_secret),
+                ("config", config.to_string()),
+                ("created", now_ms().to_string()),
+            ],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    st.kv
+        .sadd("keys", &site_key)
+        .await
+        .map_err(|e| e.to_string())?;
+    st.kv
+        .set("demo:widget-key", &format!("{site_key}:{secret}"))
+        .await
+        .map_err(|e| e.to_string())?;
+    eprintln!("[cap] demo page created site key {site_key}");
+    Ok((site_key, secret))
 }
 
 /// `GET /share/:token` — the public share page (its token lives in the URL hash).
@@ -2354,6 +2460,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(root_page))
         .route("/login", get(login_page))
         .route("/public/*rest", get(public_asset))
+        .route("/demo", get(demo_page))
+        .route("/tester", get(tester_page))
         .route("/share", get(share_page))
         .route("/share/:token", get(admin_handler))
         .route("/share/:token/geo-stats", get(admin_handler))
