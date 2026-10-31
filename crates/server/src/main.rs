@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 mod cache;
 mod config;
+mod ratelimit;
 mod v2;
 
 // mimalloc: per-thread heaps cut allocator contention on the request path
@@ -66,6 +67,9 @@ struct AppState {
     kv: cap_kv::Kv,
     ipdb: Arc<cap_ipdb::IpDb>,
     cache: Arc<cache::ConfigCache>,
+    limiter: Arc<ratelimit::LocalLimiter>,
+    /// `CAP_RL_MODE=redis` forces the shared Redis limiter.
+    redis_ratelimit: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +332,15 @@ async fn challenge_inner(
         .ratelimit_duration
         .or_else(|| global_rl.as_ref().and_then(|v| v.get("duration").and_then(Value::as_i64)))
         .unwrap_or(DEFAULT_RL_WINDOW_MS);
-    if let Ok(false) = st.store.rate_hit("challenge", &ip, window, max).await {
+    let allowed = if st.redis_ratelimit {
+        st.store
+            .rate_hit("challenge", &ip, window, max)
+            .await
+            .unwrap_or(true)
+    } else {
+        st.limiter.hit("challenge", &ip, window, max)
+    };
+    if !allowed {
         let _ = st
             .kv
             .hincrby(
@@ -1065,7 +1077,15 @@ async fn siteverify(
 ) -> Response {
     // 300 verifications per 10 s per IP (matches siteverify.js).
     let ip = client_ip(&headers, &addr.ip().to_string());
-    if let Ok(false) = st.store.rate_hit("siteverify", &ip, 10_000, 300).await {
+    let allowed = if st.redis_ratelimit {
+        st.store
+            .rate_hit("siteverify", &ip, 10_000, 300)
+            .await
+            .unwrap_or(true)
+    } else {
+        st.limiter.hit("siteverify", &ip, 10_000, 300)
+    };
+    if !allowed {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(err_response(ErrorCode::BadRequest, "Rate limit exceeded")),
@@ -2578,6 +2598,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv,
         ipdb,
         cache: Arc::new(cache::ConfigCache::new()),
+        limiter: Arc::new(ratelimit::LocalLimiter::new()),
+        redis_ratelimit: std::env::var("CAP_RL_MODE")
+            .map(|v| v.eq_ignore_ascii_case("redis"))
+            .unwrap_or(false),
     };
 
     let app = Router::new()
@@ -2623,8 +2647,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/:siteKey/siteverify", post(siteverify))
         .route("/:siteKey/validate", post(validate))
         .layer(axum::middleware::from_fn(cors_layer))
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
-        .with_state(state);
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+
+    let app = app.with_state(state);
 
     let host = settings().hostname.clone();
     let addr: SocketAddr = format!("{host}:{port}")
@@ -2632,6 +2657,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("invalid SERVER_HOSTNAME {host}: {e}"))?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("cap-server (rust) listening on http://{addr}");
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
