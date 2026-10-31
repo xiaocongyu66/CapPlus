@@ -1242,40 +1242,32 @@ async fn public_asset(State(st): State<AppState>, Path(rel): Path<String>, heade
 /// exercised from one page. Everything else (layout, log box, messages) is the
 /// upstream file, unmodified.
 async fn demo_page(State(st): State<AppState>) -> Response {
-    let key = match demo_widget_credentials(&st).await {
+    // The upstream demo page (cap/demo/index.html), served as-is: one widget,
+    // one floating widget and the trigger button. Only the two script sources
+    // and the API endpoint change, because this server serves the bundled
+    // widget and mounts per-site-key endpoints.
+    let (site_key, _secret) = match demo_widget_credentials(&st).await {
         Ok(k) => k,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("demo key: {e}")).into_response()
         }
     };
 
-    let root = dashboard_root();
-    let path = root.join("tester.html");
-    let mut html = match tokio::fs::read_to_string(&path).await {
+    let path = dashboard_root().join("demo.html");
+    let html = match tokio::fs::read_to_string(&path).await {
         Ok(h) => h,
         Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                "tester.html is missing from the dashboard bundle",
-            )
+            return (StatusCode::NOT_FOUND, "demo.html is missing from the dashboard bundle")
                 .into_response()
         }
     };
-
-    let prefill = format!(
-        r#"<script>
-window.addEventListener("DOMContentLoaded", function () {{
-  var k = document.getElementById("keyIdInput");
-  var s = document.getElementById("secretKeyInput");
-  if (k) k.value = "{sk}";
-  if (s) s.value = "{secret}";
-}});
-</script>
-</body>"#,
-        sk = key.0,
-        secret = key.1
-    );
-    html = html.replace("</body>", &prefill);
+    let html = html
+        .replace(r#"data-cap-api-endpoint="/api/""#, &format!(r#"data-cap-api-endpoint="/{site_key}/""#))
+        .replace(r#"<script src="/cap.js"></script>"#, r#"<script src="/assets/widget.js"></script>"#)
+        .replace(
+            r#"<script src="/cap-floating.js"></script>"#,
+            r#"<script src="/assets/floating.js"></script>"#,
+        );
 
     let mut headers = HeaderMap::new();
     headers.insert(
