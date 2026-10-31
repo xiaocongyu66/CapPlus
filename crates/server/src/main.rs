@@ -23,6 +23,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
+mod cache;
 mod config;
 mod v2;
 
@@ -64,6 +65,7 @@ struct AppState {
     releases: Arc<cap_assets::ReleaseStore>,
     kv: cap_kv::Kv,
     ipdb: Arc<cap_ipdb::IpDb>,
+    cache: Arc<cache::ConfigCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,19 +294,12 @@ async fn challenge_inner(
     site_key: String,
     headers: HeaderMap,
 ) -> Response {
-    let key = match st.store.key(&site_key).await {
-        Ok(Some(k)) => k,
-        Ok(None) => {
+    let key = match st.cache.key(&st.store, &site_key).await {
+        Some(k) => Arc::unwrap_or_clone(k),
+        None => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "Invalid site key or secret"})),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("store: {e}")})),
             )
                 .into_response()
         }
@@ -323,13 +318,8 @@ async fn challenge_inner(
             .into_response();
     }
     // Per-key limits win; otherwise the global `settings:ratelimit` applies.
-    let global_rl = st
-        .kv
-        .get("settings:ratelimit")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let global_rl_raw = st.cache.setting(&st.kv, "settings:ratelimit").await;
+    let global_rl = (!global_rl_raw.is_null()).then_some(global_rl_raw);
     let max = cfg
         .ratelimit_max
         .or_else(|| global_rl.as_ref().and_then(|v| v.get("max").and_then(Value::as_i64)))
@@ -549,19 +539,12 @@ async fn redeem(
     }
     let solutions_raw: Vec<Value> = sols.clone();
 
-    let key = match st.store.key(&site_key).await {
-        Ok(Some(k)) => k,
-        Ok(None) => {
+    let key = match st.cache.key(&st.store, &site_key).await {
+        Some(k) => Arc::unwrap_or_clone(k),
+        None => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "Invalid site key or secret"})),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("store: {e}")})),
             )
                 .into_response()
         }
@@ -947,9 +930,9 @@ async fn verify_common(
             .into_response();
     }
 
-    let key = match st.store.key(&site_key).await {
-        Ok(Some(k)) => k,
-        _ => {
+    let key = match st.cache.key(&st.store, &site_key).await {
+        Some(k) => Arc::unwrap_or_clone(k),
+        None => {
             return (
                 StatusCode::OK,
                 Json(err_response(
@@ -1572,8 +1555,10 @@ async fn check_challenge_env(
 /// The operator's asset baseline (`settings:integrity`), or `None` when no
 /// usable sha256 hash is configured.
 async fn load_integrity(st: &AppState) -> Option<Value> {
-    let raw = st.kv.get("settings:integrity").await.ok().flatten()?;
-    let doc: Value = serde_json::from_str(&raw).ok()?;
+    let doc: Value = st.cache.setting(&st.kv, "settings:integrity").await;
+    if doc.is_null() {
+        return None;
+    }
     let mut out = serde_json::Map::new();
     for key in ["widget", "capWasm", "hashwxWasm"] {
         if let Some(v) = doc.get(key).and_then(Value::as_str) {
@@ -1700,14 +1685,7 @@ fn is_browser_ua(ua: &str) -> bool {
 /// Per-key filtering: block non-browser UAs and requests missing the
 /// configured headers. Global settings apply unless the key overrides them.
 async fn filter_request(st: &AppState, cfg: &KeyConfig, headers: &HeaderMap, site_key: &str) -> Option<Response> {
-    let global = st
-        .kv
-        .get("settings:filtering")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or(Value::Null);
+    let global = st.cache.setting(&st.kv, "settings:filtering").await;
 
     let block_ua = cfg
         .block_non_browser_ua
@@ -1872,14 +1850,7 @@ async fn is_blocked(st: &AppState, site_key: &str, ip: &str, headers: &HeaderMap
     }
 
     // Header-configured values win, then the local database.
-    let cfg = st
-        .kv
-        .get("settings:headers")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or(Value::Null);
+    let cfg = st.cache.setting(&st.kv, "settings:headers").await;
     let header_val = |name: &str| {
         headers
             .get(name)
@@ -1961,14 +1932,7 @@ async fn record_geo(st: &AppState, site_key: &str, headers: &HeaderMap, addr: &S
             .filter(|v| !v.is_empty())
     };
 
-    let cfg = st
-        .kv
-        .get("settings:headers")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or(Value::Null);
+    let cfg = st.cache.setting(&st.kv, "settings:headers").await;
 
     let country = header(cfg.get("countryHeader").and_then(Value::as_str).unwrap_or(""));
     let asn = header(cfg.get("asnHeader").and_then(Value::as_str).unwrap_or(""));
@@ -2450,9 +2414,9 @@ async fn embed_page(
     if !cap_embed::validate_site_key(&site_key) {
         return (StatusCode::BAD_REQUEST, "invalid site key").into_response();
     }
-    let key = match st.store.key(&site_key).await {
-        Ok(Some(k)) => k,
-        _ => return (StatusCode::NOT_FOUND, "unknown site key").into_response(),
+    let key = match st.cache.key(&st.store, &site_key).await {
+        Some(k) => Arc::unwrap_or_clone(k),
+        None => return (StatusCode::NOT_FOUND, "unknown site key").into_response(),
     };
     let parent = query
         .unwrap_or_default()
@@ -2571,6 +2535,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         releases,
         kv,
         ipdb,
+        cache: Arc::new(cache::ConfigCache::new()),
     };
 
     let app = Router::new()
