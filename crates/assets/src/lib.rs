@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use cache::AssetCache;
 pub use protect::{is_protected, protect_js, MARKER as PROTECT_MARKER};
-pub use release::{ReleaseMeta, ReleaseStore};
+pub use release::{ReleaseMeta, ReleaseStore, ServedFile};
 pub use zip::{read_zip, sanitize_path, ZipEntry};
 pub use fetch::{http_fetcher, read_capped, MAX_BODY_BYTES};
 pub use refresh::{refresh_blocking, refresh_with_config, OPTIONAL_ASSETS};

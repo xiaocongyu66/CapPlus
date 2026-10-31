@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use std::io::Write;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -53,11 +55,39 @@ pub struct ReleaseMeta {
     pub entry: Option<String>,
 }
 
+/// One served file: the original bytes plus a precompressed variant.
+#[derive(Debug, Clone)]
+pub struct ServedFile {
+    pub plain: Bytes,
+    pub gzip: Option<Bytes>,
+    pub content_type: &'static str,
+}
+
 /// Files of the active release, ready to serve.
 #[derive(Debug, Default)]
 struct ActiveFiles {
     id: String,
-    files: HashMap<String, (Bytes, &'static str)>,
+    files: HashMap<String, ServedFile>,
+}
+
+/// Compressible types worth a gzip variant (already-encrypted JS is not: its
+/// payload is base64 of ciphertext and gzip would make it larger).
+fn should_gzip(name: &str, data: &[u8]) -> bool {
+    if data.len() < 1024 || is_protected(data) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    [".wasm", ".js", ".mjs", ".css", ".json", ".html", ".svg", ".txt", ".map"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+fn gzip_bytes(data: &[u8]) -> Option<Bytes> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+    encoder.write_all(data).ok()?;
+    let out = encoder.finish().ok()?;
+    // Only keep it when it actually helps.
+    (out.len() < data.len()).then(|| Bytes::from(out))
 }
 
 #[derive(Debug)]
@@ -121,7 +151,19 @@ impl ReleaseStore {
                     continue;
                 };
                 let ct = content_type_for(&key).unwrap_or("application/octet-stream");
-                files.insert(key, (Bytes::from(bytes), ct));
+                let gzip = if should_gzip(&key, &bytes) {
+                    gzip_bytes(&bytes)
+                } else {
+                    None
+                };
+                files.insert(
+                    key,
+                    ServedFile {
+                        plain: Bytes::from(bytes),
+                        gzip,
+                        content_type: ct,
+                    },
+                );
             }
         }
         let entry = files
@@ -138,7 +180,7 @@ impl ReleaseStore {
 
     /// A file from the active release. Names are exact relative paths; a bare
     /// basename also resolves when it is unambiguous.
-    pub fn get(&self, name: &str) -> Option<(Bytes, &'static str)> {
+    pub fn get(&self, name: &str) -> Option<ServedFile> {
         let active = self.active.read().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = active.files.get(name) {
             return Some(hit.clone());
@@ -441,11 +483,12 @@ mod tests {
 
         // Active because it was the first release.
         assert_eq!(store.active_release_id().as_deref(), Some(meta.id.as_str()));
-        let (js, ct) = store.get("widget.js").unwrap();
-        assert!(ct.starts_with("application/javascript"));
-        assert!(crate::is_protected(&js), "served JS is protected");
-        let (raw, _) = store.get("cap_wasm_bg.wasm").unwrap();
-        assert_eq!(&raw[..], b"\0asm\x01\x00\x00\x00", "wasm untouched");
+        let js = store.get("widget.js").unwrap();
+        assert!(js.content_type.starts_with("application/javascript"));
+        assert!(crate::is_protected(&js.plain), "served JS is protected");
+        assert!(js.gzip.is_none(), "encrypted JS is not precompressed");
+        let raw = store.get("cap_wasm_bg.wasm").unwrap();
+        assert_eq!(&raw.plain[..], b"\0asm\x01\x00\x00\x00", "wasm untouched");
         // Raw copy is preserved unmodified.
         let raw_js = std::fs::read(dir.join("releases").join(&meta.id).join("raw/widget.js")).unwrap();
         assert_eq!(raw_js, b"var a = 1; // hi\n");

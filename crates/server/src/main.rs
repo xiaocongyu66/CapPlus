@@ -2380,11 +2380,27 @@ async fn admin_handler(
     (status, out_headers, Json(resp.body)).into_response()
 }
 
-async fn asset_handler(State(st): State<AppState>, Path(name): Path<String>) -> Response {
+async fn asset_handler(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    req_headers: HeaderMap,
+) -> Response {
     // A published release always wins over the CDN cache.
-    if let Some((bytes, content_type)) = st.releases.get(&name) {
+    if let Some(file) = st.releases.get(&name) {
+        let accepts_gzip = req_headers
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_ascii_lowercase().contains("gzip"))
+            .unwrap_or(false);
+        let (body, encoded) = match (accepts_gzip, file.gzip) {
+            (true, Some(gz)) => (gz, true),
+            _ => (file.plain, false),
+        };
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(file.content_type),
+        );
         headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=300"),
@@ -2393,7 +2409,14 @@ async fn asset_handler(State(st): State<AppState>, Path(name): Path<String>) -> 
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
         );
-        return (StatusCode::OK, headers, bytes).into_response();
+        headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        if encoded {
+            headers.insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+        }
+        return (StatusCode::OK, headers, body).into_response();
     }
     let Some((bytes, content_type)) = st.assets.get(&name) else {
         return (
