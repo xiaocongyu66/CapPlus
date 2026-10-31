@@ -143,8 +143,22 @@ impl ReleaseStore {
             .filter(|s| !s.is_empty())
     }
 
+    /// Resolve a release directory, rejecting anything that is not a plain
+    /// release id. Axum percent-decodes `:id`, so `..%2F..%2Ftmp` would
+    /// otherwise escape `releases/` (read arbitrary files, delete outside).
     fn release_dir(&self, id: &str) -> PathBuf {
-        self.root.join(id)
+        let valid = id == BUILTIN_ID
+            || (id.len() <= 64
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == '-')
+                && id.split_once('-').is_some());
+        if valid {
+            self.root.join(id)
+        } else {
+            // A non-existent, private path: callers treat it as "no such id".
+            self.root.join("__invalid__")
+        }
     }
 
     /// Load `<id>/dist` into memory and mark it active.

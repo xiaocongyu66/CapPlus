@@ -72,15 +72,38 @@ fn unauth(msg: &str) -> AdminResponse {
 /// `"unknown"`; because a constant key would throttle every anonymous client
 /// as one bucket, login limiting is skipped for `"unknown"` (documented in
 /// [`login`]).
-pub(crate) fn client_ip(headers: &[(String, String)]) -> String {
+pub(crate) fn client_ip(headers: &[(String, String)], peer: &str) -> String {
+    // The transport peer is authoritative. Only when it is a local/private
+    // address (i.e. a reverse proxy) is the forwarded header consulted; that
+    // matches how `trust_proxy` works for the public API, and it means an
+    // anonymous client always lands in a stable bucket instead of skipping
+    // the limiter.
+    let local = peer.starts_with("127.")
+        || peer == "::1"
+        || peer.starts_with("10.")
+        || peer.starts_with("192.168.")
+        || peer.starts_with("172.16.")
+        || peer.starts_with("172.17.")
+        || peer.starts_with("172.18.")
+        || peer.starts_with("172.19.")
+        || peer.starts_with("172.2")
+        || peer.starts_with("172.30.")
+        || peer.starts_with("172.31.");
+    if !local {
+        return if peer.is_empty() {
+            "unknown".into()
+        } else {
+            peer.to_string()
+        };
+    }
     match header(headers, "x-forwarded-for") {
         Some(v) => v
             .split(',')
             .map(|p| p.trim())
             .find(|p| !p.is_empty())
             .map(|p| p.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        None => "unknown".into(),
+            .unwrap_or_else(|| peer.to_string()),
+        None => peer.to_string(),
     }
 }
 
@@ -100,8 +123,8 @@ pub(crate) async fn login(
         return ok(json!({ "success": true, "demo": true }));
     }
 
-    let ip = client_ip(req.headers);
-    if ip != "unknown" {
+    let ip = client_ip(req.headers, req.peer);
+    {
         let window = util::now_ms() / LOGIN_WINDOW_MS;
         let key = format!("rl:login:{ip}:{LOGIN_WINDOW_MS}:{window}");
         let count = match store.incr(&key).await {
@@ -288,6 +311,7 @@ pub async fn require_session(
     headers: &[(String, String)],
 ) -> Result<(), AdminResponse> {
     let req = AdminRequest {
+        peer: "127.0.0.1",
         method: "POST",
         path: "/releases",
         query: "",

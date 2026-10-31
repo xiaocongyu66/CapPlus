@@ -164,14 +164,10 @@ fn same_origin(headers: &HeaderMap) -> bool {
     if origin.is_empty() {
         return false;
     }
-    let host = {
-        let fwd = header_str(headers, "x-forwarded-host");
-        if fwd.is_empty() {
-            header_str(headers, "host")
-        } else {
-            fwd
-        }
-    };
+    // Only the Host the client actually addressed. `X-Forwarded-Host` is
+    // client-controlled and made the check trivially spoofable together with
+    // a forged `Origin`; behind a proxy `Host` is preserved by default.
+    let host = header_str(headers, "host");
     if host.is_empty() {
         return false;
     }
@@ -339,11 +335,11 @@ async fn challenge_inner(
         .unwrap_or(DEFAULT_RL_WINDOW_MS);
     let allowed = if st.redis_ratelimit {
         st.store
-            .rate_hit("challenge", &ip, window, max)
+            .rate_hit(&format!("challenge:{site_key}"), &ip, window, max)
             .await
             .unwrap_or(true)
     } else {
-        st.limiter.hit("challenge", &ip, window, max)
+        st.limiter.hit(&format!("challenge:{site_key}"), &ip, window, max)
     };
     if !allowed {
         st.metrics.incr(
@@ -1093,11 +1089,11 @@ async fn siteverify(
     let ip = client_ip(&headers, &addr.ip().to_string());
     let allowed = if st.redis_ratelimit {
         st.store
-            .rate_hit("siteverify", &ip, 10_000, 300)
+            .rate_hit(&format!("siteverify:{site_key}"), &ip, 10_000, 300)
             .await
             .unwrap_or(true)
     } else {
-        st.limiter.hit("siteverify", &ip, 10_000, 300)
+        st.limiter.hit(&format!("siteverify:{site_key}"), &ip, 10_000, 300)
     };
     if !allowed {
         return (
@@ -2363,6 +2359,7 @@ async fn release_archive(
 
 async fn admin_handler(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: axum::http::Method,
     uri: axum::http::Uri,
     headers: HeaderMap,
@@ -2389,12 +2386,14 @@ async fn admin_handler(
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
         .collect();
+    let peer_ip = peer.ip().to_string();
     let req = cap_admin::AdminRequest {
         method: method.as_str(),
         path: &admin_path,
         query: uri.query().unwrap_or(""),
         headers: &header_pairs,
         body: &body,
+        peer: &peer_ip,
     };
     let resp = cap_admin::handle(admin, st.admin_cfg.as_ref(), &req).await;
     // A successful admin write must be visible immediately on this instance;
@@ -2636,7 +2635,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/login", get(login_page))
         .route("/public/*rest", get(public_asset))
         .route("/demo", get(demo_page))
-        .route("/demo/verify", post(demo_verify))
+        .route(
+            "/demo/verify",
+            post(demo_verify).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/tester", get(tester_page))
         .route("/share", get(share_page))
         .route("/share/:token", get(admin_handler))
@@ -2663,11 +2665,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Public share links (no auth) live outside /server.
         .route("/shares", axum::routing::any(admin_handler))
         .route("/shares/:id", axum::routing::any(admin_handler))
-        .route("/turnstile/v0/siteverify", post(siteverify_alias))
-        .route("/:siteKey/challenge", post(challenge))
-        .route("/:siteKey/redeem", post(redeem))
-        .route("/:siteKey/siteverify", post(siteverify))
-        .route("/:siteKey/validate", post(validate))
+        .route(
+            "/turnstile/v0/siteverify",
+            post(siteverify_alias).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/:siteKey/challenge",
+            post(challenge).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/:siteKey/redeem",
+            post(redeem).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/:siteKey/siteverify",
+            post(siteverify).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/:siteKey/validate",
+            post(validate).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
         .layer(axum::middleware::from_fn(cors_layer))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
 

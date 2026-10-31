@@ -52,6 +52,12 @@ impl AdminStore {
         self.kv.expire(key, secs).await.map_err(e)
     }
 
+    /// `SET key value NX EX secs` — atomic first-writer-wins, used to consume
+    /// a recovery code exactly once.
+    pub(crate) async fn set_nx_ex(&self, key: &str, value: &str, secs: i64) -> Result<bool, String> {
+        self.kv.set_nx_ex(key, value, secs).await.map_err(e)
+    }
+
     pub(crate) async fn del_many(&self, keys: &[String]) -> Result<(), String> {
         self.kv.del_many(keys).await.map_err(e)
     }

@@ -52,6 +52,10 @@ pub struct AdminRequest<'a> {
     pub query: &'a str,
     pub headers: &'a [(String, String)],
     pub body: &'a [u8],
+    /// Transport peer address. Rate limiting keys on this, never on a
+    /// client-supplied header (which would let a login brute-forcer dodge the
+    /// limiter by omitting or rotating `x-forwarded-for`).
+    pub peer: &'a str,
 }
 
 /// One query parameter, percent-decoded where possible.
@@ -579,6 +583,7 @@ mod tests {
             query: "",
             headers: &headers,
             body: &bytes,
+            peer: "127.0.0.1",
         };
         handle(store, cfg, &req).await
     }
@@ -1329,15 +1334,17 @@ mod tests {
         assert_eq!(share_view_id("/shares/a/b"), None);
         assert_eq!(share_view_id("/keys/abc"), None);
 
-        // x-forwarded-for: first value only; absent/blank -> "unknown".
+        // A public peer is authoritative; the forwarded header is ignored.
         let h = vec![(
             "X-Forwarded-For".to_string(),
             "203.0.113.7, 10.0.0.2".into(),
         )];
-        assert_eq!(auth::client_ip(&h), "203.0.113.7");
+        assert_eq!(auth::client_ip(&h, "198.51.100.9"), "198.51.100.9");
+        // Behind a local proxy the header is used, first value only.
+        assert_eq!(auth::client_ip(&h, "127.0.0.1"), "203.0.113.7");
         let h = vec![("x-forwarded-for".into(), "   ".into())];
-        assert_eq!(auth::client_ip(&h), "unknown");
-        assert_eq!(auth::client_ip(&[]), "unknown");
+        assert_eq!(auth::client_ip(&h, "127.0.0.1"), "127.0.0.1");
+        assert_eq!(auth::client_ip(&[], "127.0.0.1"), "127.0.0.1");
     }
 
     // --- redis-backed: demo mode is read-only ----------------------------

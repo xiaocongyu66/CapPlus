@@ -201,7 +201,20 @@ pub(crate) async fn check_second_factor(
             .get("recovery")
             .and_then(|v| serde_json::from_str(v).ok())
             .unwrap_or_default();
-        if let Some(pos) = hashes.iter().position(|hash| util::argon2_verify(code, hash)) {
+        if let Some(pos) = hashes.iter().position(|h| util::argon2_verify(code, h)) {
+            // Consume atomically: the read-modify-write below is not, so two
+            // concurrent logins with the same code would both succeed.
+            let used_key = format!("2fa:recovery-used:{}", hashes[pos]);
+            let claimed = store
+                .set_nx_ex(&used_key, "1", 30 * 24 * 60 * 60)
+                .await
+                .unwrap_or(false);
+            if !claimed {
+                return Err(resp(
+                    401,
+                    json!({ "success": false, "twofa": true, "error": "Invalid recovery code" }),
+                ));
+            }
             hashes.remove(pos);
             let _ = store
                 .hset_pairs(
