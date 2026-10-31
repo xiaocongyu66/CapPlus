@@ -385,13 +385,6 @@ async fn challenge_inner(
         let now = now_ms();
         let expires = now + CHALLENGE_TTL_MS;
         let nonce = random_hex(32);
-        let Some(ev) = v2::encrypt_gcm(&json!(expected), &key.jwt_secret, v2::INFO_FMT2) else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "seal_failed"})),
-            )
-                .into_response();
-        };
         let mut challenges = challs;
         let mut expected_list = expected;
         append_instrumentation(&cfg, expires, &mut challenges, &mut expected_list);
@@ -403,7 +396,6 @@ async fn challenge_inner(
             )
                 .into_response();
         };
-        let _ = ev;
         let mut payload = json!({
             "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev2,
         });
@@ -431,7 +423,16 @@ async fn challenge_inner(
                     .into_response()
             }
         };
-        let Some((challenge, expected)) = v2::rsw_challenge(&fields, cfg.rsw_t) else {
+        // RSA modexp: run on the blocking pool so a burst cannot stall the
+        // async workers.
+        let rsw_t = cfg.rsw_t;
+        let Some((challenge, expected)) = tokio::task::spawn_blocking(move || {
+            v2::rsw_challenge(&fields, rsw_t)
+        })
+        .await
+        .ok()
+        .flatten()
+        else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "rsw_keypair_unavailable"})),
