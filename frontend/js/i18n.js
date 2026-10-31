@@ -110,6 +110,21 @@
     "Add an origin…": "添加来源…",
     "Add an origin": "添加来源",
     "Rate limiting": "速率限制",
+    "Two-factor authentication": "两步验证",
+    "Require a code from an authenticator app in addition to the admin key. Recovery codes are shown once when you enable it.":
+      "除管理密钥外，还需要验证器应用生成的验证码。启用时会显示一次恢复码。",
+    "Two-factor status unavailable.": "两步验证状态不可用。",
+    "Enable 2FA": "启用两步验证",
+    "Disable 2FA": "关闭两步验证",
+    "Disable two-factor authentication": "关闭两步验证",
+    "Add this secret to your authenticator app, then enter the 6-digit code it shows.":
+      "把该密钥添加到验证器应用，然后输入它显示的 6 位验证码。",
+    "Two-factor enabled": "两步验证已启用",
+    "Store these recovery codes somewhere safe. Each one can be used once if you lose your device.":
+      "请妥善保存这些恢复码。丢失设备时每个只能使用一次。",
+    "You will be asked for a code the next time you sign in.":
+      "下次登录时会要求输入验证码。",
+    "Incorrect admin key": "管理密钥不正确",
     "Global rate limit": "全局限流",
     "Max requests": "最大请求数",
     "Requests allowed per window": "每窗口允许的请求数",
@@ -458,6 +473,15 @@
 
   // Counts and simple templates the exact-match pass cannot cover.
   var PATTERNS = [
+    [
+      /^Override the global rate limit for this key\. Leave empty to use the global defaults(?: \(([\d.]+) reqs \/ ([\d.]+)s\))?\.$/i,
+      function (m) {
+        var base = "覆盖该密钥的全局限流。留空则使用全局默认值";
+        return m[1] && m[2]
+          ? base + "（" + m[1] + " 次 / " + m[2] + " 秒）。"
+          : base + "。";
+      },
+    ],
     [/^(\d+)\s+keys?$/i, "$1 个密钥"],
     [/^(\d+)\s+sessions?$/i, "$1 个会话"],
     [/^(\d+)\s+requests?$/i, "$1 个请求"],
