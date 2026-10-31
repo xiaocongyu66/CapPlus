@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 mod cache;
 mod config;
+mod metrics_buf;
 mod ratelimit;
 mod v2;
 
@@ -68,6 +69,7 @@ struct AppState {
     ipdb: Arc<cap_ipdb::IpDb>,
     cache: Arc<cache::ConfigCache>,
     limiter: Arc<ratelimit::LocalLimiter>,
+    metrics: Arc<metrics_buf::MetricsBuffer>,
     /// `CAP_RL_MODE=redis` forces the shared Redis limiter.
     redis_ratelimit: bool,
 }
@@ -276,20 +278,19 @@ async fn challenge(
     let started = std::time::Instant::now();
     let resp = challenge_inner(st.clone(), addr, site_key.clone(), headers).await;
     if resp.status().is_success() {
-        record_latency(&st, &site_key, started.elapsed().as_millis() as i64).await;
+        record_latency(&st, &site_key, started.elapsed().as_millis() as i64);
     }
     resp
 }
 
-async fn record_latency(st: &AppState, site_key: &str, ms: i64) {
+fn record_latency(st: &AppState, site_key: &str, ms: i64) {
     let bucket = hourly_bucket(now_ms()).to_string();
-    let _ = st
-        .kv
-        .hincrby_many(&[
-            (format!("metrics:latency_sum:{site_key}"), bucket.clone(), ms),
-            (format!("metrics:latency_count:{site_key}"), bucket, 1),
-        ])
-        .await;
+    st.metrics.latency(
+        &format!("metrics:latency_sum:{site_key}"),
+        &format!("metrics:latency_count:{site_key}"),
+        &bucket,
+        ms,
+    );
 }
 
 async fn challenge_inner(
@@ -341,14 +342,11 @@ async fn challenge_inner(
         st.limiter.hit("challenge", &ip, window, max)
     };
     if !allowed {
-        let _ = st
-            .kv
-            .hincrby(
-                &format!("metrics:ratelimited:{site_key}"),
-                &hourly_bucket(now_ms()).to_string(),
-                1,
-            )
-            .await;
+        st.metrics.incr(
+            &format!("metrics:ratelimited:{site_key}"),
+            &hourly_bucket(now_ms()).to_string(),
+            1,
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"error": "Rate limit exceeded"})),
@@ -368,8 +366,8 @@ async fn challenge_inner(
     if let Some(o) = os {
         metrics.push((os_key, o.to_string(), 1i64));
     }
-    if !metrics.is_empty() {
-        let _ = st.kv.hincrby_many(&metrics).await;
+    for (name, field, by) in metrics {
+        st.metrics.incr(&name, &field, by);
     }
 
     if cfg.protocol == "hashwx" {
@@ -806,10 +804,12 @@ async fn redeem(
     }
     let _ = st.kv.del(&format!("chalenv:{token}")).await;
     eprintln!("[redeem] site={site_key} issued token (verified)");
-    let _ = st
-        .store
-        .incr_metric(&format!("metrics:verified:{site_key}"), hourly_bucket(now))
-        .await;
+    st.metrics
+        .incr(
+            &format!("metrics:verified:{site_key}"),
+            &hourly_bucket(now).to_string(),
+            1,
+        );
 
     record_geo(&st, &site_key, &headers, &addr).await;
 
@@ -1982,16 +1982,12 @@ async fn record_geo(st: &AppState, site_key: &str, headers: &HeaderMap, addr: &S
     };
 
     if let Some(code) = country.or(db_country) {
-        let _ = st
-            .kv
-            .hincrby(&format!("metrics:country:{site_key}"), &code, 1)
-            .await;
+        st.metrics
+            .incr(&format!("metrics:country:{site_key}"), &code, 1);
     }
     if let Some(net) = asn.or(db_asn.map(|n| n.to_string())) {
-        let _ = st
-            .kv
-            .hincrby(&format!("metrics:asn:{site_key}"), &net, 1)
-            .await;
+        st.metrics
+            .incr(&format!("metrics:asn:{site_key}"), &net, 1);
     }
 }
 
@@ -2599,6 +2595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ipdb,
         cache: Arc::new(cache::ConfigCache::new()),
         limiter: Arc::new(ratelimit::LocalLimiter::new()),
+        metrics: Arc::new(metrics_buf::MetricsBuffer::new()),
         redis_ratelimit: std::env::var("CAP_RL_MODE")
             .map(|v| v.eq_ignore_ascii_case("redis"))
             .unwrap_or(false),
@@ -2648,6 +2645,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/:siteKey/validate", post(validate))
         .layer(axum::middleware::from_fn(cors_layer))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+
+    // Flush buffered metric counters once per second, in one pipeline.
+    {
+        let metrics = state.metrics.clone();
+        let kv = state.kv.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let _ = metrics.flush(&kv).await;
+            }
+        });
+    }
+
+    // Expire stale rate-limit windows so the map cannot grow with the IP count.
+    {
+        let limiter = state.limiter.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                limiter.sweep();
+            }
+        });
+    }
 
     let app = app.with_state(state);
 
