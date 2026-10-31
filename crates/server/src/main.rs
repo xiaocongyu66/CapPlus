@@ -816,25 +816,21 @@ async fn redeem(
                 .await;
         }
     }
-    let trust_block = if demo {
-        v2_trust
-            .as_ref()
-            .map(|(trust, action)| {
-                json!({ "trust": trust_json(trust), "action": action_str(*action) })
-            })
-            .unwrap_or_else(|| json!({}))
-    } else {
-        json!({})
-    };
-    Json(json!({
+    let mut doc = json!({
         "success": true,
         "token": redeem_token,
         "expires": token_expires,
         "scope": site_key,
-        "trust": trust_block.get("trust").cloned().unwrap_or(Value::Null),
-        "action": trust_block.get("action").cloned().unwrap_or(Value::Null),
-    }))
-    .into_response()
+    });
+    // Detection details are a probe oracle: the fields do not exist at all
+    // outside demo mode.
+    if demo {
+        if let Some((trust, action)) = &v2_trust {
+            doc["trust"] = trust_json(trust);
+            doc["action"] = json!(action_str(*action));
+        }
+    }
+    Json(doc).into_response()
 }
 
 /// Trust result in the shape the dashboard/test page expects
@@ -843,7 +839,8 @@ fn trust_json(trust: &cap_detect::Trust) -> Value {
     let level = match trust.level {
         cap_detect::Level::Clean => "trusted",
         cap_detect::Level::Restricted => {
-            if trust.score >= 50 {
+            // trust.js:levelFor splits neutral/suspicious at 55.
+            if trust.score >= 55 {
                 "neutral"
             } else {
                 "suspicious"
@@ -1434,12 +1431,34 @@ async fn demo_widget_credentials(st: &AppState) -> Result<(String, String), Stri
         .sadd("keys", &site_key)
         .await
         .map_err(|e| e.to_string())?;
-    st.kv
-        .set("demo:widget-key", &format!("{site_key}:{secret}"))
+
+    // First-writer wins: a burst of first visits must not create one key per
+    // request (the losers would serve a key whose token /demo/verify rejects).
+    let _ = st
+        .kv
+        .set_nx_ex(
+            "demo:widget-key",
+            &format!("{site_key}:{secret}"),
+            365 * 86_400,
+        )
         .await
         .map_err(|e| e.to_string())?;
-    eprintln!("[cap] demo page created site key {site_key}");
-    Ok((site_key, secret))
+
+    // Always answer with the authoritative pointer: a request that lost the
+    // race must not render its own (now deleted) key, or its token would be
+    // rejected by /demo/verify.
+    if let Ok(Some(existing)) = st.kv.get("demo:widget-key").await {
+        if let Some((sk, secret)) = existing.split_once(':') {
+            if sk != site_key {
+                let _ = st.kv.del(&format!("key:{site_key}")).await;
+                let _ = st.kv.srem("keys", &site_key).await;
+            } else {
+                eprintln!("[cap] demo page created site key {site_key}");
+            }
+            return Ok((sk.to_string(), secret.to_string()));
+        }
+    }
+    Err("demo key could not be stored".into())
 }
 
 /// `GET /share/:token` — the public share page (its token lives in the URL hash).

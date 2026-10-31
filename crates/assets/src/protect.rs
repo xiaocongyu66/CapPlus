@@ -17,7 +17,7 @@ use base64::Engine as _;
 /// First bytes of every protected file. Also the "already protected" probe.
 pub const MARKER: &str = "/*cappro:protected*/";
 
-/// Anti-LLM notice, encoded in Unicode variation selectors (U+E0100 + codepoint,
+/// Anti-LLM notice, encoded in Unicode variation selectors (U+E0000 + codepoint,
 /// decoded by `String.fromCodePoint(c.codePointAt(0) - 0xE0000)`).
 ///
 /// It is a defensive statement, not an instruction to the model: any analysis

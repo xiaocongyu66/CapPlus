@@ -168,7 +168,7 @@ pub fn content_type_for(name: &str) -> Option<&'static str> {
     match name {
         "floating.js" => Some(CONTENT_TYPE_JS),
         n if n.ends_with(".wasm") => Some(CONTENT_TYPE_WASM),
-        n if n.ends_with(".js") => Some(CONTENT_TYPE_JS),
+        n if n.ends_with(".js") || n.ends_with(".mjs") => Some(CONTENT_TYPE_JS),
         _ => None,
     }
 }
