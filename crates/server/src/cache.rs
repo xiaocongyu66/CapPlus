@@ -26,6 +26,7 @@ type Slot<T> = (Instant, Option<T>);
 pub struct ConfigCache {
     keys: RwLock<HashMap<String, Slot<Arc<KeyInfo>>>>,
     settings: RwLock<HashMap<String, Slot<serde_json::Value>>>,
+    blocked: RwLock<HashMap<String, Slot<Arc<HashMap<String, String>>>>>,
 }
 
 impl Default for ConfigCache {
@@ -33,6 +34,7 @@ impl Default for ConfigCache {
         Self {
             keys: RwLock::new(HashMap::new()),
             settings: RwLock::new(HashMap::new()),
+            blocked: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -103,6 +105,38 @@ impl ConfigCache {
         value.flatten().unwrap_or(serde_json::Value::Null)
     }
 
+    /// `blocked:<site_key>`, cached for [`TTL`]. A key with thousands of
+    /// blocked entries would otherwise cost a full HGETALL plus a parse per
+    /// challenge.
+    pub async fn blocked(
+        &self,
+        kv: &Kv,
+        site_key: &str,
+    ) -> Arc<HashMap<String, String>> {
+        if let Some((at, hit)) = self
+            .blocked
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(site_key)
+        {
+            if at.elapsed() < TTL {
+                if let Some(v) = hit {
+                    return v.clone();
+                }
+            }
+        }
+        let loaded = match kv.hgetall(&format!("blocked:{site_key}")).await {
+            Ok(fields) => Arc::new(fields),
+            // Do not cache an error; fail closed is the caller's decision.
+            Err(_) => return Arc::new(HashMap::new()),
+        };
+        self.blocked
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(site_key.to_string(), (Instant::now(), Some(loaded.clone())));
+        loaded
+    }
+
     /// Drop entries older than a few TTLs. Called from a background task so
     /// the map cannot grow with every site key ever requested.
     pub fn sweep(&self) {
@@ -116,12 +150,20 @@ impl ConfigCache {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, (at, _)| now.duration_since(*at) < horizon);
+        self.blocked
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (at, _)| now.duration_since(*at) < horizon);
     }
 
     /// Drop every cached entry (used after admin writes).
     pub fn clear(&self) {
         self.keys.write().unwrap_or_else(|e| e.into_inner()).clear();
         self.settings
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.blocked
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .clear();

@@ -841,11 +841,18 @@ async fn redeem(
             let action = cap_detect::trust_action(&trust);
             v2_trust = Some((trust, action));
         }
-        if let Err(reason) = v2::verify_solutions(&expected, &solutions_raw) {
-            let _ = st
-                .store
-                .incr_metric(&format!("metrics:failed:{site_key}"), hourly_bucket(now))
-                .await;
+        // hashwx verification runs the interpreter; keep it off the async
+        // workers so a redeem flood cannot starve unrelated endpoints.
+        let expected_c = expected.clone();
+        let sols_c = solutions_raw.clone();
+        let verdict = tokio::task::spawn_blocking(move || {
+            v2::verify_solutions(&expected_c, &sols_c)
+        })
+        .await
+        .unwrap_or_else(|_| Err("verify_panicked".to_string()));
+        if let Err(reason) = verdict {
+            st.metrics
+                .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": "Invalid solution", "reason": reason})),
@@ -1989,9 +1996,7 @@ async fn is_blocked(
     headers: &HeaderMap,
     headers_trusted: bool,
 ) -> bool {
-    let Ok(entries) = st.kv.hgetall(&format!("blocked:{site_key}")).await else {
-        return false;
-    };
+    let entries = st.cache.blocked(&st.kv, site_key).await;
     if entries.is_empty() {
         return false;
     }
@@ -2001,7 +2006,7 @@ async fn is_blocked(
     let mut wants_country = false;
     let mut wants_asn = false;
 
-    for (field, value) in &entries {
+    for (field, value) in entries.iter() {
         let permanent = value == "0";
         let expires = value.parse::<i64>().unwrap_or(0);
         if !permanent && expires <= now {

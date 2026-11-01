@@ -182,10 +182,19 @@ pub fn hashwx_seed(challenge: &[u8; HASHWX_CHALLENGE_SIZE], block: u64) -> [u8; 
 /// could not be instantiated or a call trapped.
 pub fn hash_nonce(seed: &[u8; HASHWX_SEED_SIZE], nonce: u64) -> Option<u64> {
     let pool = states()?;
-    // Spread by nonce so concurrent verifications rarely contend.
-    let idx = (nonce as usize) % pool.len();
-    let mutex = &pool[idx];
-    let mut guard = mutex.lock().unwrap_or_else(|poison| poison.into_inner());
+    // Prefer the shard for this nonce, but fall through to any free shard: a
+    // client that sends the same nonce repeatedly would otherwise pin one
+    // shard while the others idle.
+    let preferred = (nonce as usize) % pool.len();
+    for i in 0..pool.len() {
+        let idx = (preferred + i) % pool.len();
+        if let Ok(mut guard) = pool[idx].try_lock() {
+            return guard.run(seed, nonce);
+        }
+    }
+    let mut guard = pool[preferred]
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     guard.run(seed, nonce)
 }
 
