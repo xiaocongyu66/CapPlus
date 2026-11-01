@@ -200,73 +200,67 @@ pub fn verify_solutions(expected: &Value, solutions: &[Value]) -> Result<(), Str
                 }
             }
             "instrumentation" => {
-                // Solution shape: {instr:{i,state,p,ts,mac,scriptHash}} |
-                // {blocked:true} | {timeout:true}.
-                if sol.get("blocked").and_then(Value::as_bool) == Some(true) {
-                    return Err("instr_blocked".into());
-                }
-                if sol.get("timeout").and_then(Value::as_bool) == Some(true) {
-                    return Err("instr_timeout".into());
-                }
-                let Some(instr) = sol.get("instr") else {
-                    return Err("instr_missing".into());
-                };
-                let meta = exp
-                    .get("instrMeta")
-                    .ok_or_else(|| "invalid_expected".to_string())?;
-                let id_ok = instr.get("i").and_then(Value::as_str)
-                    == meta.get("id").and_then(Value::as_str);
-                if !id_ok {
-                    return Err("instr_id_mismatch".into());
-                }
-                let state = instr
-                    .get("state")
-                    .ok_or_else(|| "instr_no_state".to_string())?;
-                let vars = meta
-                    .get("vars")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| "invalid_expected".to_string())?;
-                let vals = meta
-                    .get("expectedVals")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| "invalid_expected".to_string())?;
-                if vars.len() != vals.len() {
-                    return Err("invalid_expected".into());
-                }
-                for (name, expected) in vars.iter().zip(vals.iter()) {
-                    let Some(key) = name.as_str() else {
-                        return Err("invalid_expected".into());
-                    };
-                    if state.get(key) != Some(expected) {
-                        return Err(format!("instr_failed_challenge:{idx}"));
-                    }
-                }
-                // Tamper-evidence: the client HMACs id|ts|JSON(state)|JSON(p)
-                // with the per-session key. Canonical JSON must reproduce the
-                // client's `JSON.stringify` (see cap_instr::js_stringify).
-                if let Some(mac_key) = meta.get("macKey").and_then(Value::as_str) {
-                    if !mac_key.is_empty() {
-                        let mac = instr.get("mac").and_then(Value::as_str).unwrap_or("");
-                        let ts_mac = instr.get("ts").and_then(Value::as_i64).unwrap_or(0);
-                        let id_str = meta.get("id").and_then(Value::as_str).unwrap_or("");
-                        let p_val = instr.get("p").cloned().unwrap_or(Value::Null);
-                        if !cap_instr::mac::verify_result_mac(
-                            mac_key, id_str, ts_mac, state, &p_val, mac,
-                        ) {
-                            return Err(format!("instr_mac_mismatch:{idx}"));
-                        }
-                    }
-                }
-                // Replay window.
-                let ts = instr.get("ts").and_then(Value::as_i64).unwrap_or(0);
-                let iat = meta.get("iat").and_then(Value::as_i64).unwrap_or(0);
-                let now = now_ms();
-                if ts < iat - 5_000 || ts > now + 120_000 {
-                    return Err("instr_ts_invalid".into());
-                }
+                verify_instr(
+                    exp.get("instrMeta")
+                        .ok_or_else(|| "invalid_expected".to_string())?,
+                    sol.get("instr").ok_or_else(|| "instr_missing".to_string())?,
+                )?;
             }
             other => return Err(format!("protocol_not_supported:{other}")),
         }
+    }
+    Ok(())
+}
+
+/// Verify one instrumentation solution against its sealed meta. Shared by the
+/// v2 challenge list and the v1 `ei` path.
+pub fn verify_instr(meta: &Value, instr: &Value) -> Result<(), String> {
+    let id_ok = instr.get("i").and_then(Value::as_str) == meta.get("id").and_then(Value::as_str);
+    if !id_ok {
+        return Err("instr_id_mismatch".into());
+    }
+    let state = instr
+        .get("state")
+        .ok_or_else(|| "instr_no_state".to_string())?;
+    let vars = meta
+        .get("vars")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "invalid_expected".to_string())?;
+    let vals = meta
+        .get("expectedVals")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "invalid_expected".to_string())?;
+    if vars.len() != vals.len() {
+        return Err("invalid_expected".into());
+    }
+    for (name, expected) in vars.iter().zip(vals.iter()) {
+        let Some(key) = name.as_str() else {
+            return Err("invalid_expected".into());
+        };
+        if state.get(key) != Some(expected) {
+            return Err("instr_failed_challenge".into());
+        }
+    }
+    // Tamper-evidence: the client HMACs id|ts|JSON(state)|JSON(p) with the
+    // per-session key. Canonical JSON must reproduce the client's
+    // `JSON.stringify` (see cap_instr::js_stringify).
+    if let Some(mac_key) = meta.get("macKey").and_then(Value::as_str) {
+        if !mac_key.is_empty() {
+            let mac = instr.get("mac").and_then(Value::as_str).unwrap_or("");
+            let ts_mac = instr.get("ts").and_then(Value::as_i64).unwrap_or(0);
+            let id_str = meta.get("id").and_then(Value::as_str).unwrap_or("");
+            let p_val = instr.get("p").cloned().unwrap_or(Value::Null);
+            if !cap_instr::mac::verify_result_mac(mac_key, id_str, ts_mac, state, &p_val, mac) {
+                return Err("instr_mac_mismatch".into());
+            }
+        }
+    }
+    // Replay window.
+    let ts = instr.get("ts").and_then(Value::as_i64).unwrap_or(0);
+    let iat = meta.get("iat").and_then(Value::as_i64).unwrap_or(0);
+    let now = now_ms();
+    if ts < iat - 5_000 || ts > now + 120_000 {
+        return Err("instr_ts_invalid".into());
     }
     Ok(())
 }

@@ -228,6 +228,64 @@ async fn health() -> impl IntoResponse {
 
 /// Append the generated instrumentation challenge (script + sealed meta) when
 /// the key enables instrumentation. Shared by the rsw and hashwx v2 branches.
+fn instr_options<'a>(
+    cfg: &'a KeyConfig,
+    ext_names: &'a [String],
+    ext: cap_instr::ExtProbes<'a>,
+) -> cap_instr::InstrOptions<'a> {
+    let _ = (ext_names, ext);
+    cap_instr::InstrOptions {
+        block_automated_browsers: cfg.block_automated_browsers,
+        extended_probes: ext,
+        polymorphism: cfg.polymorphism.clamp(0.0, 1.0),
+        sign_results: true,
+        obfuscation_level: cfg.obfuscation_level,
+        ttl_ms: CHALLENGE_TTL_MS,
+    }
+}
+
+/// Build the v1 instrumentation: the sealed meta (`ei`) and the script the
+/// client must run. Mirrors the v2 challenge entry but uses the v1 wire shape
+/// (`payload.ei` + a top-level `instrumentation` field).
+fn v1_instrumentation(cfg: &KeyConfig, expires: i64, secret: &str) -> Option<(String, String)> {
+    if !cfg.instrumentation {
+        return None;
+    }
+    let ext_names: Vec<String> = match &cfg.extended_probes {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        Value::Bool(true) => cap_instr::EXTENDED_PROBE_KEYS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let ext_refs: Vec<&str> = ext_names.iter().map(String::as_str).collect();
+    let ext = if matches!(cfg.extended_probes, Value::Bool(true)) {
+        cap_instr::ExtProbes::All
+    } else if ext_refs.is_empty() {
+        cap_instr::ExtProbes::Off
+    } else {
+        cap_instr::ExtProbes::List(&ext_refs)
+    };
+    let instr = cap_instr::generate(&instr_options(cfg, &ext_names, ext));
+    let meta = json!({
+        "id": instr.id,
+        "expectedVals": instr.expected_vals,
+        "vars": instr.vars,
+        "blockAutomatedBrowsers": instr.block_automated_browsers,
+        "extendedFields": instr.extended_fields,
+        "scriptHash": instr.script_hash,
+        "macKey": instr.mac_key,
+        "iat": now_ms(),
+        "expires": expires,
+    });
+    let ei = v2::encrypt_gcm(&meta, secret, v2::INFO_FMT2)?;
+    Some((ei, cap_instr::script_blob(&instr.script)))
+}
+
 fn append_instrumentation(
     cfg: &KeyConfig,
     expires: i64,
@@ -508,16 +566,26 @@ async fn challenge_inner(
         "n": nonce, "c": params.c, "s": params.s, "d": params.d,
         "exp": expires, "iat": now, "sk": site_key,
     });
+    // v1 carries the instrumentation meta sealed in `ei`, exactly like the JS
+    // reference; without it an automated client on the old protocol is never
+    // fingerprinted and scores as clean.
+    let instrument = v1_instrumentation(&cfg, expires, &key.jwt_secret);
+    if let Some((ei, _)) = &instrument {
+        payload["ei"] = json!(ei);
+    }
     seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
     let token = jwt_sign(&payload, &key.jwt_secret);
     remember_challenge_env(&st, &token, &headers, &addr).await;
-    Json(json!({
+    let mut body = json!({
         "challenge": {"c": params.c, "s": params.s, "d": params.d},
         "token": token,
         "expires": expires,
         "nonce": nonce,
-    }))
-    .into_response()
+    });
+    if let Some((_, script)) = instrument {
+        body["instrumentation"] = json!(script);
+    }
+    Json(body).into_response()
 }
 
 async fn redeem(
@@ -614,6 +682,66 @@ async fn redeem(
     }
     let is_v2 = claims.get("f").and_then(Value::as_u64) == Some(2);
     let mut v2_trust: Option<(cap_detect::Trust, cap_detect::Action)> = None;
+    if !is_v2 {
+        // v1 carries its instrumentation meta sealed in `ei`. Without it an
+        // automated client on the old protocol would never be fingerprinted.
+        if let Some(ei) = claims.get("ei").and_then(Value::as_str) {
+            let Some(meta) = v2::decrypt_gcm(ei, &key.jwt_secret, v2::INFO_FMT2) else {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "instr_corrupted"})),
+                )
+                    .into_response();
+            };
+            if payload.get("instr_blocked").and_then(Value::as_bool) == Some(true) {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": "instr_blocked"})))
+                    .into_response();
+            }
+            if payload.get("instr_timeout").and_then(Value::as_bool) == Some(true) {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": "instr_timeout"})))
+                    .into_response();
+            }
+            let Some(instr) = payload.get("instr") else {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": "instr_missing"})))
+                    .into_response();
+            };
+            if let Err(reason) = v2::verify_instr(&meta, instr) {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response();
+            }
+
+            let mut sigs: Vec<cap_detect::Signal> = Vec::new();
+            // Honeypot: a filled hidden field is a decisive bot signal.
+            if payload
+                .get("integrity")
+                .and_then(|i| i.get("filled"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                sigs.push(cap_detect::Signal::gating("honeypot_triggered"));
+            }
+            if let Some(p) = instr.get("p") {
+                let optional: Vec<String> = meta
+                    .get("extendedFields")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let opts = cap_detect::DetectOpts {
+                    font_stack_count: Some(cap_detect::PROBE_FONT_STACK_COUNT),
+                    optional_fields: &optional,
+                    accept_language: None,
+                };
+                let outcome = cap_detect::detect_automation(p, &opts);
+                sigs.extend(outcome.signals.iter().map(|s| s.as_signal()));
+                let trust = cap_detect::compute_trust_signals(&sigs, None, Some(outcome.pass));
+                let action = cap_detect::trust_action(&trust);
+                v2_trust = Some((trust, action));
+            } else if !sigs.is_empty() {
+                let trust = cap_detect::compute_trust_signals(&sigs, None, None);
+                let action = cap_detect::trust_action(&trust);
+                v2_trust = Some((trust, action));
+            }
+        }
+    }
     if is_v2 {
         let Some(ev) = claims.get("ev").and_then(Value::as_str) else {
             return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid_token"}))).into_response();
