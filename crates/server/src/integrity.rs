@@ -69,7 +69,7 @@ pub(crate) async fn remember_challenge_env(
     });
     st.kv
         .set_ex(
-            &format!("chalenv:{token}"),
+            &chalenv_key(token),
             &doc.to_string(),
             CHALLENGE_TTL_MS / 1000,
         )
@@ -86,7 +86,7 @@ pub(crate) async fn check_challenge_env(
     addr: &SocketAddr,
     require_ip: bool,
 ) -> Result<ChallengeEnv, String> {
-    let raw = st.kv.get(&format!("chalenv:{token}")).await.map_err(|e| {
+    let raw = st.kv.get(&chalenv_key(token)).await.map_err(|e| {
         eprintln!("[redeem] challenge environment read failed: {e}");
         "store_unavailable".to_string()
     });
@@ -110,6 +110,12 @@ pub(crate) async fn check_challenge_env(
         parent: env.get("parent").and_then(Value::as_str).map(str::to_owned),
         sid: env.get("sid").and_then(Value::as_str).map(str::to_owned),
     })
+}
+
+/// Challenge environment records are keyed by a digest: the token itself can
+/// be several KB, and the record only needs to be found again.
+pub(crate) fn chalenv_key(token: &str) -> String {
+    format!("chalenv:{}", cap_core::sha256_hex(token))
 }
 
 /// What the challenge recorded about the request that asked for it.
@@ -258,14 +264,21 @@ pub(crate) async fn load_integrity(st: &AppState) -> Option<Value> {
 
 /// Seal the baseline into the token: `ig` (encrypted) so the client cannot
 /// read or tamper with it.
-pub(crate) fn seal_integrity(payload: &mut Value, integrity: &Option<Value>, secret: &str) {
-    if let Some(ig) = integrity {
-        if let Some(blob) = v2::encrypt_gcm(ig, secret, "cap:integrity-v1") {
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("ig".into(), json!(blob));
-            }
-        }
-    }
+pub(crate) fn seal_integrity(
+    payload: &mut Value,
+    integrity: &Option<Value>,
+    secret: &str,
+) -> Result<(), &'static str> {
+    let Some(ig) = integrity else {
+        return Ok(());
+    };
+    // A configured baseline that cannot be sealed must fail the challenge:
+    // issuing one without `ig` would silently disable the check downstream.
+    let blob = v2::encrypt_gcm(ig, secret, "cap:integrity-v1")
+        .ok_or("integrity_seal_failed")?;
+    let obj = payload.as_object_mut().ok_or("integrity_seal_failed")?;
+    obj.insert("ig".into(), json!(blob));
+    Ok(())
 }
 
 /// Verify the client's reported assets and request proof against the sealed
@@ -282,8 +295,8 @@ pub(crate) fn check_integrity(claims: &Value, body: &Value, secret: &str) -> Res
         return Err("integrity_missing".into());
     }
 
-    // Strong: WASM hashes must match exactly.
-    for key in ["capWasm", "hashwxWasm"] {
+    // Strong: the served asset hashes must match exactly.
+    for key in ["capWasm", "hashwxWasm", "widget"] {
         if let Some(want) = expected.get(key).and_then(Value::as_str) {
             let got = reported
                 .get(key)

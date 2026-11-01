@@ -194,6 +194,11 @@ impl Store {
             return Ok(None);
         }
         let jwt_secret = fields.get("jwtSecret").cloned().unwrap_or_default();
+        // An empty or tiny secret would let anyone forge challenges and embed
+        // contexts for this site key, so treat such a record as unavailable.
+        if jwt_secret.len() < 16 {
+            return Ok(None);
+        }
         let secret_hash = fields.get("secretHash").cloned().unwrap_or_default();
         let config = match fields.get("config") {
             Some(raw) => serde_json::from_str(raw)?,
@@ -369,7 +374,7 @@ mod tests {
             .hset_pairs(
                 &format!("key:{site}"),
                 &[
-                    ("jwtSecret", "sekret".to_string()),
+                    ("jwtSecret", "sekret-0123456789abcdef".to_string()),
                     ("secretHash", "sha256:abc".to_string()),
                     ("config", r#"{"challengeCount":7,"difficulty":1}"#.to_string()),
                 ],
@@ -378,7 +383,7 @@ mod tests {
             .unwrap();
 
         let k = store.key(&site).await.unwrap().expect("key exists");
-        assert_eq!(k.jwt_secret, "sekret");
+        assert_eq!(k.jwt_secret, "sekret-0123456789abcdef");
         assert_eq!(k.config.challenge_count, 7);
         assert!(store
             .key(&format!("nope{suffix}"))

@@ -2183,7 +2183,7 @@ async function loadBlockedIps() {
       const colorClass = typeColors[type] || "";
       const displayValue =
         type === "country"
-          ? `${countryFlags(b.ip)} ${countryNames[b.ip] || b.ip}`
+          ? `${countryFlags(b.ip)} ${escapeHtml(countryNames[b.ip] || b.ip)}`
           : escapeHtml(b.ip);
       return `<div class="blocked-ip-row">
       <div class="blocked-ip-info">

@@ -147,7 +147,7 @@ pub(crate) async fn demo_widget_credentials(st: &AppState) -> Result<(String, St
         "difficulty": 4, "challengeCount": 80, "saltSize": 32,
         "instrumentation": true, "obfuscationLevel": 5,
         "blockAutomatedBrowsers": false, "ratelimitMax": null,
-        "ratelimitDuration": null, "corsOrigins": null,
+        "ratelimitDuration": null, "corsOrigins": ["*"],
         "blockNonBrowserUA": false, "requiredHeaders": null,
         // Demo only: let headless/automated browsers through so the test
         // page always reaches siteverify.

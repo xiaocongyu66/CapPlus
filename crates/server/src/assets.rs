@@ -3,15 +3,17 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, RawQuery, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use cap_core::{jwt_sign, random_hex};
 use cap_store::now_ms;
 use serde_json::json;
 
-use crate::http_util::{cors_origins, html_response};
-use crate::AppState;
+use crate::http_util::{client_ip, cors_origins, html_response};
+use crate::{rate_allowed, AppState, DEFAULT_RL_MAX, DEFAULT_RL_WINDOW_MS};
 
 pub(crate) async fn asset_handler(
     State(st): State<AppState>,
@@ -85,16 +87,30 @@ pub(crate) async fn embed_page(
     State(st): State<AppState>,
     Path(site_key): Path<String>,
     RawQuery(query): RawQuery,
+    req_headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if !cap_embed::validate_site_key(&site_key) {
         return (StatusCode::BAD_REQUEST, "invalid site key").into_response();
+    }
+    // Each request either reads a key from Redis or mints a signed context, so
+    // an unauthenticated loop over random site keys must be rate limited per
+    // client like the challenge endpoint is.
+    let ip = client_ip(&req_headers, &addr.ip().to_string());
+    if !rate_allowed(&st, "embed", &ip, DEFAULT_RL_WINDOW_MS, DEFAULT_RL_MAX).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded",
+        )
+            .into_response();
     }
     let key = match st.cache.key(&st.store, &site_key).await {
         Some(k) => Arc::unwrap_or_clone(k),
         None => return (StatusCode::NOT_FOUND, "unknown site key").into_response(),
     };
+    let query = query.unwrap_or_default();
     let parent = query
-        .unwrap_or_default()
+        .as_str()
         .split('&')
         .filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| *k == "parent")
@@ -128,6 +144,22 @@ pub(crate) async fn embed_page(
     // from another. Two hours covers a long-open page; after it expires the
     // iframe gets a fresh one on the next load. It only ever names a session,
     // never grants anything by itself.
+    // The framing page may declare its theme; only the two known values are
+    // passed through, anything else falls back to the default dark palette.
+    let theme = query
+        .as_str()
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "theme")
+        .map(|(_, v)| {
+            form_urlencoded::parse(format!("v={v}").as_bytes())
+                .next()
+                .map(|(_, val)| val.into_owned())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let theme = if theme == "light" { "light" } else { "dark" };
+
     let context = jwt_sign(
         &json!({
             "typ": "embed", "sk": site_key, "parent": parent_origin,
@@ -137,7 +169,7 @@ pub(crate) async fn embed_page(
         &key.jwt_secret,
     );
     let html = cap_embed::embed_page_with_context(
-        &site_key, &parent_origin, &st.embed_widget_url, &context,
+        &site_key, &parent_origin, &st.embed_widget_url, &context, theme,
     );
     html_response(
         StatusCode::OK,

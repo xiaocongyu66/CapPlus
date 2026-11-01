@@ -143,17 +143,18 @@ impl ConfigCache {
     /// `blocked:<site_key>`, cached for [`TTL`] and pre-split by kind. A key
     /// with thousands of blocked entries would otherwise cost a full HGETALL
     /// plus an O(n) scan per challenge.
-    pub async fn blocked(&self, kv: &Kv, site_key: &str) -> Arc<BlockList> {
+    /// `None` means the list could not be read; callers must fail closed
+    /// rather than treat an outage as "nothing is blocked".
+    pub async fn blocked(&self, kv: &Kv, site_key: &str) -> Option<Arc<BlockList>> {
         self.blocked
             .try_get_with_by_ref(site_key, async {
                 match kv.hgetall(&format!("blocked:{site_key}")).await {
                     Ok(fields) => Ok(Arc::new(BlockList::from_fields(&fields, crate::now_ms()))),
-                    // Do not cache an error; fail closed is the caller's decision.
                     Err(_) => Err(LoadError),
                 }
             })
             .await
-            .unwrap_or_default()
+            .ok()
     }
 
     /// Drop every cached entry (used after admin writes).

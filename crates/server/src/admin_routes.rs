@@ -346,9 +346,14 @@ pub(crate) async fn release_archive(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/zip"),
             );
+            let safe_id: String = id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(64)
+                .collect();
             out.insert(
                 header::CONTENT_DISPOSITION,
-                HeaderValue::from_str(&format!("attachment; filename=\"{id}.zip\""))
+                HeaderValue::from_str(&format!("attachment; filename=\"{safe_id}.zip\""))
                     .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
             );
             (StatusCode::OK, out, bytes).into_response()

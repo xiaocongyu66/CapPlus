@@ -87,19 +87,20 @@ pub fn jwt_sign(payload: &serde_json::Value, secret: &str) -> String {
 
 /// Returns the decoded payload when the signature matches, `None` otherwise.
 pub fn jwt_verify(token: &str, secret: &str) -> Option<serde_json::Value> {
-    let last = token.rfind('.')?;
-    if last == 0 {
+    // Pin the header instead of only relying on the HMAC: the signing input
+    // must be the exact HS256/JWT header we issue.
+    let rest = token.strip_prefix(JWT_HEADER_B64)?.strip_prefix('.')?;
+    let last = rest.rfind('.')?;
+    if rest.is_empty() {
         return None;
     }
-    let signing_input = &token[..last];
-    let sig_b64 = &token[last + 1..];
+    let sig_b64 = &rest[last + 1..];
     let actual = URL_SAFE_NO_PAD.decode(sig_b64).ok()?;
-    let expected = hmac_sha256(secret, signing_input);
+    let expected = hmac_sha256(secret, &token[..token.len() - sig_b64.len() - 1]);
     if actual.ct_eq(&expected).unwrap_u8() != 1 {
         return None;
     }
-    let first = token.find('.')?;
-    let payload_b64 = &token[first + 1..last];
+    let payload_b64 = &rest[..last];
     let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
     serde_json::from_slice(&bytes).ok()
 }

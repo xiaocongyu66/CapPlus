@@ -1,5 +1,42 @@
 :host {
   display: inline-block;
+  /* Theme palette. Defaults to dark; the page declares its theme explicitly
+     (data-cap-theme, color-scheme, data-theme, ...) and the embed page mirrors
+     it onto this element. Integrators can always override the --cap-* vars. */
+  --cap-bg: #17181c;
+  --cap-fg: #f2f3f5;
+  --cap-border: #ffffff26;
+  --cap-checkbox-bg: #ffffff12;
+  --cap-checkbox-border-color: #ffffff40;
+  --cap-spinner-bg: #33363d;
+  --cap-spinner-fg: #f2f3f5;
+  --cap-focus: #5aa9ff;
+  --cap-troubleshoot: #9cc7ff;
+}
+
+/* Explicit page choice always wins over the default. */
+:host([data-cap-theme="light"]) {
+  --cap-bg: #fdfdfd;
+  --cap-fg: #212121;
+  --cap-border: #dddddd8f;
+  --cap-checkbox-bg: #fafafa91;
+  --cap-checkbox-border-color: #aaaaaad1;
+  --cap-spinner-bg: #eee;
+  --cap-spinner-fg: #000;
+  --cap-focus: #0066cc;
+  --cap-troubleshoot: #0050a0;
+}
+
+:host([data-cap-theme="dark"]) {
+  --cap-bg: #17181c;
+  --cap-fg: #f2f3f5;
+  --cap-border: #ffffff26;
+  --cap-checkbox-bg: #ffffff12;
+  --cap-checkbox-border-color: #ffffff40;
+  --cap-spinner-bg: #33363d;
+  --cap-spinner-fg: #f2f3f5;
+  --cap-focus: #5aa9ff;
+  --cap-troubleshoot: #9cc7ff;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -35,8 +72,8 @@
   display: inline-block;
   width: var(--cap-widget-width, 260px);
   height: var(--cap-widget-height, 58px);
-  background-color: var(--cap-background, #fdfdfd);
-  border: 1px solid var(--cap-border-color, #dddddd8f);
+  background-color: var(--cap-background, var(--cap-bg));
+  border: 1px solid var(--cap-border-color, var(--cap-border));
   border-radius: var(--cap-border-radius, 14px);
   user-select: none;
   cursor: pointer;
@@ -46,7 +83,7 @@
     height 0.2s;
   -webkit-tap-highlight-color: rgba(255, 255, 255, 0);
   overflow: hidden;
-  color: var(--cap-color, #212121);
+  color: var(--cap-color, var(--cap-fg));
   font-family: var(
     --cap-font,
     system,
@@ -92,16 +129,16 @@
 }
 
 .captcha-trigger:focus-visible {
-  outline: 2px solid var(--cap-focus-ring, #0066cc);
+  outline: 2px solid var(--cap-focus-ring, var(--cap-focus));
   outline-offset: -3px;
 }
 
 .checkbox {
   width: var(--cap-checkbox-size, 25px);
   height: var(--cap-checkbox-size, 25px);
-  border: var(--cap-checkbox-border, 1px solid #aaaaaad1);
+  border: var(--cap-checkbox-border, 1px solid var(--cap-checkbox-border-color));
   border-radius: var(--cap-checkbox-border-radius, 6px);
-  background-color: var(--cap-checkbox-background, #fafafa91);
+  background-color: var(--cap-checkbox-background, var(--cap-checkbox-bg));
   transition: opacity 0.2s;
   margin-top: var(--cap-checkbox-margin, 2px);
   margin-bottom: var(--cap-checkbox-margin, 2px);
@@ -140,7 +177,7 @@
   top: 0;
   background: linear-gradient(
     to bottom,
-    var(--cap-background, #fdfdfd),
+    var(--cap-background, var(--cap-bg)),
     transparent
   );
 }
@@ -149,7 +186,7 @@
   bottom: 0;
   background: linear-gradient(
     to top,
-    var(--cap-background, #fdfdfd),
+    var(--cap-background, var(--cap-bg)),
     transparent
   );
 }
@@ -187,13 +224,13 @@
 
 .checkbox .progress-ring-bg {
   fill: none;
-  stroke: var(--cap-spinner-background-color, #eee);
+  stroke: var(--cap-spinner-background-color, var(--cap-spinner-bg));
   stroke-width: var(--cap-spinner-thickness, 3);
 }
 
 .checkbox .progress-ring-circle {
   fill: none;
-  stroke: var(--cap-spinner-color, #000);
+  stroke: var(--cap-spinner-color, var(--cap-spinner-fg));
   stroke-width: var(--cap-spinner-thickness, 3);
   stroke-linecap: round;
   stroke-dasharray: 87.96;
@@ -291,7 +328,7 @@
   inset-block-end: 4px;
   inset-inline-end: 4px;
   font-size: 12px !important;
-  color: var(--cap-color, #212121);
+  color: var(--cap-color, var(--cap-fg));
   opacity: 0.8 !important;
   text-decoration: underline;
   text-underline-offset: 0.18em;
@@ -313,7 +350,7 @@
 }
 
 .credits:focus-visible {
-  outline: 2px solid var(--cap-focus-ring, #0066cc);
+  outline: 2px solid var(--cap-focus-ring, var(--cap-focus));
   outline-offset: 2px;
   opacity: 1 !important;
 }
@@ -327,7 +364,7 @@
   padding: 4px 6px;
   min-width: 24px;
   min-height: 24px;
-  color: var(--cap-troubleshoot-color, #0050a0);
+  color: var(--cap-troubleshoot-color, var(--cap-troubleshoot));
   text-decoration: underline;
   text-underline-offset: 0.15em;
   text-decoration-thickness: 0.08em;
@@ -347,7 +384,7 @@
 }
 
 .cap-troubleshoot-link:focus-visible {
-  outline: 2px solid var(--cap-focus-ring, #0066cc);
+  outline: 2px solid var(--cap-focus-ring, var(--cap-focus));
   outline-offset: 2px;
 }
 

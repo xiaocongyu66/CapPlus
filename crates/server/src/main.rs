@@ -120,7 +120,7 @@ async fn health_check(State(st): State<AppState>) -> Response {
         Ok(Ok(_)) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
         Ok(Err(e)) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "degraded", "error": e.to_string() })),
+            { eprintln!("[health] storage error: {e}"); Json(json!({ "status": "degraded", "error": "storage unavailable" })) }
         )
             .into_response(),
         Err(_) => (
@@ -129,6 +129,17 @@ async fn health_check(State(st): State<AppState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Drop credentials from a URL before it reaches the logs.
+fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<invalid url>".into();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{host}{}", &rest[authority_end..])
 }
 
 /// Liveness probe: the process is up.
@@ -240,14 +251,16 @@ async fn is_blocked(
     ip: &str,
     headers: &HeaderMap,
     headers_trusted: bool,
-) -> bool {
-    let list = st.cache.blocked(&st.kv, site_key).await;
+) -> Result<bool, ()> {
+    let Some(list) = st.cache.blocked(&st.kv, site_key).await else {
+        return Err(());
+    };
     if list.is_empty() {
         if !list.expired.is_empty() {
             let refs: Vec<&str> = list.expired.iter().map(String::as_str).collect();
             let _ = st.kv.hdel_fields(&format!("blocked:{site_key}"), &refs).await;
         }
-        return false;
+        return Ok(false);
     }
     if !list.expired.is_empty() {
         let refs: Vec<&str> = list.expired.iter().map(String::as_str).collect();
@@ -255,13 +268,13 @@ async fn is_blocked(
     }
     // O(1) for an exact IP; CIDRs are usually a handful of entries.
     if list.ips.contains(ip) {
-        return true;
+        return Ok(true);
     }
     if list.cidrs.iter().any(|net| cidr_match(net, ip)) {
-        return true;
+        return Ok(true);
     }
     if list.countries.is_empty() && list.asns.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     // Header-configured values win, then the local database.
@@ -292,15 +305,15 @@ async fn is_blocked(
 
     if let Some(c) = country {
         if list.countries.contains(&c) {
-            return true;
+            return Ok(true);
         }
     }
     if let Some(a) = asn {
         if list.asns.contains(&a) {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Load the RSW keypair, generating it on first use (the JS server does the
@@ -495,9 +508,11 @@ async fn admin_handler(
     // otherwise a revoked key keeps redeeming (and a new one 404s) for up to
     // the cache TTL.
     if resp.status < 300
-        && matches!(
+        && !matches!(
             method,
-            axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE
+            axum::http::Method::GET
+                | axum::http::Method::HEAD
+                | axum::http::Method::OPTIONS
         )
     {
         st.cache.clear();
@@ -524,7 +539,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[cap] data directory: {}", cfg.data_dir.display());
 
     let kv = cap_kv::Kv::connect_redis(&cfg.redis_url).await?;
-    eprintln!("[cap] storage: {} ({})", kv.backend_name(), cfg.redis_url);
+    eprintln!("[cap] storage: {} ({})", kv.backend_name(), redact_url(&cfg.redis_url));
+    if !cfg.trust_proxy {
+        eprintln!(
+            "[cap] forwarding headers are ignored; behind a reverse proxy set CAP_TRUST_PROXY=true and CAP_PROXY_SECRET so per-IP limits and blocking work"
+        );
+    }
 
     let store = Store::new(kv.clone());
     let admin_cfg = cap_admin::AdminConfig {
@@ -647,12 +667,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/server/releases/:id/activate", post(release_activate))
         .route("/server/releases/:id/archive", get(release_archive))
         .route("/server/releases/:id", axum::routing::delete(release_delete))
-        .route("/auth/login", axum::routing::any(admin_handler))
-        .route("/server", axum::routing::any(admin_handler))
-        .route("/server/*rest", axum::routing::any(admin_handler))
+        // Admin/JSON endpoints are small; capping them keeps an unauthenticated
+        // caller from buffering the 64 MB upload allowance before auth runs.
+        .route(
+            "/auth/login",
+            axum::routing::any(admin_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/server",
+            axum::routing::any(admin_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/server/*rest",
+            axum::routing::any(admin_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
         // Public share links (no auth) live outside /server.
-        .route("/shares", axum::routing::any(admin_handler))
-        .route("/shares/:id", axum::routing::any(admin_handler))
+        .route(
+            "/shares",
+            axum::routing::any(admin_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/shares/:id",
+            axum::routing::any(admin_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route(
             "/turnstile/v0/siteverify",
             post(siteverify_alias).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),

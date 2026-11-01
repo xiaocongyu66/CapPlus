@@ -249,7 +249,10 @@ pub(crate) async fn apikeys_create(store: &AdminStore, body: &Value) -> AdminRes
         ("tokenHash", token_hash),
         ("created", created.to_string()),
     ];
-    if !site_keys.is_empty() {
+    // Persist the field whenever the caller supplied it (possibly empty):
+    // "absent" means an all-sites key, while an explicit empty list must stay
+    // a key with no site access.
+    if obj.get("siteKeys").is_some() {
         pairs.push((
             "siteKeys",
             Value::Array(site_keys.iter().cloned().map(Value::String).collect()).to_string(),

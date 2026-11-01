@@ -218,16 +218,22 @@ pub fn frame_policy(cors_origins: &[String], parent: &str) -> FramePolicy {
 /// `postMessage` target (empty → `"*"`). The `frame-ancestors` CSP header is the
 /// caller's job — see [`frame_policy`]; nothing here depends on it.
 pub fn embed_page(site_key: &str, parent_origin: &str, widget_url: &str) -> String {
-    embed_page_with_context(site_key, parent_origin, widget_url, "")
+    embed_page_with_context(site_key, parent_origin, widget_url, "", "dark")
 }
 
 /// Build a frame whose challenge fetches carry the server-signed embed context.
+///
+/// `theme` is the page-declared theme ("light" or "dark"); anything else is
+/// treated as the default dark palette. It only selects colours — it carries no
+/// trust.
 pub fn embed_page_with_context(
     site_key: &str,
     parent_origin: &str,
     widget_url: &str,
     context: &str,
+    theme: &str,
 ) -> String {
+    let theme = if theme == "light" { "light" } else { "dark" };
     let context = serde_json::to_string(context)
         .expect("context string")
         .replace('<', "\\u003c")
@@ -240,8 +246,6 @@ pub fn embed_page_with_context(
     let target = if parent_origin.is_empty() {
         "\"*\"".to_string()
     } else {
-        // JSON-encode for the JS string, then escape the characters that could
-        // close the surrounding <script> or be misread as HTML.
         serde_json::to_string(parent_origin)
             .unwrap_or_else(|_| "\"*\"".to_string())
             .replace('<', "\\u003c")
@@ -252,14 +256,26 @@ pub fn embed_page_with_context(
 
     format!(
         r#"<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="{theme}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>Cap</title>
 <style>
-  html,body{{margin:0;padding:0;background:transparent;color-scheme:light dark}}
+  html,body{{margin:0;padding:0;background:transparent}}
+  /* The widget reads these through the shadow boundary, so the frame follows
+     the hosting page's declared theme without rebuilding the widget bundle. */
+  html{{color-scheme:dark;
+    --cap-background:#17181c;--cap-color:#f2f3f5;--cap-border-color:#ffffff26;
+    --cap-checkbox-background:#ffffff12;--cap-checkbox-border:1px solid #ffffff40;
+    --cap-spinner-background-color:#33363d;--cap-spinner-color:#f2f3f5;
+    --cap-focus-ring:#5aa9ff;--cap-troubleshoot-color:#9cc7ff}}
+  html[data-theme="light"]{{color-scheme:light;
+    --cap-background:#fdfdfd;--cap-color:#212121;--cap-border-color:#dddddd8f;
+    --cap-checkbox-background:#fafafa91;--cap-checkbox-border:1px solid #aaaaaad1;
+    --cap-spinner-background-color:#eee;--cap-spinner-color:#000;
+    --cap-focus-ring:#0066cc;--cap-troubleshoot-color:#0050a0}}
   #w{{display:flex;justify-content:center;align-items:center;padding:4px}}
 </style>
 </head>
@@ -270,6 +286,7 @@ pub fn embed_page_with_context(
   var SITE = "{site}";
   var PARENT = {target};
   var CONTEXT = {context};
+  var THEME = "{theme}";
   var fetch = window.fetch;
   window.fetch = function(input, init) {{
     var url = new URL(input instanceof Request ? input.url : input, location.href);
@@ -284,6 +301,20 @@ pub fn embed_page_with_context(
   }};
   var widget = document.createElement("cap-widget");
   widget.setAttribute("data-cap-api-endpoint", "/{site}/");
+  widget.setAttribute("data-cap-theme", THEME);
+  function applyTheme(t) {{
+    THEME = t === "light" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", THEME);
+    widget.setAttribute("data-cap-theme", THEME);
+  }}
+  window.addEventListener("message", function (e) {{
+    // The hosting page tells us its theme; it is not a trust signal.
+    if (e.source !== parent) return;
+    if (PARENT && PARENT !== "*" && e.origin !== PARENT) return;
+    var d = e.data;
+    if (!d || d.type !== "cap:theme") return;
+    applyTheme(d.theme);
+  }});
   widget.addEventListener("solve", function (e) {{
     var token = e && e.detail && e.detail.token;
     if (!token) return;
@@ -307,22 +338,59 @@ pub fn embed_page_with_context(
     )
 }
 
-// ---------------------------------------------------------------------------
-// Parent-side loader (served as /embed.js from the Cap origin)
-// ---------------------------------------------------------------------------
-
 const LOADER: &str = r#"(function(){
   var HERE = new URL(document.currentScript.src);
   var CAP_ORIGIN = HERE.origin;
+  var SCRIPT_THEME = (document.currentScript.getAttribute("data-cap-theme") || "").toLowerCase();
+
+  // The page owns its theme: read only signals it declares itself (attribute,
+  // CSS color-scheme, theme attributes/classes). Nothing here guesses from the
+  // background colour or the OS preference, which are unrelated to the page's
+  // chosen theme.
+  function detectTheme(el){
+    var explicit = (el.getAttribute("data-cap-theme") || SCRIPT_THEME || "").toLowerCase();
+    if (explicit === "dark" || explicit === "light") return explicit;
+
+    var root = document.documentElement, body = document.body;
+    var attrs = ["data-cap-theme","data-theme","data-bs-theme","data-color-mode","data-mode","data-color-scheme"];
+    var nodes = [root, body];
+    for (var n = 0; n < nodes.length; n++) {
+      if (!nodes[n]) continue;
+      for (var i = 0; i < attrs.length; i++) {
+        var v = String(nodes[n].getAttribute(attrs[i]) || "").toLowerCase();
+        if (v === "dark" || v === "light") return v;
+      }
+    }
+
+    // Page-declared `color-scheme` (CSS), not the OS preference.
+    try {
+      var cs = String(window.getComputedStyle(root).colorScheme || "").toLowerCase();
+      if (!cs && body) cs = String(window.getComputedStyle(body).colorScheme || "").toLowerCase();
+      var hasDark = cs.indexOf("dark") >= 0, hasLight = cs.indexOf("light") >= 0;
+      if (hasDark && !hasLight) return "dark";
+      if (hasLight && !hasDark) return "light";
+    } catch (e) {}
+
+    // Common explicit class toggles (Tailwind/Bootstrap-style).
+    var cls = ((root.className || "") + " " + ((body && body.className) || "")).toLowerCase().split(/\s+/);
+    if (cls.indexOf("dark") >= 0 || cls.indexOf("theme-dark") >= 0) return "dark";
+    if (cls.indexOf("light") >= 0 || cls.indexOf("theme-light") >= 0) return "light";
+
+    // No declaration: default dark.
+    return "dark";
+  }
+
   function init(el){
     if (el.__capEmbed) return;
     el.__capEmbed = true;
     var site = el.getAttribute("data-site-key") || "";
     var name = el.getAttribute("data-field-name") || "cap-token";
     var parentOrigin = location.origin;
+    var theme = detectTheme(el);
     var iframe = document.createElement("iframe");
     iframe.src = CAP_ORIGIN + "/embed/" + encodeURIComponent(site) +
-      "?parent=" + encodeURIComponent(parentOrigin);
+      "?parent=" + encodeURIComponent(parentOrigin) +
+      "&theme=" + encodeURIComponent(theme);
     iframe.title = "Cap verification";
     iframe.setAttribute("allow", "");
     iframe.style.cssText = el.getAttribute("data-style") ||
@@ -332,6 +400,26 @@ const LOADER: &str = r#"(function(){
     input.type = "hidden";
     input.name = name;
     el.appendChild(input);
+
+    function sendTheme(){
+      var t = detectTheme(el);
+      try {
+        iframe.contentWindow.postMessage({ type: "cap:theme", theme: t }, CAP_ORIGIN);
+      } catch (e) {}
+    }
+    iframe.addEventListener("load", sendTheme);
+
+    // Theme toggles are almost always attribute/class swaps on <html> or
+    // <body>; mirror both. Pages that swap stylesheets can call
+    // CapEmbed.refreshTheme().
+    try {
+      var mo = new MutationObserver(sendTheme);
+      mo.observe(document.documentElement, { attributes: true });
+      if (document.body) mo.observe(document.body, { attributes: true });
+      mo.observe(el, { attributes: true, attributeFilter: ["data-cap-theme"] });
+      el.__capThemeObserver = mo;
+    } catch (e) {}
+
     window.addEventListener("message", function(ev){
       if (ev.origin !== CAP_ORIGIN) return;
       if (ev.source !== iframe.contentWindow) return;
@@ -341,6 +429,7 @@ const LOADER: &str = r#"(function(){
         input.value = d.token;
         el.dispatchEvent(new CustomEvent("cap-token", { detail: { token: d.token } }));
       } else if (d.type === "cap:ready") {
+        sendTheme();
         el.dispatchEvent(new CustomEvent("cap-ready"));
       } else if (d.type === "cap:error") {
         el.dispatchEvent(new CustomEvent("cap-error", { detail: d }));
@@ -353,7 +442,29 @@ const LOADER: &str = r#"(function(){
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", scan);
   else scan();
-  window.CapEmbed = { scan: scan };
+  window.CapEmbed = {
+    scan: scan,
+    // Force a theme for one widget ("dark"/"light") or return to automatic.
+    setTheme: function(el, theme){
+      if (!el) return;
+      if (theme === "dark" || theme === "light") el.setAttribute("data-cap-theme", theme);
+      else el.removeAttribute("data-cap-theme");
+      var iframe = el.querySelector("iframe");
+      if (iframe) {
+        var t = detectTheme(el);
+        try { iframe.contentWindow.postMessage({ type: "cap:theme", theme: t }, CAP_ORIGIN); } catch (e) {}
+      }
+    },
+    refreshTheme: function(){
+      var nodes = document.querySelectorAll("cap-embed[data-site-key]");
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i], iframe = el.querySelector("iframe");
+        if (!iframe) continue;
+        var t = detectTheme(el);
+        try { iframe.contentWindow.postMessage({ type: "cap:theme", theme: t }, CAP_ORIGIN); } catch (e) {}
+      }
+    }
+  };
 })();"#;
 
 /// The parent-side loader script (verbatim port of `loader` in
@@ -374,10 +485,17 @@ mod tests {
 
     #[test]
     fn context_fetch_is_scoped_and_script_safe() {
-        let html = embed_page_with_context("site-a", "https://app.example", "/widget.js", "</script>&\"");
+        let html = embed_page_with_context("site-a", "https://app.example", "/widget.js", "</script>&\"", "light");
         assert!(html.contains("url.origin === location.origin"));
         assert!(html.contains("ep === \"/site-a/challenge\" || ep === \"/site-a/redeem\""));
         assert!(html.contains("headers.set(\"x-cap-embed-context\", CONTEXT)"));
+        assert!(html.contains("<html lang=\"en\" data-theme=\"light\">"));
+        assert!(html.contains("widget.setAttribute(\"data-cap-theme\", THEME)"));
+        assert!(html.contains("d.type !== \"cap:theme\""));
+        assert!(html.contains("applyTheme(d.theme)"));
+        assert!(html.contains("e.source !== parent"));
+        assert!(html.contains("--cap-background:#17181c"));
+        assert!(html.contains("--cap-background:#fdfdfd"));
         assert!(html.contains("return fetch.call(window, input, init)"));
         assert!(html.contains("\\u003c/script\\u003e\\u0026\\\""));
         assert_eq!(origin_hostname("https://APP.example:8443"), Some("app.example".into()));
@@ -628,7 +746,8 @@ mod tests {
             assert!(js.contains(marker), "loader missing {marker}");
         }
         assert!(js.contains(r#"document.querySelectorAll("cap-embed[data-site-key]")"#));
-        assert!(js.contains("window.CapEmbed = { scan: scan };"));
+        assert!(js.contains("window.CapEmbed = {"));
+        assert!(js.contains("refreshTheme: function()"));
     }
 
     #[test]

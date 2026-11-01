@@ -152,6 +152,9 @@ pub(crate) async fn challenge_inner(
     site_key: String,
     headers: HeaderMap,
 ) -> Response {
+    if !cap_embed::validate_site_key(&site_key) {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "Invalid site key or secret"}))).into_response();
+    }
     let key = match st.cache.key(&st.store, &site_key).await {
         Some(k) => Arc::unwrap_or_clone(k),
         None => {
@@ -169,9 +172,13 @@ pub(crate) async fn challenge_inner(
             return (StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response();
         }
     };
+    // Keys without an origin allowlist cannot be framed at all, so requiring
+    // the embed session there would make the key unusable; enforcement is
+    // meaningful only once framing is configured.
+    let require_sess = settings().require_verify_session && !cors_origins(&cfg).is_empty();
     // Redeem will require the same signed embed session, so issuing a
     // challenge outside the embed flow only wastes the solve.
-    if settings().require_verify_session && embed.is_none() {
+    if require_sess && embed.is_none() {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -182,14 +189,22 @@ pub(crate) async fn challenge_inner(
             .into_response();
     }
 
-    if let Some(resp) = filter_request(&st, &cfg, &headers, &site_key).await {
-        return resp;
-    }
     let ip = client_ip(&headers, &addr.ip().to_string());
     // Geo headers are client-controlled unless a proxy is declared; a client
     // must not be able to claim a blocked-country header (or avoid one).
     let headers_trusted = proxy_trusted(&headers, &addr.ip().to_string());
-    if is_blocked(&st, &site_key, &ip, &headers, headers_trusted).await {
+    let blocked = match is_blocked(&st, &site_key, &ip, &headers, headers_trusted).await {
+        Ok(blocked) => blocked,
+        Err(()) => {
+            eprintln!("[challenge] blocklist unavailable");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "store_unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    if blocked {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error": "blocked", "reason": "This IP, network or region is blocked for this site key"})),
@@ -219,6 +234,12 @@ pub(crate) async fn challenge_inner(
             Json(json!({"error": "Rate limit exceeded"})),
         )
             .into_response();
+    }
+
+    // Filtering (UA allow/deny rules) happens after the limiter: otherwise a
+    // request that gets filtered would still write a Redis counter per hit.
+    if let Some(resp) = filter_request(&st, &cfg, &headers, &site_key).await {
+        return resp;
     }
 
     // Platform / OS tallies for the Location & Networks charts (one pipeline).
@@ -272,7 +293,10 @@ pub(crate) async fn challenge_inner(
         let mut payload = json!({
             "typ": "chal", "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev2,
         });
-        seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
+        if let Err(reason) = seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret) {
+            eprintln!("[challenge] integrity seal failed: {reason}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
+        }
         let token = jwt_sign(&payload, &key.jwt_secret);
         if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
             eprintln!("[challenge] challenge environment write failed: {e}");
@@ -342,7 +366,10 @@ pub(crate) async fn challenge_inner(
         let mut payload = json!({
             "typ": "chal", "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev,
         });
-        seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
+        if let Err(reason) = seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret) {
+        eprintln!("[challenge] integrity seal failed: {reason}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
+    }
         let token = jwt_sign(&payload, &key.jwt_secret);
         if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
             eprintln!("[challenge] challenge environment write failed: {e}");
@@ -389,7 +416,10 @@ pub(crate) async fn challenge_inner(
     if let Some((ei, _)) = &instrument {
         payload["ei"] = json!(ei);
     }
-    seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
+    if let Err(reason) = seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret) {
+        eprintln!("[challenge] integrity seal failed: {reason}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
+    }
     let token = jwt_sign(&payload, &key.jwt_secret);
     if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
         eprintln!("[challenge] challenge environment write failed: {e}");

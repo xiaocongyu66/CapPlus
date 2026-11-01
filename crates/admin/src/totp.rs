@@ -83,7 +83,7 @@ fn urlencode(s: &str) -> String {
 fn recovery_codes() -> Vec<String> {
     (0..RECOVERY_COUNT)
         .map(|_| {
-            let raw = util::random_hex(4);
+            let raw = util::random_hex(16);
             format!("{}-{}", &raw[..4], &raw[4..])
         })
         .collect()
@@ -183,7 +183,11 @@ pub(crate) async fn check_second_factor(
     store: &AdminStore,
     body: &Value,
 ) -> Result<bool, crate::AdminResponse> {
-    let h = store.hgetall(TWOFA_KEY).await.unwrap_or_default();
+    // A storage error must not silently skip the second factor.
+    let h = match store.hgetall(TWOFA_KEY).await {
+        Ok(h) => h,
+        Err(_) => return Err(crate::internal()),
+    };
     if h.get("totpEnabled").map(|v| v == "true") != Some(true) {
         return Ok(true);
     }

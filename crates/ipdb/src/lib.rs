@@ -302,6 +302,10 @@ impl IpDb {
             }
             file.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
             written += n as u64;
+            if written > MAX_DOWNLOAD {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("{label} exceeds {MAX_DOWNLOAD} bytes"));
+            }
             self.set_progress(Progress {
                 active: true,
                 file: label.to_string(),
@@ -334,12 +338,22 @@ pub fn lookup(db: &IpDb, ip: IpAddr) -> (Option<String>, Option<u64>) {
     (country, asn)
 }
 
+/// Upper bound for a downloaded database; the real files are tens of MB.
+const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
+/// Upper bound for the decompressed database, independent of the gzip ratio.
+const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
+
 /// Decompress `src` into `dest`, removing the source on success.
 fn gunzip_file(src: &Path, dest: &Path) -> Result<(), String> {
     let input = std::fs::File::open(src).map_err(|e| e.to_string())?;
-    let mut decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(input));
+    let decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(input));
     let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
-    std::io::copy(&mut decoder, &mut out).map_err(|e| e.to_string())?;
+    let copied = std::io::copy(&mut decoder.take(MAX_UNPACKED + 1), &mut out)
+        .map_err(|e| e.to_string())?;
+    if copied > MAX_UNPACKED {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!("decompressed database exceeds {MAX_UNPACKED} bytes"));
+    }
     let _ = std::fs::remove_file(src);
     Ok(())
 }

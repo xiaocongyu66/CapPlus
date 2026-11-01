@@ -521,7 +521,16 @@ pub(crate) async fn create(
         Err(e) => return bad_request(&e),
     };
 
-    let site_key = util::random_hex(5);
+    // `random_hex(5)` is only 40 bits; regenerate rather than overwrite an
+    // existing key on a (rare) collision.
+    let site_key = loop {
+        let candidate = util::random_hex(5);
+        match store.exists(&format!("key:{candidate}")).await {
+            Ok(false) => break candidate,
+            Ok(true) => continue,
+            Err(_) => return internal(),
+        }
+    };
     let secret_key = format!("sk-{}", util::b64_strip(&util::random_bytes(32)));
     let jwt_secret = util::b64url_nopad(&util::random_bytes(32));
     let secret_hash = format!("sha256:{}", util::sha256_hex(&secret_key));

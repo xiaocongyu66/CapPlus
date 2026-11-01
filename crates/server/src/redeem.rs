@@ -29,6 +29,9 @@ pub(crate) async fn redeem(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !cap_embed::validate_site_key(&site_key) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid_token"}))).into_response();
+    }
     if !same_origin(&headers) {
         return (
             StatusCode::FORBIDDEN,
@@ -147,7 +150,9 @@ pub(crate) async fn redeem(
             )
                 .into_response();
         }
-        (bound, None) | (None, bound) if settings().require_verify_session => {
+        (bound, None) | (None, bound)
+            if settings().require_verify_session && !cors_origins(&key.config).is_empty() =>
+        {
             let _ = bound;
             st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
             return (
@@ -208,6 +213,17 @@ pub(crate) async fn redeem(
             if let Err(reason) = v2::verify_instr(&meta, instr) {
                 return (StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response();
             }
+            // The challenge asked for instrumentation; a result without a
+            // probe would skip detection entirely, so refuse it.
+            let Some(p) = instr.get("p").filter(|p| p.is_object()) else {
+                st.metrics
+                    .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "instr_probe_missing", "instr_error": true})),
+                )
+                    .into_response();
+            };
 
             // Honeypot: a filled hidden field is a decisive bot signal.
             if payload
@@ -218,7 +234,7 @@ pub(crate) async fn redeem(
             {
                 sigs.push(cap_detect::Signal::gating("honeypot_triggered"));
             }
-            if let Some(p) = instr.get("p") {
+            {
                 let optional: Vec<String> = meta
                     .get("extendedFields")
                     .and_then(Value::as_array)
@@ -233,11 +249,6 @@ pub(crate) async fn redeem(
                 sigs.extend(outcome.signals.iter().map(|s| s.as_signal()));
                 let trust =
                     cap_detect::compute_trust_signals(&sigs, net.as_ref(), Some(outcome.pass));
-                let action = cap_detect::trust_action(&trust);
-                v2_trust = Some((trust, action));
-                judged = true;
-            } else if !sigs.is_empty() {
-                let trust = cap_detect::compute_trust_signals(&sigs, net.as_ref(), None);
                 let action = cap_detect::trust_action(&trust);
                 v2_trust = Some((trust, action));
                 judged = true;
@@ -311,12 +322,42 @@ pub(crate) async fn redeem(
                 .into_response();
         }
 
+        // Verify first: the probe payload is client-supplied, so running the
+        // detector on unverified input only spends CPU for a request that is
+        // about to be rejected anyway.
+        // hashwx verification runs the interpreter; keep it off the async
+        // workers so a redeem flood cannot starve unrelated endpoints.
+        let expected_c = expected.clone();
+        let sols_c = solutions_raw.clone();
+        let verdict = tokio::task::spawn_blocking(move || {
+            v2::verify_solutions(&expected_c, &sols_c)
+        })
+        .await
+        .unwrap_or_else(|_| Err("verify_panicked".to_string()));
+        if let Err(reason) = verdict {
+            st.metrics
+                .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "Invalid solution", "reason": reason})),
+            )
+                .into_response();
+        }
+
         // Run the probe detector on the captured instrumentation payload and
         // remember the verdict; the deny decision is enforced after the nonce
-        // has been consumed (same ordering as the JS server).
+        // has been consumed. A challenge that asked for instrumentation must
+        // come back with a probe: omitting it would otherwise skip detection
+        // entirely.
         let captured = v2::take_probe(&expected, &solutions_raw);
-        if captured.is_none() {
-            eprintln!("[redeem] no probe captured (solutions={})", solutions_raw.len());
+        if captured.is_none() && instr_meta.is_some() {
+            st.metrics
+                .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "instr_probe_missing", "instr_error": true})),
+            )
+                .into_response();
         }
         if captured.is_none() && net.is_some() {
             let trust = cap_detect::compute_trust_signals(&[], net.as_ref(), None);
@@ -337,29 +378,20 @@ pub(crate) async fn redeem(
             };
             let outcome = cap_detect::detect_automation(&cap.p, &opts);
             let owned = outcome.signals.clone();
-            let sigs: Vec<cap_detect::Signal> =
+            let mut sigs: Vec<cap_detect::Signal> =
                 owned.iter().map(|s| s.as_signal()).collect();
+            // Same decisive signal as v1: a filled honeypot field.
+            if payload
+                .get("integrity")
+                .and_then(|i| i.get("filled"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                sigs.push(cap_detect::Signal::gating("honeypot_triggered"));
+            }
             let trust = cap_detect::compute_trust_signals(&sigs, net.as_ref(), Some(outcome.pass));
             let action = cap_detect::trust_action(&trust);
             v2_trust = Some((trust, action));
-        }
-        // hashwx verification runs the interpreter; keep it off the async
-        // workers so a redeem flood cannot starve unrelated endpoints.
-        let expected_c = expected.clone();
-        let sols_c = solutions_raw.clone();
-        let verdict = tokio::task::spawn_blocking(move || {
-            v2::verify_solutions(&expected_c, &sols_c)
-        })
-        .await
-        .unwrap_or_else(|_| Err("verify_panicked".to_string()));
-        if let Err(reason) = verdict {
-            st.metrics
-                .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Invalid solution", "reason": reason})),
-            )
-                .into_response();
         }
     } else {
         let mut solutions = Vec::with_capacity(solutions_raw.len());
@@ -447,7 +479,7 @@ pub(crate) async fn redeem(
         )
             .into_response();
     }
-    let _ = st.kv.del(&format!("chalenv:{token}")).await;
+    let _ = st.kv.del(&crate::integrity::chalenv_key(token)).await;
     eprintln!("[redeem] site={site_key} issued token (verified)");
     st.metrics
         .incr(

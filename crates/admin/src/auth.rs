@@ -21,7 +21,13 @@ const LOGIN_WINDOW_MS: i64 = 20_000;
 fn request_is_https(headers: &[(String, String)]) -> bool {
     for name in ["x-forwarded-proto", "x-forwarded-scheme", "x-url-scheme"] {
         if let Some(v) = header(headers, name) {
-            if v.split(',').next().map(|p| p.trim().eq_ignore_ascii_case("https")) == Some(true) {
+            // The proxy's own hop is last when it appends, so a client cannot
+            // prepend `http` to drop the Secure attribute.
+            if v.rsplit(',')
+                .map(|p| p.trim())
+                .find(|p| !p.is_empty())
+                .is_some_and(|p| p.eq_ignore_ascii_case("https"))
+            {
                 return true;
             }
         }

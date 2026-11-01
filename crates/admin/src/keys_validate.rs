@@ -61,6 +61,12 @@ pub(crate) fn check_string_array(
             if !a.iter().all(|v| v.is_string()) {
                 return Err(format!("{key} must be an array of strings"));
             }
+            // Each entry is scanned on every request and can end up inside
+            // signed challenge payloads, so bound the individual strings too.
+            const MAX_ITEM: usize = 255;
+            if a.iter().any(|v| v.as_str().map(str::len).unwrap_or(0) > MAX_ITEM) {
+                return Err(format!("{key} entries may be at most {MAX_ITEM} characters"));
+            }
             Ok(())
         }
         Some(_) => Err(format!("{key} must be an array")),

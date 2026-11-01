@@ -77,11 +77,12 @@ pub(crate) fn network_signals(
     if !proxy_trusted(headers, peer) {
         return None;
     }
-    let mut net = if cfg.proxy_secret.is_empty() {
-        None
-    } else {
-        parse_signed_network_fp(headers, &cfg.proxy_secret)
-    };
+    // Without a shared secret there is no way to tell the proxy's headers
+    // from a client's, so no network signals are derived at all.
+    if cfg.proxy_secret.is_empty() {
+        return None;
+    }
+    let mut net = parse_signed_network_fp(headers, &cfg.proxy_secret);
     // Caddy and Traefik do not compute JA3/JA4 themselves, but both set
     // `X-Forwarded-Proto`; that alone proves whether the hop the proxy
     // terminated was TLS. Explicit fields from a signed fingerprint win.
@@ -108,11 +109,21 @@ fn parse_signed_network_fp(
     headers: &HeaderMap,
     secret: &str,
 ) -> Option<cap_detect::NetworkSignals> {
-    let raw = headers.get(NET_FP_HEADER)?.to_str().ok()?;
+    // A proxy that appends instead of overwriting would let a client prepend
+    // an unsigned header and shadow the real one; with duplicates, trust none.
+    let mut values = headers.get_all(NET_FP_HEADER).iter();
+    let raw = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
     if raw.is_empty() || raw.len() > NET_FP_MAX_LEN || secret.is_empty() {
         return None;
     }
-    let sig = headers.get(NET_FP_SIG_HEADER)?.to_str().ok()?.trim();
+    let mut sigs = headers.get_all(NET_FP_SIG_HEADER).iter();
+    let sig = sigs.next()?.to_str().ok()?.trim();
+    if sigs.next().is_some() {
+        return None;
+    }
     if sig.len() != 64 || !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -175,12 +186,10 @@ pub(crate) fn client_ip(headers: &HeaderMap, peer: &str) -> String {
             .and_then(forwarded_client)
             .unwrap_or_else(|| peer.to_string());
     }
-    // Single-value headers that a proxy sets (overwrites) rather than appends.
-    for h in ["cf-connecting-ip", "x-real-ip"] {
-        if let Some(ip) = get(h).and_then(forwarded_client) {
-            return ip;
-        }
-    }
+    // X-Forwarded-For is the only default source: Caddy and Traefik set it,
+    // while they neither set nor strip `CF-Connecting-IP` / `X-Real-IP`, so
+    // trusting those implicitly lets any client claim an arbitrary address.
+    // Operators behind Cloudflare can opt in via `RATELIMIT_IP_HEADER`.
     get("x-forwarded-for")
         .and_then(forwarded_client)
         .unwrap_or_else(|| peer.to_string())

@@ -107,6 +107,7 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<ZipEntry>, ZipError> {
 
     let mut out = Vec::new();
     let mut total = 0usize;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut pos = cd_offset;
 
     for _ in 0..entries {
@@ -143,9 +144,8 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<ZipEntry>, ZipError> {
         if uncomp_size > MAX_FILE {
             return err(format!("{safe} is {uncomp_size} bytes, limit is {MAX_FILE}"));
         }
-        total = total.saturating_add(uncomp_size);
-        if total > MAX_TOTAL {
-            return err(format!("archive expands past {MAX_TOTAL} bytes"));
+        if comp_size > MAX_FILE {
+            return err(format!("{safe} stores {comp_size} compressed bytes, limit is {MAX_FILE}"));
         }
 
         if u32_at(bytes, local_offset) != Some(SIG_LOCAL) {
@@ -158,12 +158,29 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<ZipEntry>, ZipError> {
             u16_at(bytes, local_offset + 28).ok_or(ZipError("truncated local header".into()))?
                 as usize;
         let data_start = local_offset + 30 + l_name_len + l_extra_len;
+        let data_end = data_start.saturating_add(comp_size);
+        // Entries may not share bytes: N central-directory records pointing at
+        // one local range would otherwise multiply a small upload N times.
+        if ranges
+            .iter()
+            .any(|&(start, end)| data_start < end && start < data_end)
+        {
+            return err(format!("{safe} overlaps another entry"));
+        }
+        ranges.push((data_start, data_end));
         let data = bytes
-            .get(data_start..data_start.saturating_add(comp_size))
+            .get(data_start..data_end)
             .ok_or_else(|| ZipError(format!("truncated data for {safe}")))?;
 
         let data = match method {
-            0 => data.to_vec(),
+            0 => {
+                // Stored entries must be self-consistent: the declared sizes
+                // are otherwise attacker-chosen bookkeeping.
+                if comp_size != uncomp_size {
+                    return err(format!("{safe} stored sizes disagree"));
+                }
+                data.to_vec()
+            }
             8 => {
                 let mut out = Vec::with_capacity(uncomp_size.min(MAX_FILE));
                 let decoder = flate2::read::DeflateDecoder::new(data);
@@ -174,6 +191,9 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<ZipEntry>, ZipError> {
                 if out.len() > MAX_FILE {
                     return err(format!("{safe} inflates past {MAX_FILE} bytes"));
                 }
+                if out.len() != uncomp_size {
+                    return err(format!("{safe} inflates to the wrong size"));
+                }
                 out
             }
             other => {
@@ -183,6 +203,11 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<ZipEntry>, ZipError> {
             }
         };
 
+        // Budget the bytes actually produced, not the declared sizes.
+        total = total.saturating_add(data.len());
+        if total > MAX_TOTAL {
+            return err(format!("archive expands past {MAX_TOTAL} bytes"));
+        }
         out.push(ZipEntry { name: safe, data });
     }
 

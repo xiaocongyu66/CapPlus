@@ -197,13 +197,24 @@ fn env_bool(name: &str) -> Option<bool> {
 }
 
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    std::fs::write(path, contents)?;
+    // Create with the final mode so there is no window where the generated
+    // admin key is world-readable.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
 }
 
 fn random_key() -> String {
@@ -275,9 +286,11 @@ pub fn init() -> Result<Settings, String> {
         write_private(&cfg_path, &format!("{header}{body}"))
             .map_err(|e| format!("cannot write {}: {e}", cfg_path.display()))?;
     }
-    if let Some(key) = &generated_key {
-        eprintln!("[cap] generated an admin key and saved it to {}", cfg_path.display());
-        eprintln!("[cap] admin key: {key}");
+    if generated_key.is_some() {
+        eprintln!(
+            "[cap] generated an admin key and saved it (0600) to {}; read it from the file",
+            cfg_path.display()
+        );
     }
 
     let dashboard = env_str("ADMIN_LEGACY_DIR").or_else(|| {

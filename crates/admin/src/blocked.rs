@@ -16,7 +16,7 @@ fn block_field(kind: &str, value: &str) -> Option<String> {
         return None;
     }
     Some(match kind {
-        "ip" => value.to_string(),
+        "ip" => value.parse::<std::net::IpAddr>().ok()?.to_string(),
         "cidr" => {
             let (address, prefix) = value.split_once('/')?;
             let address = address.parse::<std::net::IpAddr>().ok()?;
@@ -27,8 +27,21 @@ fn block_field(kind: &str, value: &str) -> Option<String> {
             }
             format!("cidr:{address}/{prefix}")
         },
-        "asn" => format!("asn:{value}"),
-        "country" => format!("country:{value}"),
+        // These end up rendered in the admin dashboard, so only the exact
+        // shapes are accepted: a dashboard XSS must not be reachable from a
+        // site-scoped bot key.
+        "asn" => {
+            if value.len() > 10 || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            format!("asn:{value}")
+        }
+        "country" => {
+            if value.len() != 2 || !value.bytes().all(|b| b.is_ascii_alphabetic()) {
+                return None;
+            }
+            format!("country:{}", value.to_ascii_uppercase())
+        }
         _ => return None,
     })
 }

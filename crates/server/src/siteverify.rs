@@ -267,6 +267,13 @@ pub(crate) async fn siteverify(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !cap_embed::validate_site_key(&site_key) {
+        return (
+            StatusCode::OK,
+            axum::Json(json!({"success": false, "error-codes": ["invalid-input-response"]})),
+        )
+            .into_response();
+    }
     if let Some(r) = verify_limited(&st, &headers, &addr, &site_key).await {
         return r;
     }

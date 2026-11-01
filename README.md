@@ -81,6 +81,22 @@ Embed sessions are enforced by default: `challenge` and `redeem` must come from
 the same signed embed page (`CAP_REQUIRE_VSESS=0` disables this for direct API
 clients; a token then still works only for the site key that minted it).
 
+Enforcement only applies to keys with `corsOrigins` configured: a key without
+an origin allowlist cannot be framed at all, so it keeps working without the
+embed session (and without the extra binding).
+
+This binding prevents a token obtained in one framing from being redeemed in
+another. It is not proof that a browser ran the page: the embed page is public,
+so a script can fetch its own context. Likewise the `hostname` returned by
+`siteverify` is the framing origin claimed by that challenge, not a
+server-verified statement about where the solve happened; do not use it as an
+origin-security check.
+
+Only `X-Forwarded-For` is trusted by default. Proxies such as Caddy and Traefik
+neither set nor strip `CF-Connecting-IP` / `X-Real-IP`, so those headers are
+ignored unless you point `RATELIMIT_IP_HEADER` at the one your proxy actually
+overwrites.
+
 ## Status (2026-10-30)
 - Protocols: `sha256-pow` (v1), `rsw` (v2, AES-256-GCM sealed expectations),
   `instrumentation` (v2, generated probe + state check + detection/trust).
