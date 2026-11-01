@@ -125,13 +125,14 @@ pub(crate) async fn embed_page(
 
     // The context carries a random session id: challenge and redeem both
     // present it, so a token solved in one embed session cannot be redeemed
-    // from another. Long-lived because the page may stay open; it only ever
-    // names a session, never grants anything by itself.
+    // from another. Two hours covers a long-open page; after it expires the
+    // iframe gets a fresh one on the next load. It only ever names a session,
+    // never grants anything by itself.
     let context = jwt_sign(
         &json!({
             "typ": "embed", "sk": site_key, "parent": parent_origin,
             "sid": random_hex(32),
-            "exp": now_ms() + 24 * 60 * 60 * 1000,
+            "exp": now_ms() + 2 * 60 * 60 * 1000,
         }),
         &key.jwt_secret,
     );
