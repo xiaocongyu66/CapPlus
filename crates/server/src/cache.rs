@@ -23,10 +23,54 @@ const MAX_KEYS: usize = 10_000;
 
 type Slot<T> = (Instant, Option<T>);
 
+/// A site key's blocklist, split by kind so the request path does O(1)
+/// lookups for IPs, countries and ASNs and only scans the (usually tiny) CIDR
+/// list. Parsing happens once per TTL rather than once per request.
+#[derive(Debug, Default)]
+pub struct BlockList {
+    pub ips: std::collections::HashSet<String>,
+    pub cidrs: Vec<String>,
+    pub countries: std::collections::HashSet<String>,
+    pub asns: std::collections::HashSet<String>,
+    /// Fields whose TTL has passed; the caller should drop them from Redis.
+    pub expired: Vec<String>,
+}
+
+impl BlockList {
+    pub fn is_empty(&self) -> bool {
+        self.ips.is_empty()
+            && self.cidrs.is_empty()
+            && self.countries.is_empty()
+            && self.asns.is_empty()
+    }
+
+    fn from_fields(fields: &HashMap<String, String>, now: i64) -> Self {
+        let mut out = BlockList::default();
+        for (field, value) in fields {
+            let permanent = value == "0";
+            let expires = value.parse::<i64>().unwrap_or(0);
+            if !permanent && expires <= now {
+                out.expired.push(field.clone());
+                continue;
+            }
+            if let Some(net) = field.strip_prefix("cidr:") {
+                out.cidrs.push(net.to_string());
+            } else if let Some(country) = field.strip_prefix("country:") {
+                out.countries.insert(country.to_string());
+            } else if let Some(asn) = field.strip_prefix("asn:") {
+                out.asns.insert(asn.to_string());
+            } else {
+                out.ips.insert(field.clone());
+            }
+        }
+        out
+    }
+}
+
 pub struct ConfigCache {
     keys: RwLock<HashMap<String, Slot<Arc<KeyInfo>>>>,
     settings: RwLock<HashMap<String, Slot<serde_json::Value>>>,
-    blocked: RwLock<HashMap<String, Slot<Arc<HashMap<String, String>>>>>,
+    blocked: RwLock<HashMap<String, Slot<Arc<BlockList>>>>,
 }
 
 impl Default for ConfigCache {
@@ -105,14 +149,10 @@ impl ConfigCache {
         value.flatten().unwrap_or(serde_json::Value::Null)
     }
 
-    /// `blocked:<site_key>`, cached for [`TTL`]. A key with thousands of
-    /// blocked entries would otherwise cost a full HGETALL plus a parse per
-    /// challenge.
-    pub async fn blocked(
-        &self,
-        kv: &Kv,
-        site_key: &str,
-    ) -> Arc<HashMap<String, String>> {
+    /// `blocked:<site_key>`, cached for [`TTL`] and pre-split by kind. A key
+    /// with thousands of blocked entries would otherwise cost a full HGETALL
+    /// plus an O(n) scan per challenge.
+    pub async fn blocked(&self, kv: &Kv, site_key: &str) -> Arc<BlockList> {
         if let Some((at, hit)) = self
             .blocked
             .read()
@@ -126,9 +166,9 @@ impl ConfigCache {
             }
         }
         let loaded = match kv.hgetall(&format!("blocked:{site_key}")).await {
-            Ok(fields) => Arc::new(fields),
+            Ok(fields) => Arc::new(BlockList::from_fields(&fields, crate::now_ms())),
             // Do not cache an error; fail closed is the caller's decision.
-            Err(_) => return Arc::new(HashMap::new()),
+            Err(_) => return Arc::new(BlockList::default()),
         };
         self.blocked
             .write()

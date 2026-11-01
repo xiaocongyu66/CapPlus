@@ -1996,47 +1996,26 @@ async fn is_blocked(
     headers: &HeaderMap,
     headers_trusted: bool,
 ) -> bool {
-    let entries = st.cache.blocked(&st.kv, site_key).await;
-    if entries.is_empty() {
+    let list = st.cache.blocked(&st.kv, site_key).await;
+    if list.is_empty() {
+        if !list.expired.is_empty() {
+            let refs: Vec<&str> = list.expired.iter().map(String::as_str).collect();
+            let _ = st.kv.hdel_fields(&format!("blocked:{site_key}"), &refs).await;
+        }
         return false;
     }
-    let now = now_ms();
-    let mut expired = Vec::new();
-    let mut hit = false;
-    let mut wants_country = false;
-    let mut wants_asn = false;
-
-    for (field, value) in entries.iter() {
-        let permanent = value == "0";
-        let expires = value.parse::<i64>().unwrap_or(0);
-        if !permanent && expires <= now {
-            expired.push(field.clone());
-            continue;
-        }
-        if field == ip {
-            hit = true;
-            break;
-        }
-        if let Some(net) = field.strip_prefix("cidr:") {
-            if cidr_match(net, ip) {
-                hit = true;
-                break;
-            }
-        } else if field.starts_with("country:") {
-            wants_country = true;
-        } else if field.starts_with("asn:") {
-            wants_asn = true;
-        }
-    }
-
-    if !expired.is_empty() {
-        let refs: Vec<&str> = expired.iter().map(String::as_str).collect();
+    if !list.expired.is_empty() {
+        let refs: Vec<&str> = list.expired.iter().map(String::as_str).collect();
         let _ = st.kv.hdel_fields(&format!("blocked:{site_key}"), &refs).await;
     }
-    if hit {
+    // O(1) for an exact IP; CIDRs are usually a handful of entries.
+    if list.ips.contains(ip) {
         return true;
     }
-    if !wants_country && !wants_asn {
+    if list.cidrs.iter().any(|net| cidr_match(net, ip)) {
+        return true;
+    }
+    if list.countries.is_empty() && list.asns.is_empty() {
         return false;
     }
 
@@ -2066,18 +2045,14 @@ async fn is_blocked(
     let country = country.or(db_country);
     let asn = asn.or(db_asn.map(|n| n.to_string()));
 
-    if wants_country {
-        if let Some(c) = country {
-            if entries.contains_key(&format!("country:{c}")) {
-                return true;
-            }
+    if let Some(c) = country {
+        if list.countries.contains(&c) {
+            return true;
         }
     }
-    if wants_asn {
-        if let Some(a) = asn {
-            if entries.contains_key(&format!("asn:{a}")) {
-                return true;
-            }
+    if let Some(a) = asn {
+        if list.asns.contains(&a) {
+            return true;
         }
     }
     false
