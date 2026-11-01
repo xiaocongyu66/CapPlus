@@ -131,7 +131,8 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
     let native_obj = as_obj(field(s, "nativeShape"));
     let native_nl = as_bool(field(s, "nativeShape").and_then(|e| field(e, "nl")));
 
-    if want_shape && !(eval_obj.is_some() && eval_nl.is_some()) {
+    if want_shape && field(s, "evalShape").is_some_and(|v| !v.is_null())
+        && !(eval_obj.is_some() && eval_nl.is_some()) {
         add(
             &mut checks,
             "shape_probe_missing",
@@ -568,7 +569,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
     // --- CDP / DevTools attachment ---------------------------------------
     let want_cdp = opts.wants("cdp");
     let cdp = as_obj(field(s, "cdp"));
-    if want_cdp && cdp.is_none() {
+    if want_cdp && field(s, "cdp").is_some_and(|v| !v.is_null()) && cdp.is_none() {
         add(&mut checks, "cdp_probe_missing", false, "cdp probe missing or malformed", true);
     }
     if let Some(cdp) = cdp {

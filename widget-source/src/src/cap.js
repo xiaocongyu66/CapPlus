@@ -840,8 +840,8 @@
 
 
   // Theme is declared by the page, never guessed from pixels or the OS:
-  // an explicit data-cap-theme wins, then common page-level attributes, the
-  // CSS color-scheme the page sets, and finally common class toggles. With no
+  // an explicit data-cap-theme wins, then page attributes/classes, then a
+  // single CSS color-scheme. With no
   // declaration the widget uses its dark palette.
   function _pageTheme() {
     const root = document.documentElement;
@@ -857,22 +857,34 @@
         if (v === "dark" || v === "light") return v;
       }
     }
-    try {
-      let cs = String(getComputedStyle(root).colorScheme || "").toLowerCase();
-      if (!cs && body) cs = String(getComputedStyle(body).colorScheme || "").toLowerCase();
-      const dark = cs.includes("dark");
-      const light = cs.includes("light");
-      if (dark && !light) return "dark";
-      if (light && !dark) return "light";
-    } catch (e) {}
     const cls = `${root.className || ""} ${(body && body.className) || ""}`.toLowerCase().split(/\s+/);
     if (cls.includes("dark") || cls.includes("theme-dark")) return "dark";
     if (cls.includes("light") || cls.includes("theme-light")) return "light";
+    for (const node of [root, body]) {
+      if (!node) continue;
+      try {
+        const cs = String(getComputedStyle(node).colorScheme || "").trim().toLowerCase();
+        const tokens = cs.split(/\s+/);
+        const schemes = tokens.filter(t => t === "light" || t === "dark");
+        if (schemes.length === 1 && tokens.length <= 2 && tokens.every(t => t === schemes[0] || t === "only")) return schemes[0];
+      } catch (e) {}
+    }
     return "dark";
   }
 
   class CapWidget extends HTMLElement {
     static formAssociated = true;
+    #themeObserver = null;
+    // Call after CSSOM/stylesheet changes that do not mutate html/body attributes.
+    refreshTheme() { if (this.isConnected) this.#syncTheme(); }
+    #syncTheme = () => {
+      const explicit = (this.getAttribute("data-cap-theme") || "").toLowerCase();
+      const theme = explicit === "light" || explicit === "dark" ? explicit : _pageTheme();
+      // Derived state must never overwrite the integrator's explicit setting.
+      if (this.getAttribute("data-cap-resolved-theme") !== theme) {
+        this.setAttribute("data-cap-resolved-theme", theme);
+      }
+    };
     #resetTimer = null;
     #workersCount = navigator.hardwareConcurrency || 8;
     token = null;
@@ -1261,6 +1273,7 @@
         "onreset",
         "onerror",
         "data-cap-worker-count",
+        "data-cap-theme",
         "data-cap-i18n-initial-state",
         "required",
       ];
@@ -1311,6 +1324,7 @@
     }
 
     attributeChangedCallback(name, _, value) {
+      if (name === "data-cap-theme" && this.isConnected) this.#syncTheme();
       if (name.startsWith("on")) {
         const eventName = name.slice(2);
         const oldHandler = this.#eventHandlers.get(name);
@@ -1351,10 +1365,15 @@
 
     async connectedCallback() {
       this.#host = this;
-      // The embed page normally sets data-cap-theme; for standalone use, mirror
-      // whatever the page itself declares.
-      if (!this.hasAttribute("data-cap-theme")) {
-        this.setAttribute("data-cap-theme", _pageTheme());
+      this.#syncTheme();
+      this.#themeObserver?.disconnect();
+      this.#themeObserver = new MutationObserver(this.#syncTheme);
+      for (const node of [document.documentElement, document.body]) {
+        if (node) this.#themeObserver.observe(node, {
+          attributes: true,
+          attributeFilter: ["class", "style", "data-cap-theme", "data-theme",
+            "data-bs-theme", "data-color-mode", "data-mode", "data-color-scheme"],
+        });
       }
 
       if (!this.shadowRoot) {
@@ -2390,6 +2409,9 @@
     }
 
     disconnectedCallback() {
+      this.#themeObserver?.disconnect();
+      this.#themeObserver = null;
+      this.removeEventListener("invalid", this.#handleInvalid);
       this.#abort?.abort();
       this.removeEventListener("progress", this.boundHandleProgress);
       this.removeEventListener("solve", this.boundHandleSolve);

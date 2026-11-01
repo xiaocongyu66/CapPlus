@@ -278,7 +278,7 @@ async fn is_blocked(
     }
 
     // Header-configured values win, then the local database.
-    let cfg = st.cache.setting(&st.kv, "settings:headers").await;
+    let cfg = st.cache.setting_checked(&st.kv, "settings:headers").await.map_err(|_| ())?;
     let header_val = |name: &str| {
         headers
             .get(name)

@@ -118,11 +118,11 @@ const obfuscateJS = (code) =>
 // Obfuscate first, then terser-minify, and write ONLY the final artifact so a
 // mid-way failure can never publish an unobfuscated bundle.
 const obfuscated = obfuscateJS(bundle);
-await fs.writeFile("./src/cap.min.js", await minifyJS(obfuscated));
-
-await fs.writeFile(
-  "./src/cap-floating.min.js",
-  await minifyJS(await fs.readFile("./src/src/cap-floating.js", "utf-8")),
-);
+const widget = await minifyJS(obfuscated);
+const floating = await minifyJS(await fs.readFile("./src/src/cap-floating.js", "utf-8"));
+// The only release directory; WASM assets are versioned there separately.
+// Finish all transformations before publishing either JS artifact.
+await fs.writeFile("../widget-dist/widget.js", widget);
+await fs.writeFile("../widget-dist/floating.js", floating);
 
 console.timeEnd("build");

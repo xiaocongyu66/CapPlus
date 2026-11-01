@@ -72,7 +72,9 @@ pub struct StorageSection {
 
 impl Default for StorageSection {
     fn default() -> Self {
-        Self { redis_url: String::new() }
+        Self {
+            redis_url: String::new(),
+        }
     }
 }
 
@@ -100,10 +102,15 @@ impl Default for AssetsSection {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProxySection {
     pub trust_proxy: bool,
     pub proxy_secret: String,
+    /// Reject redeem without an authenticated fingerprint (CAP_REQUIRE_NETWORK_FINGERPRINT).
+    pub require_network_fingerprint: bool,
+    /// Intermediate proxy hops to peel from XFF (CAP_TRUSTED_PROXY_CIDRS).
+    /// Does not grant trust to the immediate peer or bypass the proxy secret.
+    pub trusted_proxy_cidrs: Vec<String>,
     /// Header carrying the real client IP (`RATELIMIT_IP_HEADER`).
     pub ip_header: String,
 }
@@ -127,6 +134,11 @@ pub struct Settings {
     pub embed_widget_url: String,
     pub trust_proxy: bool,
     pub proxy_secret: String,
+    /// Reject redeem without an authenticated fingerprint (CAP_REQUIRE_NETWORK_FINGERPRINT).
+    pub require_network_fingerprint: bool,
+    /// Intermediate proxy hops to peel from XFF (CAP_TRUSTED_PROXY_CIDRS).
+    /// Does not grant trust to the immediate peer or bypass the proxy secret.
+    pub trusted_proxy_cidrs: Vec<String>,
     pub require_verify_session: bool,
 }
 
@@ -196,19 +208,65 @@ fn env_bool(name: &str) -> Option<bool> {
     })
 }
 
+fn strict_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(format!("{name} must be valid Unicode")),
+    }
+}
+
+fn parse_proxy_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err("expected an explicit boolean".into()),
+    }
+}
+
+fn proxy_env_bool(name: &str, fallback: bool) -> Result<bool, String> {
+    strict_env(name)?
+        .map(|v| parse_proxy_bool(&v).map_err(|e| format!("{name}: {e}")))
+        .unwrap_or(Ok(fallback))
+}
+
+fn validate_proxy(proxy: &ProxySection) -> Result<(), String> {
+    if proxy.require_network_fingerprint
+        && (!proxy.trust_proxy || proxy.proxy_secret.trim().is_empty())
+    {
+        return Err(
+            "require_network_fingerprint requires trust_proxy and a nonempty proxy_secret".into(),
+        );
+    }
+    if !proxy.ip_header.is_empty() {
+        axum::http::HeaderName::from_bytes(proxy.ip_header.as_bytes())
+            .map_err(|_| "invalid RATELIMIT_IP_HEADER / proxy.ip_header".to_string())?;
+    }
+    for net in &proxy.trusted_proxy_cidrs {
+        let base = net.split('/').next().unwrap_or("");
+        if !crate::http_util::cidr_match(net, base) {
+            return Err(format!("invalid trusted proxy CIDR: {net:?}"));
+        }
+    }
+    Ok(())
+}
+
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     // Create with the final mode so there is no window where the generated
     // admin key is world-readable.
     #[cfg(unix)]
     {
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)?;
+        // mode 只影响新文件；既有文件必须先收紧权限再覆盖秘密。
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.set_len(0)?;
         f.write_all(contents.as_bytes())
     }
     #[cfg(not(unix))]
@@ -264,7 +322,21 @@ pub fn init() -> Result<Settings, String> {
 
     let cfg_path = dir.join("config.toml");
     let mut file: FileConfig = if cfg_path.is_file() {
-        let raw = std::fs::read_to_string(&cfg_path)
+        // Existing secrets must not stay world-readable merely because no
+        // rewrite is necessary. Tighten through the same handle we read.
+        let mut handle = std::fs::File::open(&cfg_path)
+            .map_err(|e| format!("cannot open {}: {e}", cfg_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            handle
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("cannot secure {}: {e}", cfg_path.display()))?;
+        }
+        use std::io::Read as _;
+        let mut raw = String::new();
+        handle
+            .read_to_string(&mut raw)
             .map_err(|e| format!("cannot read {}: {e}", cfg_path.display()))?;
         toml::from_str(&raw).map_err(|e| format!("invalid {}: {e}", cfg_path.display()))?
     } else {
@@ -293,9 +365,35 @@ pub fn init() -> Result<Settings, String> {
         );
     }
 
-    let dashboard = env_str("ADMIN_LEGACY_DIR").or_else(|| {
-        Some(file.server.dashboard_dir.clone()).filter(|d| !d.is_empty())
-    });
+    let dashboard = env_str("ADMIN_LEGACY_DIR")
+        .or_else(|| Some(file.server.dashboard_dir.clone()).filter(|d| !d.is_empty()));
+
+    let mut proxy = file.proxy;
+    proxy.trust_proxy = proxy_env_bool("CAP_TRUST_PROXY", proxy.trust_proxy)?;
+    proxy.require_network_fingerprint = proxy_env_bool(
+        "CAP_REQUIRE_NETWORK_FINGERPRINT",
+        proxy.require_network_fingerprint,
+    )?;
+    if let Some(secret) = strict_env("CAP_PROXY_SECRET")? {
+        if secret.trim().is_empty() {
+            return Err("CAP_PROXY_SECRET must not be empty; unset it to use config.toml".into());
+        }
+        proxy.proxy_secret = secret;
+    }
+    if let Some(header) = strict_env("RATELIMIT_IP_HEADER")? {
+        if header.is_empty() {
+            return Err(
+                "RATELIMIT_IP_HEADER must not be empty; unset it to use config.toml".into(),
+            );
+        }
+        proxy.ip_header = header;
+    }
+    if let Some(value) = strict_env("CAP_TRUSTED_PROXY_CIDRS")? {
+        // Empty elements (including an empty variable) are errors, not a
+        // silently truncated trust list. Use [] in TOML for the default.
+        proxy.trusted_proxy_cidrs = value.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    validate_proxy(&proxy)?;
 
     Ok(Settings {
         hostname: env_str("SERVER_HOSTNAME").unwrap_or(file.server.hostname),
@@ -303,7 +401,10 @@ pub fn init() -> Result<Settings, String> {
             .and_then(|p| match p.trim().parse() {
                 Ok(port) => Some(port),
                 Err(_) => {
-                    eprintln!("[cap] SERVER_PORT={p:?} is not a number; using {}", file.server.port);
+                    eprintln!(
+                        "[cap] SERVER_PORT={p:?} is not a number; using {}",
+                        file.server.port
+                    );
                     None
                 }
             })
@@ -319,15 +420,81 @@ pub fn init() -> Result<Settings, String> {
         widget_version: env_str("WIDGET_VERSION").unwrap_or(file.assets.widget_version),
         wasm_version: env_str("WASM_VERSION").unwrap_or(file.assets.wasm_version),
         embed_widget_url: env_str("EMBED_WIDGET_URL").unwrap_or(file.assets.embed_widget_url),
-        ip_header: env_str("RATELIMIT_IP_HEADER").unwrap_or(file.proxy.ip_header),
+        ip_header: proxy.ip_header,
         rsw_bits: env_str("RSW_BITS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(2048),
-        trust_proxy: env_bool("CAP_TRUST_PROXY").unwrap_or(file.proxy.trust_proxy),
-        proxy_secret: env_str("CAP_PROXY_SECRET").unwrap_or(file.proxy.proxy_secret),
-        require_verify_session: env_bool("CAP_REQUIRE_VSESS")
-            .or(file.server.verify_session)
-            .unwrap_or(true),
+        trust_proxy: proxy.trust_proxy,
+        proxy_secret: proxy.proxy_secret,
+        require_network_fingerprint: proxy.require_network_fingerprint,
+        trusted_proxy_cidrs: proxy.trusted_proxy_cidrs,
+        require_verify_session: proxy_env_bool(
+            "CAP_REQUIRE_VSESS",
+            file.server.verify_session.unwrap_or(true),
+        )?,
         data_dir: dir,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_configuration_fails_closed() {
+        for value in ["", "tru", "2", "enabled"] {
+            assert!(parse_proxy_bool(value).is_err());
+        }
+        assert_eq!(parse_proxy_bool(" TRUE "), Ok(true));
+        assert_eq!(parse_proxy_bool("off"), Ok(false));
+        let mut proxy = ProxySection::default();
+        assert!(validate_proxy(&proxy).is_ok());
+        proxy.require_network_fingerprint = true;
+        assert!(validate_proxy(&proxy).is_err());
+        proxy.trust_proxy = true;
+        assert!(validate_proxy(&proxy).is_err());
+        proxy.proxy_secret = "secret".into();
+        assert!(validate_proxy(&proxy).is_ok());
+        for net in ["", "bad", "10.0.0.0/33", "::/129", "10.0.0.0/24/1"] {
+            proxy.trusted_proxy_cidrs = vec![net.into()];
+            assert!(validate_proxy(&proxy).is_err(), "{net}");
+        }
+        proxy.trusted_proxy_cidrs = vec!["10.0.0.0/24".into(), "2001:db8::/32".into()];
+        assert!(validate_proxy(&proxy).is_ok());
+        proxy.ip_header = "bad header".into();
+        assert!(validate_proxy(&proxy).is_err());
+        assert!(
+            toml::from_str::<FileConfig>("[proxy]\nrequire_network_fingerprit = true").is_err()
+        );
+        assert!(
+            toml::from_str::<FileConfig>("[proxy]\nrequire_network_fingerprint = 'true'").is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_writes_create_and_tighten_before_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "cap-private-{}-{}",
+            std::process::id(),
+            random_key()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.toml");
+        write_private(&path, "long secret contents").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, "short").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "short");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

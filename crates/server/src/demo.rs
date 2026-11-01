@@ -221,7 +221,11 @@ pub(crate) fn is_browser_ua(ua: &str) -> bool {
 /// Per-key filtering: block non-browser UAs and requests missing the
 /// configured headers. Global settings apply unless the key overrides them.
 pub(crate) async fn filter_request(st: &AppState, cfg: &KeyConfig, headers: &HeaderMap, site_key: &str) -> Option<Response> {
-    let global = st.cache.setting(&st.kv, "settings:filtering").await;
+    let global = match st.cache.setting_checked(&st.kv, "settings:filtering").await {
+        Ok(global) => global,
+        Err(_) => return Some((StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "store_unavailable"}))).into_response()),
+    };
 
     let block_ua = cfg
         .block_non_browser_ua

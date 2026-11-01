@@ -137,34 +137,16 @@ pub(crate) async fn redeem(
         }
     };
     let sent_sid = embed.as_ref().map(|e| e.sid.as_str());
-    match (env.sid.as_deref(), sent_sid) {
-        (Some(bound), Some(sent)) if bound == sent => {}
-        (Some(_), Some(_)) => {
-            st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": "verified_session_required",
-                    "reason": "the challenge was solved in a different embed session",
-                })),
-            )
-                .into_response();
-        }
-        (bound, None) | (None, bound)
-            if settings().require_verify_session && !cors_origins(&key.config).is_empty() =>
-        {
-            let _ = bound;
-            st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": "verified_session_required",
-                    "reason": "solve challenges inside the Cap-hosted iframe (embed.js)",
-                })),
-            )
-                .into_response();
-        }
-        _ => {}
+    if !session_matches(env.sid.as_deref(), sent_sid,
+        settings().require_verify_session && !cors_origins(&key.config).is_empty()) {
+        st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "verified_session_required",
+                "reason": "the challenge requires its original embed session",
+            })),
+        ).into_response();
     }
     let parent = env.parent;
     if let Err(reason) = check_integrity(&claims, &payload, &key.jwt_secret) {
@@ -184,8 +166,23 @@ pub(crate) async fn redeem(
     let mut v2_trust: Option<(cap_detect::Trust, cap_detect::Action)> = None;
     // Protocol-layer findings from the trusted proxy. Present for both
     // protocols: these describe the connection, not the client's claims.
-    let net = network_signals(&headers, &addr.ip().to_string());
+    let net = match network_signals(&headers, &addr.ip().to_string()) {
+        Ok(net) => net,
+        Err(_) => return (StatusCode::FORBIDDEN, Json(json!({"error": "verification_failed"}))).into_response(),
+    };
     if !is_v2 {
+        // As with v2, verify the proof before spending CPU on detection.
+        if let Err(reason) = verify_v1_pow(token, &claims, &solutions_raw) {
+            let status = if reason == "invalid_solutions" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            if reason == "Invalid solution" {
+                st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
+            }
+            return (status, Json(json!({"error": reason}))).into_response();
+        }
         // v1 carries its instrumentation meta sealed in `ei`. Without it an
         // automated client on the old protocol would never be fingerprinted.
         let mut sigs: Vec<cap_detect::Signal> = Vec::new();
@@ -215,7 +212,7 @@ pub(crate) async fn redeem(
             }
             // The challenge asked for instrumentation; a result without a
             // probe would skip detection entirely, so refuse it.
-            let Some(p) = instr.get("p").filter(|p| p.is_object()) else {
+            let Some(captured) = v2::capture_instr(&meta, instr) else {
                 st.metrics
                     .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
                 return (
@@ -235,17 +232,12 @@ pub(crate) async fn redeem(
                 sigs.push(cap_detect::Signal::gating("honeypot_triggered"));
             }
             {
-                let optional: Vec<String> = meta
-                    .get("extendedFields")
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                    .unwrap_or_default();
                 let opts = cap_detect::DetectOpts {
                     font_stack_count: Some(cap_detect::PROBE_FONT_STACK_COUNT),
-                    optional_fields: &optional,
+                    optional_fields: &captured.optional_fields,
                     accept_language: None,
                 };
-                let outcome = cap_detect::detect_automation(p, &opts);
+                let outcome = cap_detect::detect_automation(&captured.p, &opts);
                 sigs.extend(outcome.signals.iter().map(|s| s.as_signal()));
                 let trust =
                     cap_detect::compute_trust_signals(&sigs, net.as_ref(), Some(outcome.pass));
@@ -280,8 +272,8 @@ pub(crate) async fn redeem(
             .get("instr_timeout")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let instr_meta = expected
-            .as_array()
+        let instr_meta = v2::expected_entries(&expected)
+            .ok()
             .and_then(|list| {
                 list.iter()
                     .find(|c| c.get("protocol").and_then(Value::as_str) == Some("instrumentation"))
@@ -393,37 +385,6 @@ pub(crate) async fn redeem(
             let action = cap_detect::trust_action(&trust);
             v2_trust = Some((trust, action));
         }
-    } else {
-        let mut solutions = Vec::with_capacity(solutions_raw.len());
-        for v in &solutions_raw {
-            match v.as_u64() {
-                Some(n) => solutions.push(n),
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": "invalid_solutions"})),
-                    )
-                        .into_response()
-                }
-            }
-        }
-        let params = PowParams {
-            c: claims.get("c").and_then(Value::as_u64).unwrap_or(0) as u32,
-            s: claims.get("s").and_then(Value::as_u64).unwrap_or(0) as u32,
-            d: claims.get("d").and_then(Value::as_u64).unwrap_or(0) as u32,
-        };
-        if !params.valid() {
-            return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid_token"}))).into_response();
-        }
-        if !verify_pow(token, params, &solutions) {
-            st.metrics
-                .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Invalid solution"})),
-            )
-                .into_response();
-        }
     }
 
     let Some(sig) = jwt_sig_hex(token) else {
@@ -520,6 +481,50 @@ pub(crate) async fn redeem(
         }
     }
     Json(doc).into_response()
+}
+
+// Configuration only permits initially unbound challenges; it never removes
+// an existing binding when enforcement is disabled or the allowlist is cleared.
+fn session_matches(bound: Option<&str>, sent: Option<&str>, require_bound: bool) -> bool {
+    match bound {
+        Some(sid) => sent == Some(sid),
+        None => !require_bound,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_matches;
+
+    #[test]
+    fn existing_sid_binding_survives_configuration_changes() {
+        for require_bound in [false, true] {
+            assert!(session_matches(Some("original"), Some("original"), require_bound));
+            assert!(!session_matches(Some("original"), Some("other"), require_bound));
+            assert!(!session_matches(Some("original"), None, require_bound));
+        }
+        for sent in [None, Some("new")] {
+            assert!(session_matches(None, sent, false));
+            assert!(!session_matches(None, sent, true));
+        }
+    }
+}
+
+fn verify_v1_pow(token: &str, claims: &Value, raw: &[Value]) -> Result<(), &'static str> {
+    let solutions: Vec<u64> = raw.iter().map(|v| v.as_u64().ok_or("invalid_solutions"))
+        .collect::<Result<_, _>>()?;
+    let params = PowParams {
+        c: claims.get("c").and_then(Value::as_u64).unwrap_or(0) as u32,
+        s: claims.get("s").and_then(Value::as_u64).unwrap_or(0) as u32,
+        d: claims.get("d").and_then(Value::as_u64).unwrap_or(0) as u32,
+    };
+    if !params.valid() {
+        return Err("invalid_token");
+    }
+    if !verify_pow(token, params, &solutions) {
+        return Err("Invalid solution");
+    }
+    Ok(())
 }
 
 /// Trust result in the shape the dashboard/test page expects

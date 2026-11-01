@@ -91,6 +91,7 @@ fn safe_rel(name: &str) -> Option<std::path::PathBuf> {
 struct ActiveFiles {
     id: String,
     files: HashMap<String, ServedFile>,
+    error: Option<String>,
 }
 
 /// Compressible types worth a gzip variant (already-encrypted JS is not: its
@@ -117,6 +118,7 @@ fn gzip_bytes(data: &[u8]) -> Option<Bytes> {
 pub struct ReleaseStore {
     root: PathBuf,
     active: RwLock<ActiveFiles>,
+    builtin: RwLock<HashMap<String, ServedFile>>,
 }
 
 impl ReleaseStore {
@@ -125,9 +127,14 @@ impl ReleaseStore {
         let root = data_dir.join("releases");
         std::fs::create_dir_all(&root)
             .map_err(|e| format!("cannot create {}: {e}", root.display()))?;
-        let store = Self { root, active: RwLock::new(ActiveFiles::default()) };
+        let store = Self {
+            root,
+            active: RwLock::new(ActiveFiles::default()),
+            builtin: RwLock::new(HashMap::new()),
+        };
         if let Err(e) = store.reload_active() {
             eprintln!("[cap] could not load the active release: {e}");
+            store.active.write().unwrap_or_else(|e| e.into_inner()).error = Some(e);
         }
         Ok(store)
     }
@@ -136,11 +143,16 @@ impl ReleaseStore {
         &self.root
     }
 
-    fn active_id(&self) -> Option<String> {
-        std::fs::read_to_string(self.root.join(ACTIVE_FILE))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+    fn active_id(&self) -> Result<Option<String>, String> {
+        let path = self.root.join(ACTIVE_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Ok(_) => Err("active release marker is empty".into()),
+            // A dangling symlink is configured, not an absent marker.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) => Ok(None),
+            Err(e) => Err(format!("cannot read active release marker: {e}")),
+        }
     }
 
     /// Resolve a release directory, rejecting anything that is not a plain
@@ -163,19 +175,31 @@ impl ReleaseStore {
 
     /// Load `<id>/dist` into memory and mark it active.
     fn reload_active(&self) -> Result<(), String> {
-        let Some(id) = self.active_id() else {
+        let Some(id) = self.active_id()? else {
+            *self.active.write().unwrap_or_else(|e| e.into_inner()) = ActiveFiles::default();
             return Ok(());
         };
-        let dist = self.release_dir(&id).join("dist");
+        let loaded = self.load_release(&id)?;
+        *self.active.write().unwrap_or_else(|e| e.into_inner()) = loaded;
+        Ok(())
+    }
+
+    fn load_release(&self, id: &str) -> Result<ActiveFiles, String> {
+        if id == "__invalid__" || self.release_dir(id).file_name().and_then(|s| s.to_str()) != Some(id) {
+            return Err("invalid active release id".into());
+        }
+        let dist = self.release_dir(id).join("dist");
         let mut files = HashMap::new();
         let mut stack = vec![dist.clone()];
         while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
+            let entries = std::fs::read_dir(&dir)
+                .map_err(|e| format!("cannot load release {id}: {e}"))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| e.to_string())?;
                 let path = entry.path();
+                if entry.file_type().map_err(|e| e.to_string())?.is_symlink() {
+                    return Err(format!("release {id} contains a symlink"));
+                }
                 if path.is_dir() {
                     stack.push(path);
                     continue;
@@ -184,9 +208,8 @@ impl ReleaseStore {
                     continue;
                 };
                 let key = rel.to_string_lossy().replace('\\', "/");
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| format!("cannot read release {id} file {}: {e}", path.display()))?;
                 let ct = content_type_for(&key).unwrap_or("application/octet-stream");
                 let gzip = if should_gzip(&key, &bytes) {
                     gzip_bytes(&bytes)
@@ -210,26 +233,46 @@ impl ReleaseStore {
         } else {
             None
         };
-        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
-        *active = ActiveFiles { id, files };
         if let Some(entry) = entry {
-            eprintln!("[cap] release active: widget entry /assets/{entry}");
+            eprintln!("[cap] release loaded: widget entry /assets/{entry}");
         }
-        Ok(())
+        Ok(ActiveFiles { id: id.to_string(), files, error: None })
     }
 
     /// A file from the active release. Names are exact relative paths; a bare
     /// basename also resolves when it is unambiguous.
     pub fn get(&self, name: &str) -> Option<ServedFile> {
+        self.resolve(name).ok().flatten()
+    }
+
+    /// Resolve exclusively within one release. Only an absent configuration
+    /// selects the current binary's complete in-memory bundle.
+    pub fn resolve(&self, name: &str) -> Result<Option<ServedFile>, String> {
         let active = self.active.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = active.files.get(name) {
+        if let Some(error) = &active.error {
+            return Err(error.clone());
+        }
+        let builtin = self.builtin.read().unwrap_or_else(|e| e.into_inner());
+        let files = if active.id.is_empty() {
+            if builtin.is_empty() {
+                return Err("built-in assets are unavailable".into());
+            }
+            &*builtin
+        } else {
+            &active.files
+        };
+        Ok(Self::find_file(files, name))
+    }
+
+    fn find_file(files: &HashMap<String, ServedFile>, name: &str) -> Option<ServedFile> {
+        if let Some(hit) = files.get(name) {
             return Some(hit.clone());
         }
         if name.contains('/') {
             return None;
         }
         let mut found = None;
-        for (key, value) in &active.files {
+        for (key, value) in files {
             if key.rsplit('/').next() == Some(name) {
                 if found.is_some() {
                     return None; // ambiguous
@@ -313,17 +356,25 @@ impl ReleaseStore {
         Ok(meta)
     }
 
-    /// Publish the bundle compiled into the binary. Idempotent: an existing
-    /// builtin release is left untouched (so a user's rollback target keeps
-    /// its files), and it becomes active only when nothing else is.
+    /// Install the binary's default in memory, without creating an active
+    /// setting. Preserve existing on-disk releases, including builtin rollback
+    /// targets and broken explicit configurations, rather than repairing them
+    /// by silently substituting another version.
     pub fn publish_builtin(&self, archive: &[u8], build_id: &str) -> Result<ReleaseMeta, String> {
+        let entries = read_zip(archive).map_err(|e: ZipError| e.0)?;
+        let mut bundled = HashMap::new();
+        for item in &entries {
+            safe_rel(&item.name).ok_or_else(|| format!("unsafe archive entry: {}", item.name))?;
+            let served = protect_js(&item.name, &item.data);
+            let gzip = if should_gzip(&item.name, &served) { gzip_bytes(&served) } else { None };
+            bundled.insert(item.name.clone(), ServedFile {
+                plain: Bytes::from(served), gzip,
+                content_type: content_type_for(&item.name).unwrap_or("application/octet-stream"),
+            });
+        }
+        *self.builtin.write().unwrap_or_else(|e| e.into_inner()) = bundled;
         let dir = self.release_dir(BUILTIN_ID);
-        let up_to_date = std::fs::read_to_string(dir.join(META_FILE))
-            .ok()
-            .and_then(|s| serde_json::from_str::<ReleaseMeta>(&s).ok())
-            .map(|m| m.build_id == build_id)
-            .unwrap_or(false);
-        if dir.join("dist").is_dir() && up_to_date {
+        if std::fs::symlink_metadata(&dir).is_ok() {
             let mut meta = self
                 .list()
                 .into_iter()
@@ -339,16 +390,14 @@ impl ReleaseStore {
                     build_id: String::new(),
                     entry: None,
                 });
-            meta.active = self.active_id().as_deref() == Some(BUILTIN_ID);
+            meta.active = self.active_id().ok().flatten().as_deref() == Some(BUILTIN_ID);
             return Ok(meta);
         }
+        if self.active_id().ok().flatten().as_deref() == Some(BUILTIN_ID) {
+            return Err("configured built-in release is missing".into());
+        }
 
-        let entries = read_zip(archive).map_err(|e: ZipError| e.0)?;
         let (raw_dir, dist_dir) = (dir.join("raw"), dir.join("dist"));
-        // A new bundle must not inherit files from the previous one (a removed
-        // debug.js or old wasm would otherwise keep being served).
-        let _ = std::fs::remove_dir_all(&raw_dir);
-        let _ = std::fs::remove_dir_all(&dist_dir);
         std::fs::create_dir_all(&raw_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&dist_dir).map_err(|e| e.to_string())?;
         std::fs::write(dir.join("source.zip"), archive).map_err(|e| e.to_string())?;
@@ -396,14 +445,11 @@ impl ReleaseStore {
         )
         .map_err(|e| e.to_string())?;
 
-        if self.active_release_id().is_none() {
-            self.activate(BUILTIN_ID)?;
-        }
         Ok(meta)
     }
 
     pub fn list(&self) -> Vec<ReleaseMeta> {
-        let active = self.active_id();
+        let active = self.active_id().ok().flatten();
         let mut out = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return out;
@@ -439,19 +485,21 @@ impl ReleaseStore {
     }
 
     pub fn activate(&self, id: &str) -> Result<(), String> {
-        let dir = self.release_dir(id);
-        if !dir.join("dist").is_dir() {
-            return Err(format!("release {id} does not exist"));
-        }
-        std::fs::write(self.root.join(ACTIVE_FILE), id).map_err(|e| e.to_string())?;
-        self.reload_active()
+        // Validate before changing either the durable marker or served snapshot.
+        let loaded = self.load_release(id)?;
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        let pending = self.root.join("active.tmp");
+        std::fs::write(&pending, id).map_err(|e| e.to_string())?;
+        std::fs::rename(&pending, self.root.join(ACTIVE_FILE)).map_err(|e| e.to_string())?;
+        *active = loaded;
+        Ok(())
     }
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
         if id == BUILTIN_ID {
             return Err("the built-in release cannot be deleted".into());
         }
-        if self.active_id().as_deref() == Some(id) {
+        if self.active_id().ok().flatten().as_deref() == Some(id) {
             return Err("cannot delete the active release; activate another first".into());
         }
         let dir = self.release_dir(id);
@@ -572,6 +620,49 @@ mod tests {
         store.delete(&second.id).unwrap();
         assert_eq!(store.list().len(), 1);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn binary_default_is_complete_and_does_not_configure_or_replace_history() {
+        let dir = temp_dir("default");
+        let store = ReleaseStore::open(&dir).unwrap();
+        let bundle = zip_of(&[("widget.js", b"var x=1;"), ("a.wasm", b"old"), ("b.wasm", b"two")]);
+        store.publish_builtin(&bundle, "one").unwrap();
+        assert!(!store.root().join(ACTIVE_FILE).exists());
+        for name in ["widget.js", "a.wasm", "b.wasm"] {
+            assert!(store.resolve(name).unwrap().is_some());
+        }
+        store.publish_builtin(&zip_of(&[("a.wasm", b"new")]), "two").unwrap();
+        assert_eq!(store.resolve("a.wasm").unwrap().unwrap().plain.as_ref(), b"new");
+        store.activate(BUILTIN_ID).unwrap();
+        assert_eq!(store.resolve("a.wasm").unwrap().unwrap().plain.as_ref(), b"old");
+        let user = store.publish(&zip_of(&[("custom.js", b"var x=3;")])).unwrap();
+        assert!(store.resolve("widget.js").unwrap().is_none());
+        assert!(store.resolve("a.wasm").unwrap().is_none());
+        assert!(store.activate("missing-release").is_err());
+        assert_eq!(store.active_release_id().as_deref(), Some(user.id.as_str()));
+        store.activate(BUILTIN_ID).unwrap();
+        assert!(store.resolve("widget.js").unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn broken_configuration_is_not_defaulted_or_overwritten() {
+        for marker in ["", "../escape", "missing-release", "builtin"] {
+            let dir = temp_dir("broken");
+            std::fs::create_dir_all(dir.join("releases")).unwrap();
+            std::fs::write(dir.join("releases/active"), marker).unwrap();
+            let store = ReleaseStore::open(&dir).unwrap();
+            assert!(store.resolve("widget.js").is_err());
+            let result = store.publish_builtin(&zip_of(&[("widget.js", b"var x=1;")]), "one");
+            assert_eq!(result.is_err(), marker == BUILTIN_ID);
+            assert!(store.resolve("widget.js").is_err());
+            assert_eq!(std::fs::read_to_string(dir.join("releases/active")).unwrap(), marker);
+            let published = store.publish(&zip_of(&[("custom.js", b"var x=2;")])).unwrap();
+            assert_eq!(store.active_release_id(), Some(published.id));
+            assert!(store.resolve("widget.js").unwrap().is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

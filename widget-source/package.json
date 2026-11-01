@@ -2,10 +2,13 @@
   "name": "widget",
   "private": true,
   "scripts": {
-    "test": "bun test test/unit.test.js && bun test test/e2e.test.js && bun test test/e2e-instrumentation.test.js && bun test test/e2e-regression.test.js && bun test test/e2e-worker.test.js && bun test test/e2e-hashwx.test.js",
+    "test": "bun run build && bun run test:prebuilt",
+    "test:prebuilt": "bun test test/unit.test.js && bun test test/theme.test.js && bun test test/e2e.test.js && bun test test/e2e-instrumentation.test.js && bun test test/e2e-regression.test.js && bun test test/e2e-worker.test.js && bun test test/e2e-hashwx.test.js",
     "test:unit": "bun test test/unit.test.js",
-    "test:e2e": "bun test test/e2e.test.js && bun test test/e2e-instrumentation.test.js && bun test test/e2e-regression.test.js && bun test test/e2e-worker.test.js && bun test test/e2e-hashwx.test.js",
-    "build": "bun build.js"
+    "test:theme": "bun run build && bun test test/theme.test.js",
+    "test:e2e": "bun run build && bun run test:e2e:prebuilt",
+    "test:e2e:prebuilt": "bun test test/e2e.test.js && bun test test/e2e-instrumentation.test.js && bun test test/e2e-regression.test.js && bun test test/e2e-worker.test.js && bun test test/e2e-hashwx.test.js",
+    "build": "bun _build_only.mjs"
   },
   "dependencies": {},
   "devDependencies": {

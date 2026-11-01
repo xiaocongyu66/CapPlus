@@ -152,19 +152,6 @@ const OPTIONAL_FIELD_TYPES: &[(&str, Kind)] = &[
     ("webgpu", Kind::NullableObject),
 ];
 
-/// Optional fields whose absence is a transport gap, not a client lie — used by
-/// [`collect_signals`] to drop spurious `probe_incomplete` entries.
-const OPTIONAL_FIELD_NAMES: &[&str] = &[
-    "workerUA",
-    "webgl",
-    "canvas",
-    "audio",
-    "emoji",
-    "platform",
-    "hardwareConcurrency",
-    "storageQuota",
-];
-
 /// Which optional field backs each consistency check (`CHECK_DEP_FIELD`).
 const CHECK_DEP_FIELD: &[(&str, &str)] = &[
     ("cdp_console_trap", "cdp"),

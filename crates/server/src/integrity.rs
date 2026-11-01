@@ -239,26 +239,61 @@ mod embed_context_tests {
     }
 }
 
-/// The operator's asset baseline (`settings:integrity`), or `None` when no
-/// usable sha256 hash is configured.
-pub(crate) async fn load_integrity(st: &AppState) -> Option<Value> {
-    let doc: Value = st.cache.setting(&st.kv, "settings:integrity").await;
+/// 加载资产基线；读取失败或配置损坏不能等同于未配置。
+pub(crate) async fn load_integrity(st: &AppState) -> Result<Option<Value>, &'static str> {
+    parse_integrity_config(st.cache.setting_checked(&st.kv, "settings:integrity").await)
+}
+
+fn parse_integrity_config(doc: Result<Value, &'static str>) -> Result<Option<Value>, &'static str> {
+    let doc = doc?;
     if doc.is_null() {
-        return None;
+        return Ok(None);
+    }
+    let fields = doc.as_object().ok_or("integrity_config_invalid")?;
+    if fields.keys().any(|key| !matches!(key.as_str(), "widget" | "capWasm" | "hashwxWasm")) {
+        return Err("integrity_config_invalid");
     }
     let mut out = serde_json::Map::new();
     for key in ["widget", "capWasm", "hashwxWasm"] {
-        if let Some(v) = doc.get(key).and_then(Value::as_str) {
-            let v = v.trim().to_ascii_lowercase();
-            if v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()) {
-                out.insert(key.to_string(), json!(v));
+        if let Some(value) = doc.get(key) {
+            if value.is_null() {
+                continue;
             }
+            let v = value.as_str().ok_or("integrity_config_invalid")?.trim().to_ascii_lowercase();
+            if v.is_empty() {
+                continue;
+            }
+            if v.len() != 64 || !v.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err("integrity_config_invalid");
+            }
+            out.insert(key.to_string(), json!(v));
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(Value::Object(out))
+    Ok(if out.is_empty() { None } else { Some(Value::Object(out)) })
+}
+
+#[cfg(test)]
+mod integrity_config_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_or_malformed_baseline_is_not_absent() {
+        assert_eq!(parse_integrity_config(Err("setting_unavailable")), Err("setting_unavailable"));
+        for doc in [json!([]), json!(false), json!({"widget": 42}),
+            json!({"capWasm": "bad"}), json!({"hashwxWasm": "z".repeat(64)})] {
+            assert_eq!(parse_integrity_config(Ok(doc)), Err("integrity_config_invalid"));
+        }
+        let mixed = json!({"widget": "a".repeat(64), "capWasm": "invalid"});
+        assert_eq!(parse_integrity_config(Ok(mixed)), Err("integrity_config_invalid"));
+    }
+
+    #[test]
+    fn disabled_baseline_and_valid_hashes_remain_supported() {
+        for doc in [Value::Null, json!({}), json!({"widget": "", "capWasm": null})] {
+            assert_eq!(parse_integrity_config(Ok(doc)), Ok(None));
+        }
+        let doc = json!({"widget": format!(" {} ", "A".repeat(64))});
+        assert_eq!(parse_integrity_config(Ok(doc)), Ok(Some(json!({"widget": "a".repeat(64)}))));
     }
 }
 

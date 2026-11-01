@@ -98,19 +98,21 @@ fn write_stored_zip(files: &[(String, Vec<u8>)], out: &Path) -> std::io::Result<
     f.write_all(&body)
 }
 
-/// Optional: rebuild the widget when its toolchain is available. Any failure
-/// falls back to the prebuilt files in `widget-dist/`.
-fn try_build_widget(manifest: &Path) -> bool {
+/// Rebuild with the pure builder when dependencies are installed. Source-only
+/// distributions without node_modules use the versioned release artifacts.
+/// A requested rebuild must succeed: never silently ship an older bundle.
+fn build_widget(manifest: &Path) {
     let widget_dir = manifest.join("../../widget-source");
     if !widget_dir.join("node_modules").is_dir() {
-        return false;
+        println!("cargo:warning=using versioned widget-dist (no widget node_modules)");
+        return;
     }
     let status = std::process::Command::new("bun")
-        .arg("run")
-        .arg("build")
+        .arg("_build_only.mjs")
         .current_dir(&widget_dir)
-        .status();
-    matches!(status, Ok(s) if s.success())
+        .status()
+        .expect("run pure widget builder (bun required with node_modules installed)");
+    assert!(status.success(), "widget build failed; refusing stale artifacts");
 }
 
 fn bundle(name: &str, dir: &Path, out_dir: &Path) -> u64 {
@@ -122,6 +124,11 @@ fn bundle(name: &str, dir: &Path, out_dir: &Path) -> u64 {
             dir.display()
         );
     }
+    bundle_files(name, files, out_dir)
+}
+
+fn bundle_files(name: &str, mut files: Vec<(String, Vec<u8>)>, out_dir: &Path) -> u64 {
+    files.sort_by(|a, b| a.0.cmp(&b.0));
     write_stored_zip(&files, &out_dir.join(format!("{name}.zip"))).expect("write zip");
     // FNV-1a over sorted (name, bytes) so an upgrade can tell whether the
     // bundle changed and must be re-published (and re-encrypted).
@@ -150,21 +157,23 @@ fn main() {
     std::fs::write(out_dir.join("dashboard-id.txt"), format!("{dashboard_hash:016x}"))
         .expect("write dashboard-id.txt");
 
-    // Widget: refresh from source when `bun` and the toolchain are present,
-    // otherwise ship the prebuilt bundle committed under widget-dist/.
     let widget_src = manifest.join("../../widget-source");
-    println!("cargo:rerun-if-changed={}", widget_src.display());
-    let rebuilt = try_build_widget(&manifest);
-    let dist = if rebuilt {
-        // build.js writes the minified files into widget-source/src/.
-        let d = widget_src.join("src");
-        if d.join("cap.min.js").is_file() { d } else { manifest.join("../../widget-dist") }
-    } else {
-        manifest.join("../../widget-dist")
-    };
-    println!("cargo:warning=widget bundle: {}", dist.display());
-    println!("cargo:rerun-if-changed={}", dist.display());
-    let widget_hash = bundle("widget", &dist, &out_dir);
+    for input in ["src/src", "_build_only.mjs", "package.json", "bun.lock"] {
+        println!("cargo:rerun-if-changed={}", widget_src.join(input).display());
+    }
+    build_widget(&manifest);
+    let dist = manifest.join("../../widget-dist");
+    // Never recursively package source trees or arbitrary files from dist.
+    let mut files = Vec::new();
+    for name in ["widget.js", "floating.js", "cap_wasm.js", "cap_wasm_bg.wasm", "hashwx.wasm"] {
+        let path = dist.join(name);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("required widget artifact {}: {e}", path.display()));
+        assert!(!bytes.is_empty(), "empty widget artifact: {name}");
+        files.push((name.to_string(), bytes));
+    }
+    let widget_hash = bundle_files("widget", files, &out_dir);
     std::fs::write(out_dir.join("widget-id.txt"), format!("{widget_hash:016x}"))
         .expect("write widget-id.txt");
 }

@@ -253,6 +253,11 @@ pub fn embed_page_with_context(
             .replace('&', "\\u0026")
     };
     let widget = esc(widget_url);
+    // The default self-hosted release is a complete JS/WASM set. Custom
+    // widget deployments retain their own asset resolution contract.
+    let local_assets = if widget_url == "/assets/widget.js" {
+        "window.CAP_CUSTOM_WASM_URL = '/assets/cap_wasm_bg.wasm'; window.CAP_CUSTOM_HASHWX_URL = '/assets/hashwx.wasm';"
+    } else { "" };
 
     format!(
         r#"<!doctype html>
@@ -283,6 +288,7 @@ pub fn embed_page_with_context(
 <div id="w"></div>
 <script>
 (function(){{
+  {local_assets}
   var SITE = "{site}";
   var PARENT = {target};
   var CONTEXT = {context};
@@ -341,14 +347,14 @@ pub fn embed_page_with_context(
 const LOADER: &str = r#"(function(){
   var HERE = new URL(document.currentScript.src);
   var CAP_ORIGIN = HERE.origin;
-  var SCRIPT_THEME = (document.currentScript.getAttribute("data-cap-theme") || "").toLowerCase();
+  // No script-level override: use the same precedence as standalone widgets.
 
   // The page owns its theme: read only signals it declares itself (attribute,
   // CSS color-scheme, theme attributes/classes). Nothing here guesses from the
   // background colour or the OS preference, which are unrelated to the page's
   // chosen theme.
   function detectTheme(el){
-    var explicit = (el.getAttribute("data-cap-theme") || SCRIPT_THEME || "").toLowerCase();
+    var explicit = (el.getAttribute("data-cap-theme") || "").toLowerCase();
     if (explicit === "dark" || explicit === "light") return explicit;
 
     var root = document.documentElement, body = document.body;
@@ -362,26 +368,41 @@ const LOADER: &str = r#"(function(){
       }
     }
 
-    // Page-declared `color-scheme` (CSS), not the OS preference.
-    try {
-      var cs = String(window.getComputedStyle(root).colorScheme || "").toLowerCase();
-      if (!cs && body) cs = String(window.getComputedStyle(body).colorScheme || "").toLowerCase();
-      var hasDark = cs.indexOf("dark") >= 0, hasLight = cs.indexOf("light") >= 0;
-      if (hasDark && !hasLight) return "dark";
-      if (hasLight && !hasDark) return "light";
-    } catch (e) {}
-
-    // Common explicit class toggles (Tailwind/Bootstrap-style).
+    // Explicit classes outrank CSS declarations on either page node.
     var cls = ((root.className || "") + " " + ((body && body.className) || "")).toLowerCase().split(/\s+/);
     if (cls.indexOf("dark") >= 0 || cls.indexOf("theme-dark") >= 0) return "dark";
     if (cls.indexOf("light") >= 0 || cls.indexOf("theme-light") >= 0) return "light";
+
+    // Only a single CSS scheme is a choice. normal / dual values on html
+    // must not hide an explicit scheme on body.
+    for (var n = 0; n < nodes.length; n++) {
+      if (!nodes[n]) continue;
+      try {
+        var cs = String(window.getComputedStyle(nodes[n]).colorScheme || "").trim().toLowerCase();
+        var tokens = cs.split(/\s+/);
+        var schemes = tokens.filter(function(t){ return t === "light" || t === "dark"; });
+        if (schemes.length === 1 && tokens.length <= 2 && tokens.every(function(t){ return t === schemes[0] || t === "only"; })) return schemes[0];
+      } catch (e) {}
+    }
 
     // No declaration: default dark.
     return "dark";
   }
 
+  var mounted = new Map();
+  var paused = new WeakSet();
+  var themeAttrs = ["class", "style", "data-cap-theme", "data-theme", "data-bs-theme", "data-color-mode", "data-mode", "data-color-scheme"];
+  function destroy(el){
+    if (!el) return;
+    paused.add(el);
+    cleanupInstance(el);
+  }
+  function cleanupInstance(el){
+    var cleanup = mounted.get(el);
+    if (cleanup) cleanup();
+  }
   function init(el){
-    if (el.__capEmbed) return;
+    if (el.__capEmbed || !el.isConnected || paused.has(el)) return;
     el.__capEmbed = true;
     var site = el.getAttribute("data-site-key") || "";
     var name = el.getAttribute("data-field-name") || "cap-token";
@@ -402,6 +423,7 @@ const LOADER: &str = r#"(function(){
     el.appendChild(input);
 
     function sendTheme(){
+      if (!el.isConnected) return;
       var t = detectTheme(el);
       try {
         iframe.contentWindow.postMessage({ type: "cap:theme", theme: t }, CAP_ORIGIN);
@@ -414,13 +436,14 @@ const LOADER: &str = r#"(function(){
     // CapEmbed.refreshTheme().
     try {
       var mo = new MutationObserver(sendTheme);
-      mo.observe(document.documentElement, { attributes: true });
-      if (document.body) mo.observe(document.body, { attributes: true });
+      mo.observe(document.documentElement, { attributes: true, attributeFilter: themeAttrs });
+      if (document.body) mo.observe(document.body, { attributes: true, attributeFilter: themeAttrs });
       mo.observe(el, { attributes: true, attributeFilter: ["data-cap-theme"] });
       el.__capThemeObserver = mo;
     } catch (e) {}
 
-    window.addEventListener("message", function(ev){
+    function onMessage(ev){
+      if (!el.isConnected) return;
       if (ev.origin !== CAP_ORIGIN) return;
       if (ev.source !== iframe.contentWindow) return;
       var d = ev.data;
@@ -434,16 +457,37 @@ const LOADER: &str = r#"(function(){
       } else if (d.type === "cap:error") {
         el.dispatchEvent(new CustomEvent("cap-error", { detail: d }));
       }
+    }
+    window.addEventListener("message", onMessage);
+    mounted.set(el, function(){
+      if (mo) mo.disconnect();
+      iframe.removeEventListener("load", sendTheme);
+      window.removeEventListener("message", onMessage);
+      iframe.remove();
+      input.remove();
+      delete el.__capThemeObserver;
+      delete el.__capEmbed;
+      mounted.delete(el);
     });
   }
-  function scan(){
+  function scan(resume){
+    mounted.forEach(function(_, el){ if (!el.isConnected) cleanupInstance(el); });
     var nodes = document.querySelectorAll("cap-embed[data-site-key]");
-    for (var i = 0; i < nodes.length; i++) init(nodes[i]);
+    for (var i = 0; i < nodes.length; i++) {
+      if (resume === true) paused.delete(nodes[i]);
+      init(nodes[i]);
+    }
   }
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", scan);
+  // One document-lifetime observer handles dynamically inserted/removed hosts;
+  // all instance observers and listeners are disposed when their host leaves.
+  var lifecycle = new MutationObserver(scan);
+  lifecycle.observe(document.documentElement, { childList: true, subtree: true });
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", scan, { once: true });
   else scan();
   window.CapEmbed = {
-    scan: scan,
+    scan: function(){ scan(true); },
+    mount: function(el){ if (el) { paused.delete(el); init(el); } },
+    destroy: destroy,
     // Force a theme for one widget ("dark"/"light") or return to automatic.
     setTheme: function(el, theme){
       if (!el) return;

@@ -68,8 +68,8 @@ impl BlockList {
                 out.countries.insert(country.to_string());
             } else if let Some(asn) = field.strip_prefix("asn:") {
                 out.asns.insert(asn.to_string());
-            } else {
-                out.ips.insert(field.clone());
+            } else if let Some(ip) = crate::http_util::canonical_ip(field) {
+                out.ips.insert(ip);
             }
         }
         out
@@ -78,7 +78,7 @@ impl BlockList {
 
 pub struct ConfigCache {
     keys: Cache<String, Option<Arc<KeyInfo>>>,
-    settings: Cache<String, serde_json::Value>,
+    settings: Cache<String, Option<serde_json::Value>>,
     blocked: Cache<String, Arc<BlockList>>,
 }
 
@@ -122,22 +122,33 @@ impl ConfigCache {
             .unwrap_or(None)
     }
 
-    /// Global setting JSON (`settings:*`), cached for [`TTL`]. Missing or
-    /// unparsable values are cached as `Value::Null`.
+    /// 非安全用途的兼容读取；安全决策应使用保留错误的 checked 接口。
     pub async fn setting(&self, kv: &Kv, name: &str) -> serde_json::Value {
+        self.setting_checked(kv, name).await.unwrap_or(serde_json::Value::Null)
+    }
+
+    pub async fn setting_checked(&self, kv: &Kv, name: &str) -> Result<serde_json::Value, &'static str> {
+        match self.setting_optional(kv, name).await? {
+            None => Ok(serde_json::Value::Null),
+            Some(value) if value.is_object() => Ok(value),
+            Some(_) => Err("setting_invalid"),
+        }
+    }
+
+    pub async fn setting_optional(&self, kv: &Kv, name: &str) -> Result<Option<serde_json::Value>, &'static str> {
         self.settings
             .try_get_with_by_ref(name, async {
                 match kv.get(name).await {
-                    Ok(raw) => Ok(raw
-                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                        .unwrap_or(serde_json::Value::Null)),
+                    Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
+                        .map(Some).map_err(|_| LoadError),
+                    Ok(None) => Ok(None),
                     // A read error is NOT "the setting is absent": caching it
                     // would silently disable integrity checking for a second.
                     Err(_) => Err(LoadError),
                 }
             })
             .await
-            .unwrap_or(serde_json::Value::Null)
+            .map_err(|_| "setting_unavailable")
     }
 
     /// `blocked:<site_key>`, cached for [`TTL`] and pre-split by kind. A key

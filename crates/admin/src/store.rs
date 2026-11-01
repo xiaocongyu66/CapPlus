@@ -52,8 +52,7 @@ impl AdminStore {
         self.kv.expire(key, secs).await.map_err(e)
     }
 
-    /// `SET key value NX EX secs` — atomic first-writer-wins, used to consume
-    /// a recovery code exactly once.
+    /// `SET key value NX EX secs` — atomic first-writer-wins for TOTP steps.
     pub(crate) async fn set_nx_ex(&self, key: &str, value: &str, secs: i64) -> Result<bool, String> {
         self.kv.set_nx_ex(key, value, secs).await.map_err(e)
     }
@@ -102,6 +101,29 @@ impl AdminStore {
 
     pub(crate) async fn hgetall(&self, name: &str) -> Result<HashMap<String, String>, String> {
         self.kv.hgetall(name).await.map_err(e)
+    }
+
+    pub(crate) async fn consume_recovery_hash(
+        &self,
+        name: &str,
+        expected_secret: &str,
+        hash: &str,
+    ) -> Result<bool, String> {
+        self.kv.consume_recovery_hash(name, expected_secret, hash).await.map_err(e)
+    }
+
+    pub(crate) async fn publish_totp(&self, name: &str, pending: &str, recovery: &str) -> Result<bool, String> {
+        self.kv.publish_totp(name, pending, recovery).await.map_err(e)
+    }
+
+    pub(crate) async fn hcreate_indexed(
+        &self,
+        name: &str,
+        pairs: &[(&str, String)],
+        index: &str,
+        member: &str,
+    ) -> Result<bool, String> {
+        self.kv.hcreate_indexed(name, pairs, index, member).await.map_err(e)
     }
 
     pub(crate) async fn hset_pairs(

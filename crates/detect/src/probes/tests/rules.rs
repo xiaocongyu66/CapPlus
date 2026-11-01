@@ -11,6 +11,27 @@ use super::*;
 
 
 
+    #[test]
+    fn protocol_completeness_requires_base_fields_but_not_optional_apis() {
+        for mut probe in [chrome_human(), firefox_human(), safari_human()] {
+            for (name, _) in OPTIONAL_FIELD_TYPES {
+                probe.as_object_mut().unwrap().remove(*name);
+            }
+            assert!(probe_completeness(&probe, Some(PROBE_FONT_STACK_COUNT), &[]).is_empty());
+            for (name, _) in PROBE_FIELD_TYPES {
+                let mut missing = probe.clone();
+                missing.as_object_mut().unwrap().remove(*name);
+                assert!(!probe_completeness(&missing, Some(PROBE_FONT_STACK_COUNT), &[]).is_empty(), "missing {name}");
+                let mut wrong = probe.clone();
+                wrong[*name] = json!(42);
+                assert!(!probe_completeness(&wrong, Some(PROBE_FONT_STACK_COUNT), &[]).is_empty(), "wrong {name}");
+            }
+        }
+        for invalid in [Value::Null, json!({}), json!([]), json!("probe"), json!(true)] {
+            assert!(!probe_completeness(&invalid, Some(PROBE_FONT_STACK_COUNT), &[]).is_empty());
+        }
+    }
+
     // ---- geometryStats --------------------------------------------------
 
     #[test]
@@ -794,14 +815,35 @@ use super::*;
     }
 
     #[test]
-    fn collect_signals_suppresses_optional_only_probe_incomplete() {
+    fn all_optional_schema_fields_can_be_unavailable_without_gating() {
+        let fields: Vec<_> = OPTIONAL_FIELD_TYPES.iter().map(|(name, _)| name.to_string()).collect();
+        let mut probe = chrome_human();
+        for name in &fields {
+            probe.as_object_mut().unwrap().remove(name);
+        }
+        let opts = DetectOpts { font_stack_count: Some(PROBE_FONT_STACK_COUNT), optional_fields: &fields, accept_language: None };
+        let outcome = detect_automation(&probe, &opts);
+        assert!(outcome.pass, "{:?}", outcome.blocked_by);
+        for (name, _) in OPTIONAL_FIELD_TYPES {
+            let mut malformed = probe.clone();
+            malformed[*name] = json!([]);
+            let outcome = detect_automation(&malformed, &opts);
+            assert!(!outcome.pass, "malformed {name}");
+            assert!(outcome.signals.iter().any(|s| s.id == "probe_incomplete"));
+        }
+    }
+
+    #[test]
+    fn collect_signals_preserves_malformed_optional_probe_incomplete() {
         let check = Check {
             id: "probe_incomplete".into(),
             passed: false,
             detail: "missing or malformed: webgl, canvas".into(),
             gating: true,
         };
-        assert!(collect_signals(&[check.clone()], &[], &json!({})).is_empty());
+        // Completeness now handles absence structurally; an emitted failure
+        // must not be discarded by parsing a truncated human-readable detail.
+        assert_eq!(collect_signals(&[check.clone()], &[], &json!({})).len(), 1);
         let check2 = Check {
             detail: "missing or malformed: ua, webgl".into(),
             ..check
@@ -836,10 +878,10 @@ use super::*;
         let mut s = chrome_human();
         s.as_object_mut().unwrap().remove("tamper");
         let r = detect_automation(&s, &o);
-        assert!(r.blocked_by.iter().any(|b| b == "shape_probe_missing"));
+        assert!(!r.blocked_by.iter().any(|b| b == "shape_probe_missing"));
         assert!(r.blocked_by.iter().any(|b| b == "tamper_probe_missing"));
         assert!(r.blocked_by.iter().any(|b| b == "crypto_probe_missing"));
-        assert!(r.blocked_by.iter().any(|b| b == "cdp_probe_missing"));
+        assert!(!r.blocked_by.iter().any(|b| b == "cdp_probe_missing"));
         assert!(!r.pass);
     }
 

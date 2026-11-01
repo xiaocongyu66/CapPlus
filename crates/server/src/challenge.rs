@@ -212,7 +212,11 @@ pub(crate) async fn challenge_inner(
             .into_response();
     }
     // Per-key limits win; otherwise the global `settings:ratelimit` applies.
-    let global_rl_raw = st.cache.setting(&st.kv, "settings:ratelimit").await;
+    let global_rl_raw = match st.cache.setting_checked(&st.kv, "settings:ratelimit").await {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "store_unavailable"}))).into_response(),
+    };
     let global_rl = (!global_rl_raw.is_null()).then_some(global_rl_raw);
     let max = cfg
         .ratelimit_max
@@ -241,6 +245,14 @@ pub(crate) async fn challenge_inner(
     if let Some(resp) = filter_request(&st, &cfg, &headers, &site_key).await {
         return resp;
     }
+
+    let integrity = match load_integrity(&st).await {
+        Ok(integrity) => integrity,
+        Err(reason) => {
+            eprintln!("[challenge] integrity configuration unavailable: {reason}");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "integrity_unavailable"}))).into_response();
+        }
+    };
 
     // Platform / OS tallies for the Location & Networks charts (one pipeline).
     let ua = header_str(&headers, "user-agent");
@@ -293,7 +305,7 @@ pub(crate) async fn challenge_inner(
         let mut payload = json!({
             "typ": "chal", "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev2,
         });
-        if let Err(reason) = seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret) {
+        if let Err(reason) = seal_integrity(&mut payload, &integrity, &key.jwt_secret) {
             eprintln!("[challenge] integrity seal failed: {reason}");
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
         }
@@ -366,7 +378,7 @@ pub(crate) async fn challenge_inner(
         let mut payload = json!({
             "typ": "chal", "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev,
         });
-        if let Err(reason) = seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret) {
+        if let Err(reason) = seal_integrity(&mut payload, &integrity, &key.jwt_secret) {
         eprintln!("[challenge] integrity seal failed: {reason}");
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
     }
@@ -416,7 +428,7 @@ pub(crate) async fn challenge_inner(
     if let Some((ei, _)) = &instrument {
         payload["ei"] = json!(ei);
     }
-    if let Err(reason) = seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret) {
+    if let Err(reason) = seal_integrity(&mut payload, &integrity, &key.jwt_secret) {
         eprintln!("[challenge] integrity seal failed: {reason}");
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
     }

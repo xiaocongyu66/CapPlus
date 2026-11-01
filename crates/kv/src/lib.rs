@@ -38,9 +38,7 @@ pub struct Kv {
 impl Kv {
     pub async fn connect_redis(url: &str) -> KvResult<Self> {
         let client = redis::Client::open(url)?;
-        Ok(Self {
-            conn: ConnectionManager::new(client).await?,
-        })
+        Ok(Self { conn: ConnectionManager::new(client).await? })
     }
 
     pub fn backend_name(&self) -> &'static str {
@@ -234,6 +232,129 @@ impl Kv {
         self.query::<i64>(cmd).await.map(|_| ())
     }
 
+    /// Consume a verified recovery hash from the *current* JSON array. Checking
+    /// the enabled flag and secret also rejects a stale verifier after rotation
+    /// or disable. No snapshot is written back. Existing legacy replay markers
+    /// reject login while permanently pruning the hash (including duplicates).
+    /// Only recoveryVersion=1 is accepted: legacy marker expiry cannot make an
+    /// unversioned/old set valid. Publish a fresh setup to migrate, never stamp
+    /// existing arrays. Stop old writers AND drain in-flight requests first;
+    /// mixed writers and direct rollback of authentication writers are unsafe.
+    /// Malformed storage fails closed before any mutation.
+    pub async fn consume_recovery_hash(
+        &self,
+        name: &str,
+        expected_secret: &str,
+        hash: &str,
+    ) -> KvResult<bool> {
+        let mut conn = self.conn.clone();
+        let n: i64 = redis::Script::new(
+            r#"
+            if redis.call('HGET', KEYS[1], 'totpEnabled') ~= 'true'
+                or redis.call('HGET', KEYS[1], 'totpSecret') ~= ARGV[1]
+                or redis.call('HGET', KEYS[1], 'recoveryVersion') ~= '1' then
+                return 0
+            end
+            local raw = redis.call('HGET', KEYS[1], 'recovery')
+            if not raw then return 0 end
+            if not string.match(raw, '^%s*%[') then
+                return redis.error_reply('recovery must be a JSON array')
+            end
+            local hashes = cjson.decode(raw)
+            local remaining = {}
+            local found = false
+            for _, hash in ipairs(hashes) do
+                if type(hash) ~= 'string' then
+                    return redis.error_reply('recovery must contain strings')
+                end
+                if hash == ARGV[2] then found = true
+                else table.insert(remaining, hash) end
+            end
+            if not found then return 0 end
+            local encoded = '[]'
+            if #remaining > 0 then encoded = cjson.encode(remaining) end
+            -- Old releases could resurrect a consumed hash in the array.
+            -- Remove it permanently even when its legacy marker rejects login.
+            local used = redis.call('EXISTS', KEYS[2])
+            redis.call('HSET', KEYS[1], 'recovery', encoded)
+            if used ~= 0 then return 0 end
+            return 1
+            "#,
+        )
+        .key(name)
+        .key(format!("2fa:recovery-used:{hash}"))
+        .arg(expected_secret)
+        .arg(hash)
+        .invoke_async(&mut conn)
+        .await?;
+        Ok(n == 1)
+    }
+
+    /// Publish a verified setup only while its unique pending secret is still
+    /// current. Setup replaces this generation token; disable deletes it;
+    /// successful enable consumes it. Stale Argon work cannot re-enable 2FA.
+    pub async fn publish_totp(&self, name: &str, pending: &str, recovery: &str) -> KvResult<bool> {
+        let mut conn = self.conn.clone();
+        let n: i64 = redis::Script::new(r#"
+            if redis.call('HGET', KEYS[1], 'totpPending') ~= ARGV[1] then return 0 end
+            if type(redis.acl_check_cmd) ~= 'function' then
+                return redis.error_reply('TOTP publication requires Redis 7.0+ ACL preflight support')
+            end
+            if not redis.acl_check_cmd('HSET', KEYS[1], 'totpSecret', ARGV[1], 'totpEnabled', 'true', 'recovery', ARGV[2], 'recoveryVersion', '1')
+                or not redis.acl_check_cmd('HDEL', KEYS[1], 'totpPending') then
+                return redis.error_reply('TOTP publication ACL denied')
+            end
+            redis.call('HSET', KEYS[1], 'totpSecret', ARGV[1], 'totpEnabled', 'true', 'recovery', ARGV[2], 'recoveryVersion', '1')
+            redis.call('HDEL', KEYS[1], 'totpPending')
+            return 1
+        "#).key(name).arg(pending).arg(recovery).invoke_async(&mut conn).await?;
+        Ok(n == 1)
+    }
+
+    /// Create a previously absent hash and register its index member in one
+    /// atomic operation. A collision changes neither hash nor index. Validate
+    /// the index type and both commands' ACLs before mutation (Redis 7.0+).
+    /// Redis scripts do not roll back arbitrary runtime failures; this guards
+    /// collisions, wrong types and ACL denial, not OOM/server failure atomicity.
+    pub async fn hcreate_indexed(
+        &self,
+        name: &str,
+        pairs: &[(&str, String)],
+        index: &str,
+        member: &str,
+    ) -> KvResult<bool> {
+        if pairs.is_empty() || name == index {
+            return Err(KvError("indexed hash requires fields and a distinct index".into()));
+        }
+        let script = redis::Script::new(
+            r#"
+            if redis.call('EXISTS', KEYS[1]) ~= 0 then return 0 end
+            local kind = redis.call('TYPE', KEYS[2]).ok
+            if kind ~= 'none' and kind ~= 'set' then
+                return redis.error_reply('index must be a set')
+            end
+            if type(redis.acl_check_cmd) ~= 'function' then
+                return redis.error_reply('indexed creation requires Redis 7.0+ ACL preflight support')
+            end
+            if not redis.acl_check_cmd('HSET', KEYS[1], unpack(ARGV, 2))
+                or not redis.acl_check_cmd('SADD', KEYS[2], ARGV[1]) then
+                return redis.error_reply('indexed creation ACL denied')
+            end
+            redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+            redis.call('SADD', KEYS[2], ARGV[1])
+            return 1
+            "#,
+        );
+        let mut invocation = script.prepare_invoke();
+        invocation.key(name).key(index).arg(member);
+        for (field, value) in pairs {
+            invocation.arg(*field).arg(value);
+        }
+        let mut conn = self.conn.clone();
+        let n: i64 = invocation.invoke_async(&mut conn).await?;
+        Ok(n == 1)
+    }
+
     pub async fn hdel_fields(&self, name: &str, fields: &[&str]) -> KvResult<()> {
         if fields.is_empty() {
             return Ok(());
@@ -273,6 +394,161 @@ impl Kv {
         let mut conn = self.conn.clone();
         pipe.query_async::<()>(&mut conn).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::*;
+
+    // Explicit opt-in only: never connect to a default or shared Redis.
+    #[tokio::test]
+    #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
+    async fn atomic_recovery_and_indexed_creation() {
+        let kv = Kv::connect_redis(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        let prefix = format!("atomic-test:{}:{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let name = &format!("{prefix}:2fa");
+        kv.hset_pairs(name, &[
+            ("totpEnabled", "true".into()),
+            ("totpSecret", "old-secret".into()),
+            ("recoveryVersion", "1".into()),
+            ("recovery", r#"["a","b","c"]"#.into()),
+        ]).await.unwrap();
+        // Both callers verified the same old snapshot, but distinct hashes
+        // must both disappear rather than resurrect each other.
+        let (a, b) = tokio::join!(
+            kv.consume_recovery_hash(name, "old-secret", "a"),
+            kv.consume_recovery_hash(name, "old-secret", "b"),
+        );
+        assert!(a.unwrap() && b.unwrap());
+        assert_eq!(kv.hget(name, "recovery").await.unwrap().as_deref(), Some(r#"["c"]"#));
+        let (a, b) = tokio::join!(
+            kv.consume_recovery_hash(name, "old-secret", "c"),
+            kv.consume_recovery_hash(name, "old-secret", "c"),
+        );
+        assert_ne!(a.unwrap(), b.unwrap());
+        assert_eq!(kv.hget(name, "recovery").await.unwrap().as_deref(), Some("[]"));
+
+        // A rotation between Argon verification and consumption must neither
+        // admit the old login nor restore any part of the old configuration.
+        kv.hset_pairs(name, &[("totpSecret", "new-secret".into()), ("recovery", r#"["new"]"#.into())]).await.unwrap();
+        let rotated = kv.hgetall(name).await.unwrap();
+        assert!(!kv.consume_recovery_hash(name, "old-secret", "a").await.unwrap());
+        assert!(!kv.consume_recovery_hash(name, "old-secret", "new").await.unwrap());
+        assert!(!kv.consume_recovery_hash(name, "new-secret", "a").await.unwrap());
+        assert_eq!(kv.hgetall(name).await.unwrap(), rotated);
+        kv.hdel_fields(name, &["totpEnabled", "totpSecret", "recovery", "recoveryVersion"]).await.unwrap();
+        assert!(!kv.consume_recovery_hash(name, "new-secret", "new").await.unwrap());
+        assert!(!kv.exists(name).await.unwrap());
+
+        // Legacy replay marker must reject AND permanently remove all copies.
+        let legacy = format!("{prefix}:legacy-hash");
+        let marker = format!("2fa:recovery-used:{legacy}");
+        kv.hset_pairs(name, &[("totpEnabled", "true".into()), ("totpSecret", "s".into()), ("recovery", format!(r#"["{legacy}","{legacy}","fresh"]"#))]).await.unwrap();
+        kv.set_ex(&marker, "1", 60).await.unwrap();
+        kv.del(&marker).await.unwrap(); // Expired BEFORE the first upgraded login.
+        let unversioned = kv.hgetall(name).await.unwrap();
+        assert!(!kv.consume_recovery_hash(name, "s", &legacy).await.unwrap());
+        assert_eq!(kv.hgetall(name).await.unwrap(), unversioned);
+        kv.hset_pairs(name, &[("recoveryVersion", "0".into())]).await.unwrap();
+        assert!(!kv.consume_recovery_hash(name, "s", &legacy).await.unwrap());
+        kv.hset_pairs(name, &[("recoveryVersion", "1".into())]).await.unwrap();
+        kv.set_ex(&marker, "1", 60).await.unwrap();
+        assert!(!kv.consume_recovery_hash(name, "s", &legacy).await.unwrap());
+        assert_eq!(kv.hget(name, "recovery").await.unwrap().as_deref(), Some(r#"["fresh"]"#));
+        kv.del(&marker).await.unwrap(); // Simulate TTL expiry; no resurrection.
+        assert!(!kv.consume_recovery_hash(name, "s", &legacy).await.unwrap());
+        for malformed in ["[", "{}", r#"["fresh",123]"#, r#"["fresh",null]"#] {
+            kv.hset_pairs(name, &[("recovery", malformed.into())]).await.unwrap();
+            assert!(kv.consume_recovery_hash(name, "s", "fresh").await.is_err());
+            assert_eq!(kv.hget(name, "recovery").await.unwrap().as_deref(), Some(malformed));
+        }
+        kv.hset_pairs(name, &[("recovery", r#"["fresh","fresh"]"#.into())]).await.unwrap();
+        assert!(kv.consume_recovery_hash(name, "s", "fresh").await.unwrap());
+        assert_eq!(kv.hget(name, "recovery").await.unwrap().as_deref(), Some("[]"));
+        kv.hset_pairs(name, &[("totpEnabled", "false".into()), ("recovery", r#"["fresh"]"#.into())]).await.unwrap();
+        let disabled = kv.hgetall(name).await.unwrap();
+        assert!(!kv.consume_recovery_hash(name, "s", "fresh").await.unwrap());
+        assert_eq!(kv.hgetall(name).await.unwrap(), disabled);
+
+        // Pause an enable after reading its generation; let disable or setup
+        // finish, then release the stale publication. No timing sleeps.
+        for replacement in [None, Some("new-pending")] {
+            kv.hset_pairs(name, &[("totpPending", "old-pending".into())]).await.unwrap();
+            let ready = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let resume = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let worker = {
+                let (kv, name, ready, resume) = (kv.clone(), name.clone(), ready.clone(), resume.clone());
+                tokio::spawn(async move {
+                    let pending = kv.hget(&name, "totpPending").await.unwrap().unwrap();
+                    ready.wait().await;
+                    resume.wait().await;
+                    kv.publish_totp(&name, &pending, r#"["stale"]"#).await.unwrap()
+                })
+            };
+            ready.wait().await;
+            if let Some(pending) = replacement {
+                kv.hset_pairs(name, &[("totpPending", pending.into())]).await.unwrap();
+            } else {
+                kv.hdel_fields(name, &["totpPending", "totpEnabled", "totpSecret", "recovery"]).await.unwrap();
+            }
+            let current = kv.hgetall(name).await.unwrap();
+            resume.wait().await;
+            assert!(!worker.await.unwrap());
+            assert_eq!(kv.hgetall(name).await.unwrap(), current);
+        }
+        let (a, b) = tokio::join!(kv.publish_totp(name, "new-pending", "[]"), kv.publish_totp(name, "new-pending", "[]"));
+        assert_ne!(a.unwrap(), b.unwrap());
+        assert_eq!(kv.hget(name, "totpSecret").await.unwrap().as_deref(), Some("new-pending"));
+        assert_eq!(kv.hget(name, "totpPending").await.unwrap(), None);
+        assert_eq!(kv.hget(name, "recoveryVersion").await.unwrap().as_deref(), Some("1"));
+        kv.del(name).await.unwrap();
+
+        let key = &format!("{prefix}:key");
+        let index = &format!("{prefix}:keys");
+        let first = [("secret", "first".into())];
+        let second = [("secret", "second".into())];
+        let (a, b) = tokio::join!(
+            kv.hcreate_indexed(key, &first, index, "site"),
+            kv.hcreate_indexed(key, &second, index, "site"),
+        );
+        let a = a.unwrap();
+        assert_ne!(a, b.unwrap());
+        assert_eq!(kv.hget(key, "secret").await.unwrap().as_deref(), Some(if a { "first" } else { "second" }));
+        assert_eq!(kv.smembers(index).await.unwrap(), vec!["site"]);
+        assert!(!kv.hcreate_indexed(key, &second, index, "loser").await.unwrap());
+        assert_eq!(kv.smembers(index).await.unwrap(), vec!["site"]);
+        kv.del(key).await.unwrap();
+        kv.del(index).await.unwrap();
+        kv.set(index, "wrong-type").await.unwrap();
+        assert!(kv.hcreate_indexed(key, &first, index, "site").await.is_err());
+        assert!(!kv.exists(key).await.unwrap(), "index error must not leave an orphan hash");
+        kv.del(index).await.unwrap();
+
+        // A user allowed HSET but denied SADD used to leave an orphan hash.
+        // Exercise actual Redis ACL enforcement, not a mocked command error.
+        let user = format!("test-user-{}-{}", std::process::id(), now_ms());
+        kv.query::<()>(redis::cmd("ACL").arg("SETUSER").arg(&user)
+            .arg("on").arg(">test-password").arg("~*").arg("+@all").arg("-sadd").clone()).await.unwrap();
+        let client = redis::Client::open(std::env::var("CAP_TEST_REDIS_URL").unwrap()).unwrap();
+        let mut conn = ConnectionManager::new(client).await.unwrap();
+        redis::cmd("AUTH").arg(&user).arg("test-password").query_async::<()>(&mut conn).await.unwrap();
+        let limited = Kv { conn };
+        assert!(limited.hcreate_indexed(key, &first, index, "site").await.is_err());
+        assert!(!kv.exists(key).await.unwrap());
+        assert!(!kv.exists(index).await.unwrap());
+        // Denial of the other command likewise cannot register a stray member.
+        kv.query::<()>(redis::cmd("ACL").arg("SETUSER").arg(&user).arg("+sadd").arg("-hset").clone()).await.unwrap();
+        assert!(limited.hcreate_indexed(key, &first, index, "site").await.is_err());
+        assert!(!kv.exists(key).await.unwrap());
+        assert!(!kv.exists(index).await.unwrap());
+        kv.query::<()>(redis::cmd("ACL").arg("SETUSER").arg(&user).arg("+hset").arg("-hdel").clone()).await.unwrap();
+        kv.hset_pairs(name, &[("totpPending", "acl-pending".into())]).await.unwrap();
+        let before = kv.hgetall(name).await.unwrap();
+        assert!(limited.publish_totp(name, "acl-pending", "[]").await.is_err());
+        assert_eq!(kv.hgetall(name).await.unwrap(), before);
+        kv.del(name).await.unwrap();
+        kv.query::<i64>(redis::cmd("ACL").arg("DELUSER").arg(&user).clone()).await.unwrap();
     }
 }
 

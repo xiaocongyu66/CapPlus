@@ -367,7 +367,9 @@ pub(super) fn type_ok(v: Option<&Value>, kind: Kind) -> bool {
 }
 
 /// Port of `probeCompleteness`: the list of missing / malformed base fields
-/// (plus requested optional fields and a wrong `fontWidths` length).
+/// (plus malformed returned optional fields and a wrong `fontWidths` length).
+/// OPTIONAL_FIELD_TYPES is the single schema: requesting an API does not
+/// require the browser to provide it.
 pub fn probe_completeness(
     vector: &Value,
     font_stack_count: Option<usize>,
@@ -385,7 +387,9 @@ pub fn probe_completeness(
     }
     for name in optional_fields {
         if let Some((_, kind)) = OPTIONAL_FIELD_TYPES.iter().find(|(k, _)| k == name) {
-            if !type_ok(obj.get(name.as_str()), *kind) {
+            // Requested browser APIs may be unavailable. Absence is not an
+            // observation; a returned value must still have the declared type.
+            if obj.contains_key(name.as_str()) && !type_ok(obj.get(name.as_str()), *kind) {
                 bad.push(name.clone());
             }
         }
@@ -447,8 +451,8 @@ pub(crate) fn dep_field(id: &str) -> Option<&'static str> {
 }
 
 /// Port of `collectSignals`: flatten failed checks into a signal list, dropping
-/// failures whose backing optional field was never returned, and suppressing
-/// `probe_incomplete` entries caused only by absent optional probes.
+/// failures whose backing optional field was neither requested nor returned.
+/// Completeness already distinguishes unavailable APIs from malformed values.
 pub fn collect_signals(
     checks: &[Check],
     optional_fields: &[String],
@@ -463,22 +467,6 @@ pub fn collect_signals(
                 continue;
             }
         }
-        if c.id == "probe_incomplete" && !c.detail.is_empty() {
-            let rest = c
-                .detail
-                .strip_prefix("missing or malformed:")
-                .map(str::trim)
-                .unwrap_or(c.detail.as_str());
-            let real_missing = rest
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .filter(|f| !OPTIONAL_FIELD_NAMES.contains(f))
-                .count();
-            if real_missing == 0 {
-                continue;
-            }
-        }
         out.push(OwnedSignal {
             id: c.id.clone(),
             gating: c.gating,
@@ -490,6 +478,21 @@ pub fn collect_signals(
 // ---------------------------------------------------------------------------
 // detector
 // ---------------------------------------------------------------------------
+
+/// Copy only supported top-frame supplements, with detector input bounds.
+pub fn capture_top(top: &Value) -> Value {
+    let mut selected = Map::new();
+    if let Some(top) = top.as_object() {
+        for key in ALLOW_TOP {
+            if let Some(value) = top.get(*key) {
+                selected.insert((*key).to_string(), value.clone());
+            }
+        }
+    }
+    let mut vector = Value::Object(selected);
+    sanitize_vector(&mut vector);
+    vector
+}
 
 /// Merge allowlisted `top` supplements beneath the signed probe.
 pub(crate) fn merge_top(s: &Value) -> Option<Value> {

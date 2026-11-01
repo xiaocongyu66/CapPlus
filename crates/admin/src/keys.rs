@@ -516,52 +516,79 @@ pub(crate) async fn create(
     store: &AdminStore,
     body: &Value,
 ) -> crate::AdminResponse {
+    create_with_generator(store, body, || util::random_hex(5)).await
+}
+
+async fn create_with_generator(
+    store: &AdminStore,
+    body: &Value,
+    mut candidate: impl FnMut() -> String,
+) -> crate::AdminResponse {
     let config = match build_create_config(body) {
         Ok(c) => c,
         Err(e) => return bad_request(&e),
     };
 
-    // `random_hex(5)` is only 40 bits; regenerate rather than overwrite an
-    // existing key on a (rare) collision.
-    let site_key = loop {
-        let candidate = util::random_hex(5);
-        match store.exists(&format!("key:{candidate}")).await {
-            Ok(false) => break candidate,
-            Ok(true) => continue,
-            Err(_) => return internal(),
-        }
-    };
     let secret_key = format!("sk-{}", util::b64_strip(&util::random_bytes(32)));
     let jwt_secret = util::b64url_nopad(&util::random_bytes(32));
     let secret_hash = format!("sha256:{}", util::sha256_hex(&secret_key));
 
-    let name = body
-        .get("name")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| site_key.clone());
     let created = util::now_ms();
-
-    let pairs: [(&str, String); 5] = [
-        ("name", name),
-        ("secretHash", secret_hash),
-        ("jwtSecret", jwt_secret),
-        ("config", config.to_string()),
-        ("created", created.to_string()),
-    ];
-    if store
-        .hset_pairs(&format!("key:{site_key}"), &pairs)
-        .await
-        .is_err()
-    {
-        return internal();
+    // Check absence, create the hash, and register it atomically. Retry a
+    // collision without modifying the existing site's credentials or config.
+    loop {
+        let site_key = candidate();
+        let name = body
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&site_key)
+            .to_string();
+        let pairs = [
+            ("name", name),
+            ("secretHash", secret_hash.clone()),
+            ("jwtSecret", jwt_secret.clone()),
+            ("config", config.to_string()),
+            ("created", created.to_string()),
+        ];
+        match store.hcreate_indexed(&format!("key:{site_key}"), &pairs, "keys", &site_key).await {
+            Ok(true) => return ok(json!({ "siteKey": site_key, "secretKey": secret_key })),
+            Ok(false) => continue,
+            Err(_) => return internal(),
+        }
     }
-    if store.sadd("keys", &site_key).await.is_err() {
-        return internal();
-    }
+}
 
-    ok(json!({ "siteKey": site_key, "secretKey": secret_key }))
+#[cfg(test)]
+mod collision_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
+    async fn create_retries_collision_without_overwrite() {
+        let store = AdminStore::connect(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        let suffix = util::random_hex(16);
+        let old = format!("collision-old-{suffix}");
+        let new = format!("collision-new-{suffix}");
+        let mut first_candidate = Some(old.clone());
+        let first = create_with_generator(&store, &json!({}), || first_candidate.take().expect("unexpected collision")).await;
+        assert_eq!(first.status, 200);
+        let original = store.hgetall(&format!("key:{old}")).await.unwrap();
+        let mut candidates = [old.clone(), new.clone()].into_iter();
+        let next = create_with_generator(&store, &json!({}), || candidates.next().expect("candidates exhausted")).await;
+        assert_eq!(next.status, 200);
+        assert_eq!(next.body["siteKey"], new);
+        assert_eq!(store.hgetall(&format!("key:{old}")).await.unwrap(), original);
+        let created = store.hgetall(&format!("key:{new}")).await.unwrap();
+        assert_eq!(created["name"], new);
+        assert_eq!(created["secretHash"], format!("sha256:{}", util::sha256_hex(next.body["secretKey"].as_str().unwrap())));
+        let index = store.smembers("keys").await.unwrap();
+        assert!(index.contains(&old) && index.contains(&new));
+        for site in [&old, &new] {
+            store.del(&format!("key:{site}")).await.unwrap();
+            store.srem("keys", site).await.unwrap();
+        }
+    }
 }
 
 pub(crate) async fn update(

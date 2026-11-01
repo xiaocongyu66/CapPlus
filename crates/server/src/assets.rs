@@ -1,4 +1,4 @@
-//! Asset serving (published releases and the CDN cache) and the verified
+//! Asset serving (exclusive release or binary default) and the verified
 //! embed loader (`/embed.js` + the iframe page).
 
 use std::sync::Arc;
@@ -20,8 +20,17 @@ pub(crate) async fn asset_handler(
     Path(name): Path<String>,
     req_headers: HeaderMap,
 ) -> Response {
-    // A published release always wins over the CDN cache.
-    if let Some(file) = st.releases.get(&name) {
+    release_response(&st.releases, &name, &req_headers)
+}
+
+fn release_response(releases: &cap_assets::ReleaseStore, name: &str, req_headers: &HeaderMap) -> Response {
+    // Never mix an explicit release with cached CDN or other-version assets.
+    let file = match releases.resolve(name) {
+        Ok(Some(file)) => file,
+        Ok(None) => return (StatusCode::NOT_FOUND, "asset not found in selected release").into_response(),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "active asset configuration is unavailable").into_response(),
+    };
+    {
         let accepts_gzip = req_headers
             .get(header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok())
@@ -51,23 +60,36 @@ pub(crate) async fn asset_handler(
                 HeaderValue::from_static("gzip"),
             );
         }
-        return (StatusCode::OK, headers, body).into_response();
+        (StatusCode::OK, headers, body).into_response()
     }
-    let Some((bytes, content_type)) = st.assets.get(&name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            [("content-type", "text/plain; charset=utf-8")],
-            "asset not cached yet (set ENABLE_ASSETS_SERVER=true and wait for the first refresh)",
-        )
-            .into_response();
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600"),
-    );
-    (StatusCode::OK, headers, bytes).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asset_response_uses_one_source_and_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("cap-asset-route-{}", random_hex(16)));
+        let releases = cap_assets::ReleaseStore::open(&dir).unwrap();
+        releases.publish_builtin(crate::config::builtin_widget_zip(), "route-test").unwrap();
+        let headers = HeaderMap::new();
+        for name in ["widget.js", "cap_wasm_bg.wasm", "hashwx.wasm"] {
+            assert_eq!(release_response(&releases, name, &headers).status(), StatusCode::OK, "{name}");
+        }
+        assert_eq!(release_response(&releases, "absent.wasm", &headers).status(), StatusCode::NOT_FOUND);
+        // A configured partial release must not borrow widget.js from builtin.
+        std::fs::create_dir_all(dir.join("releases/test-partial/dist")).unwrap();
+        std::fs::write(dir.join("releases/test-partial/dist/only.txt"), b"only").unwrap();
+        releases.activate("test-partial").unwrap();
+        assert_eq!(release_response(&releases, "widget.js", &headers).status(), StatusCode::NOT_FOUND);
+        assert_eq!(release_response(&releases, "only.txt", &headers).status(), StatusCode::OK);
+        std::fs::write(dir.join("releases/active"), "missing-release").unwrap();
+        let broken = cap_assets::ReleaseStore::open(&dir).unwrap();
+        broken.publish_builtin(crate::config::builtin_widget_zip(), "route-test").unwrap();
+        assert_eq!(release_response(&broken, "widget.js", &headers).status(), StatusCode::SERVICE_UNAVAILABLE);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 pub(crate) async fn embed_js() -> Response {

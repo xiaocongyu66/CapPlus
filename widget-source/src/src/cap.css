@@ -15,7 +15,7 @@
 }
 
 /* Explicit page choice always wins over the default. */
-:host([data-cap-theme="light"]) {
+:host([data-cap-resolved-theme="light"]) {
   --cap-bg: #fdfdfd;
   --cap-fg: #212121;
   --cap-border: #dddddd8f;
@@ -27,7 +27,7 @@
   --cap-troubleshoot: #0050a0;
 }
 
-:host([data-cap-theme="dark"]) {
+:host([data-cap-resolved-theme="dark"]) {
   --cap-bg: #17181c;
   --cap-fg: #f2f3f5;
   --cap-border: #ffffff26;

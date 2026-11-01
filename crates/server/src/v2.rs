@@ -159,16 +159,20 @@ pub fn instrumentation_challenge(
     (payload, meta)
 }
 
-/// Verify a v2 solution list against the sealed expectations. Supports the
-/// `rsw` protocol; unknown protocols fail closed.
-pub fn verify_solutions(expected: &Value, solutions: &[Value]) -> Result<(), String> {
-    // JS seals `{ expected: [...] }`; older Rust builds sealed a bare array.
-    // Accept both so a challenge minted by either side still redeems.
-    let expected = expected
+/// JS seals `{ expected: [...] }`; older Rust builds sealed a bare array.
+/// All expectation consumers must use the same envelope interpretation.
+pub fn expected_entries(expected: &Value) -> Result<&[Value], String> {
+    expected
         .get("expected")
         .unwrap_or(expected)
         .as_array()
-        .ok_or_else(|| "invalid_expected".to_string())?;
+        .map(Vec::as_slice)
+        .ok_or_else(|| "invalid_expected".to_string())
+}
+
+/// Verify a v2 solution list; unknown protocols fail closed.
+pub fn verify_solutions(expected: &Value, solutions: &[Value]) -> Result<(), String> {
+    let expected = expected_entries(expected)?;
     if expected.len() != solutions.len() {
         return Err("invalid_solutions".into());
     }
@@ -267,6 +271,13 @@ pub fn verify_instr(meta: &Value, instr: &Value) -> Result<(), String> {
     if ts < iat - 5_000 || ts > now + 120_000 {
         return Err("instr_ts_invalid".into());
     }
+    // Structure is a protocol requirement, not a trust-score penalty. Check
+    // the raw probe before sanitizing/merging top-frame data. Optional APIs
+    // may be unavailable, even when extendedFields requested them.
+    let p = instr.get("p").ok_or_else(|| "instr_probe_missing".to_string())?;
+    if !cap_detect::probe_completeness(p, Some(cap_detect::PROBE_FONT_STACK_COUNT), &[]).is_empty() {
+        return Err("instr_probe_invalid".into());
+    }
     Ok(())
 }
 
@@ -276,37 +287,28 @@ pub struct ProbeCapture {
     pub optional_fields: Vec<String>,
 }
 
+/// Call only after verify_instr: the MAC covers raw p, not sibling top.
+/// Detection applies its shared top allowlist and gives signed base fields priority.
+pub fn capture_instr(meta: &Value, instr: &Value) -> Option<ProbeCapture> {
+    let mut p = instr.get("p")?.as_object()?.clone();
+    if let Some(top) = instr.get("top").filter(|t| t.is_object()) {
+        p.insert("top".into(), cap_detect::probes::capture_top(top));
+    }
+    let optional_fields = meta.get("extendedFields").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    Some(ProbeCapture { p: Value::Object(p), optional_fields })
+}
+
 pub fn take_probe(expected: &Value, solutions: &[Value]) -> Option<ProbeCapture> {
-    let expected = expected.as_array()?;
+    let expected = expected_entries(expected).ok()?;
     for (idx, exp) in expected.iter().enumerate() {
         if exp.get("protocol").and_then(Value::as_str) != Some("instrumentation") {
             continue;
         }
         let sol = solutions.get(idx)?;
         let instr = sol.get("instr")?;
-        let p = instr.get("p")?.clone();
-        // `top` supplements (canvas/WebGL/automationGlobals measured in the top
-        // document) live next to `p` on the solution; detect merges them.
-        let mut vector = p;
-        if let Some(top) = instr.get("top") {
-            if vector.is_object() {
-                vector["top"] = top.clone();
-            }
-        }
-        let optional_fields = exp
-            .get("instrMeta")
-            .and_then(|m| m.get("extendedFields"))
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        return Some(ProbeCapture {
-            p: vector,
-            optional_fields,
-        });
+        return capture_instr(exp.get("instrMeta")?, instr);
     }
     None
 }
@@ -314,6 +316,156 @@ pub fn take_probe(expected: &Value, solutions: &[Value]) -> Option<ProbeCapture>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_probe() -> Value {
+        json!({
+            "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "productSub": "20030107", "oscpu": "__undefined",
+            "uaDataPresent": false, "uaData": null,
+            "plugins": {"length": 5}, "engine": {"hasChrome": false, "hasMozInnerScreenX": false},
+            "screen": {"width": 1440, "height": 900}, "outerWH": [1440, 900],
+            "isExtended": null, "tamper": null,
+            "fontWidths": (0..cap_detect::PROBE_FONT_STACK_COUNT).map(|i| 1200.25 + i as f64).collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn sealed_instrumentation_requires_valid_probe_in_both_protocols() {
+        let meta = json!({"id":"test", "vars":["a"], "expectedVals":[7], "iat":now_ms(),
+            "extendedFields":["webgl", "canvas", "webgpu"]});
+        let expected = json!({"expected":[{"protocol":"instrumentation", "instrMeta":meta}]});
+        let blob = encrypt_gcm(&expected, "secret", INFO_FMT2).unwrap();
+        let wrapped = decrypt_gcm(&blob, "secret", INFO_FMT2).unwrap();
+        let bare = wrapped["expected"].clone();
+        let instr = json!({"i":"test", "state":{"a":7}, "ts":now_ms(), "p":valid_probe()});
+        assert!(verify_instr(&meta, &instr).is_ok()); // v1 ei path
+        for expected in [&wrapped, &bare] {
+            let sols = [json!({"instr":instr})];
+            assert!(verify_solutions(expected, &sols).is_ok());
+            assert_eq!(take_probe(expected, &sols).unwrap().p, instr["p"]);
+            for bad in [None, Some(json!({})), Some(Value::Null), Some(json!([])), Some(json!("bad"))] {
+                let mut malformed = instr.clone();
+                match bad {
+                    None => { malformed.as_object_mut().unwrap().remove("p"); }
+                    Some(p) => malformed["p"] = p,
+                }
+                assert!(verify_instr(&meta, &malformed).is_err());
+                assert!(verify_solutions(expected, &[json!({"instr":malformed})]).is_err());
+            }
+            for name in valid_probe().as_object().unwrap().keys() {
+                let mut missing = instr.clone();
+                missing["p"].as_object_mut().unwrap().remove(name);
+                assert!(verify_instr(&meta, &missing).is_err(), "missing {name}");
+                assert!(verify_solutions(expected, &[json!({"instr":missing})]).is_err());
+                let mut wrong = instr.clone();
+                wrong["p"][name] = json!(42);
+                assert!(verify_instr(&meta, &wrong).is_err(), "wrong type {name}");
+                assert!(verify_solutions(expected, &[json!({"instr":wrong})]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_verified_probe_reaches_detection_and_honeypot_denies() {
+        let meta = json!({"id":"test", "vars":[], "expectedVals":[], "iat":now_ms()});
+        let expected = json!({"expected":[{"protocol":"instrumentation", "instrMeta":meta}]});
+        let sols = [json!({"instr":{"i":"test", "state":{}, "ts":now_ms(), "p":valid_probe()}})];
+        verify_solutions(&expected, &sols).unwrap();
+        let captured = take_probe(&expected, &sols).unwrap();
+        let outcome = cap_detect::detect_automation(&captured.p, &cap_detect::DetectOpts {
+            font_stack_count: Some(cap_detect::PROBE_FONT_STACK_COUNT),
+            optional_fields: &captured.optional_fields, accept_language: None,
+        });
+        assert!(outcome.pass, "{:?}", outcome.blocked_by);
+        let mut signals: Vec<_> = outcome.signals.iter().map(|s| s.as_signal()).collect();
+        let clean = cap_detect::compute_trust_signals(&signals, None, Some(outcome.pass));
+        assert_eq!(cap_detect::trust_action(&clean), cap_detect::Action::Allow);
+        signals.push(cap_detect::Signal::gating("honeypot_triggered"));
+        let trapped = cap_detect::compute_trust_signals(&signals, None, Some(outcome.pass));
+        assert_eq!(cap_detect::trust_action(&trapped), cap_detect::Action::Deny);
+    }
+
+    fn signed_instr(meta: &Value, p: Value) -> Value {
+        let mut instr = json!({"i":"test", "state":{"a":7}, "ts":now_ms(), "p":p});
+        // Same canonical message and ASCII hex-key encoding as the JS producer.
+        let message = format!("cap-instr|test|{}|{}|{}", instr["ts"],
+            cap_instr::js_stringify(&instr["state"]), cap_instr::js_stringify(&instr["p"]));
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(meta["macKey"].as_str().unwrap().as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        instr["mac"] = json!(mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>());
+        instr
+    }
+
+    fn verified_outcome(meta: &Value, instr: &Value, v2: bool) -> cap_detect::DetectOutcome {
+        let captured = if v2 {
+            let expected = json!({"expected":[{"protocol":"instrumentation", "instrMeta":meta}]});
+            let sealed = encrypt_gcm(&expected, "secret", INFO_FMT2).unwrap();
+            let expected = decrypt_gcm(&sealed, "secret", INFO_FMT2).unwrap();
+            let sols = [json!({"instr":instr})];
+            verify_solutions(&expected, &sols).unwrap();
+            take_probe(&expected, &sols).unwrap()
+        } else {
+            verify_instr(meta, instr).unwrap();
+            capture_instr(meta, instr).unwrap()
+        };
+        cap_detect::detect_automation(&captured.p, &cap_detect::DetectOpts {
+            font_stack_count: Some(cap_detect::PROBE_FONT_STACK_COUNT),
+            optional_fields: &captured.optional_fields, accept_language: None,
+        })
+    }
+
+    fn action(outcome: &cap_detect::DetectOutcome) -> cap_detect::Action {
+        let signals: Vec<_> = outcome.signals.iter().map(|s| s.as_signal()).collect();
+        cap_detect::trust_action(&cap_detect::compute_trust_signals(&signals, None, Some(outcome.pass)))
+    }
+
+    #[test]
+    fn signed_optional_absence_and_observations_follow_complete_pipeline() {
+        let meta = json!({"id":"test", "vars":["a"], "expectedVals":[7], "iat":now_ms(),
+            "macKey":"0123456789abcdef0123456789abcdef",
+            "extendedFields":["workerUA", "storageQuota", "webgl", "cdp", "evalShape", "webgpu"]});
+        for v2 in [false, true] {
+            let instr = signed_instr(&meta, valid_probe());
+            let clean = verified_outcome(&meta, &instr, v2);
+            assert!(clean.pass, "{:?}", clean.blocked_by);
+            assert_eq!(action(&clean), cap_detect::Action::Allow);
+            for (field, value, signal) in [
+                ("workerUA", json!("different UA"), "worker_ua_mismatch"),
+                ("storageQuota", json!(1024), "storage_quota_tiny"),
+                ("webgl", json!({"ok":true,"renderer":"SwiftShader"}), "webgl_software_renderer"),
+            ] {
+                let mut probe = valid_probe();
+                probe[field] = value;
+                let observed = verified_outcome(&meta, &signed_instr(&meta, probe), v2);
+                assert!(observed.signals.iter().any(|s| s.id == signal), "{field}: {:?}", observed.signals);
+                if field == "workerUA" {
+                    assert_eq!(action(&observed), cap_detect::Action::Deny);
+                } else {
+                    // Quota/render observations remain scored signals, not
+                    // automatic protocol errors merely because an API exists.
+                    let signals: Vec<_> = observed.signals.iter().map(|s| s.as_signal()).collect();
+                    let trust = cap_detect::compute_trust_signals(&signals, None, Some(observed.pass));
+                    assert!(trust.score < 100);
+                    assert_eq!(action(&observed), cap_detect::trust_action(&trust));
+                }
+            }
+            let mut wrong = valid_probe();
+            wrong["ua"] = json!(42);
+            assert_eq!(verify_instr(&meta, &signed_instr(&meta, wrong)), Err("instr_probe_invalid".into()));
+            let mut tampered = instr.clone();
+            tampered["p"]["ua"] = json!("changed after signing");
+            assert_eq!(verify_instr(&meta, &tampered), Err("instr_mac_mismatch".into()));
+            let mut top = instr.clone();
+            top["top"] = json!({"automationGlobals":["__playwright__binding__"], "ua":"ignored", "webdriver":true});
+            let capture = capture_instr(&meta, &top).unwrap();
+            assert!(capture.p["top"].get("ua").is_none());
+            assert!(capture.p["top"].get("webdriver").is_none());
+            let trapped = verified_outcome(&meta, &top, v2);
+            assert!(trapped.blocked_by.iter().any(|s| s == "automation_globals_main"));
+            assert_eq!(action(&trapped), cap_detect::Action::Deny);
+            assert_eq!(top["p"], instr["p"]); // capture never mutates MAC input
+        }
+    }
 
     #[test]
     fn gcm_roundtrip_matches_js_layout() {

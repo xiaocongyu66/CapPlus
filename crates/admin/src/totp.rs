@@ -5,6 +5,8 @@
 //! - `totpPending` secret awaiting confirmation (setup started, not enabled)
 //! - `totpEnabled` `"true"` once the first code checks out
 //! - `recovery`    JSON array of argon2 hashes (single use)
+//! - `recoveryVersion` `"1"` only for freshly published atomic-consumption sets;
+//!   missing/older versions cannot authenticate (normal TOTP remains valid).
 
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
@@ -94,6 +96,8 @@ pub(crate) async fn status(store: &AdminStore) -> Value {
     json!({
         "enabled": h.get("totpEnabled").map(|v| v == "true").unwrap_or(false),
         "pending": h.contains_key("totpPending"),
+        "recoveryRegenerationRequired": h.get("totpEnabled").map(String::as_str) == Some("true")
+            && h.get("recoveryVersion").map(String::as_str) != Some("1"),
         "recoveryCodes": h
             .get("recovery")
             .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
@@ -138,18 +142,12 @@ pub(crate) async fn enable(store: &AdminStore, body: &Value) -> crate::AdminResp
         }
     }
 
-    let pairs = [
-        ("totpSecret", pending),
-        ("totpEnabled", "true".to_string()),
-        (
-            "recovery",
-            serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into()),
-        ),
-    ];
-    if store.hset_pairs(TWOFA_KEY, &pairs).await.is_err() {
-        return internal();
+    let recovery = serde_json::to_string(&hashes).expect("string hashes serialize");
+    match store.publish_totp(TWOFA_KEY, &pending, &recovery).await {
+        Ok(true) => {}
+        Ok(false) => return bad_request("Two-factor setup changed; start again"),
+        Err(_) => return internal(),
     }
-    let _ = store.hdel_fields(TWOFA_KEY, &["totpPending"]).await;
 
     ok(json!({ "success": true, "recoveryCodes": codes }))
 }
@@ -169,7 +167,7 @@ pub(crate) async fn disable(
         return resp(401, json!({ "success": false, "error": "Incorrect admin key" }));
     }
     if store
-        .hdel_fields(TWOFA_KEY, &["totpSecret", "totpEnabled", "recovery", "totpPending"])
+        .hdel_fields(TWOFA_KEY, &["totpSecret", "totpEnabled", "recovery", "totpPending", "recoveryVersion"])
         .await
         .is_err()
     {
@@ -183,8 +181,16 @@ pub(crate) async fn check_second_factor(
     store: &AdminStore,
     body: &Value,
 ) -> Result<bool, crate::AdminResponse> {
+    check_second_factor_at(store, body, TWOFA_KEY).await
+}
+
+async fn check_second_factor_at(
+    store: &AdminStore,
+    body: &Value,
+    name: &str,
+) -> Result<bool, crate::AdminResponse> {
     // A storage error must not silently skip the second factor.
-    let h = match store.hgetall(TWOFA_KEY).await {
+    let h = match store.hgetall(name).await {
         Ok(h) => h,
         Err(_) => return Err(crate::internal()),
     };
@@ -216,49 +222,23 @@ pub(crate) async fn check_second_factor(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        let mut hashes: Vec<String> = h
+        let hashes: Vec<String> = h
             .get("recovery")
             .and_then(|v| serde_json::from_str(v).ok())
             .unwrap_or_default();
-        let mut found = None;
-        for (i, h) in hashes.iter().enumerate() {
-            if util::argon2_verify_async(code, h).await {
-                found = Some(i);
-                break;
+        if let Some(secret) = h.get("totpSecret") {
+            for hash in &hashes {
+                if util::argon2_verify_async(code, hash).await {
+                    // Argon runs outside Redis; consume only if the hash is
+                    // still present in the current configuration. Never write
+                    // this snapshot back over another login or a rotation.
+                    match store.consume_recovery_hash(name, secret, hash).await {
+                        Ok(true) => return Ok(true),
+                        Ok(false) => break,
+                        Err(_) => return Err(internal()),
+                    }
+                }
             }
-        }
-        if let Some(pos) = found {
-            // Consume atomically: the read-modify-write below is not, so two
-            // concurrent logins with the same code would both succeed.
-            let used_key = format!("2fa:recovery-used:{}", hashes[pos]);
-            let claimed = store
-                .set_nx_ex(&used_key, "1", 30 * 24 * 60 * 60)
-                .await
-                .unwrap_or(false);
-            if !claimed {
-                return Err(resp(
-                    401,
-                    json!({ "success": false, "twofa": true, "error": "Invalid recovery code" }),
-                ));
-            }
-            hashes.remove(pos);
-            // The NX marker above already stops reuse; if removing the code
-            // from the list fails, refuse the login rather than leave a code
-            // that works again once the marker expires.
-            if store
-                .hset_pairs(
-                    TWOFA_KEY,
-                    &[(
-                        "recovery",
-                        serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into()),
-                    )],
-                )
-                .await
-                .is_err()
-            {
-                return Err(internal());
-            }
-            return Ok(true);
         }
         return Err(resp(
             401,
@@ -275,6 +255,43 @@ pub(crate) async fn check_second_factor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
+    async fn recovery_login_concurrency() {
+        let store = AdminStore::connect(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        let name = &format!("test:2fa:{}", util::random_hex(16));
+        let a = util::argon2_hash_async("recovery-a").await.unwrap();
+        let b = util::argon2_hash_async("recovery-b").await.unwrap();
+        store.hset_pairs(name, &[
+            ("totpEnabled", "true".into()),
+            ("totpSecret", new_secret()),
+            ("recoveryVersion", "1".into()),
+            ("recovery", serde_json::to_string(&[&a, &b]).unwrap()),
+        ]).await.unwrap();
+        let body_a = json!({"recovery": "recovery-a"});
+        let body_b = json!({"recovery": "recovery-b"});
+        let (one, two) = tokio::join!(check_second_factor_at(&store, &body_a, name), check_second_factor_at(&store, &body_b, name));
+        assert!(matches!(one, Ok(true)) && matches!(two, Ok(true)));
+        assert_eq!(store.hget(name, "recovery").await.unwrap().as_deref(), Some("[]"));
+        assert!(check_second_factor_at(&store, &body_a, name).await.is_err());
+        assert!(check_second_factor_at(&store, &body_b, name).await.is_err());
+        store.hset_pairs(name, &[("recovery", serde_json::to_string(&[&a]).unwrap())]).await.unwrap();
+        let (one, two) = tokio::join!(check_second_factor_at(&store, &body_a, name), check_second_factor_at(&store, &body_a, name));
+        assert_ne!(matches!(one, Ok(true)), matches!(two, Ok(true)));
+        assert_eq!(store.hget(name, "recovery").await.unwrap().as_deref(), Some("[]"));
+        // Legacy recovery is refused independently of markers, while ordinary
+        // TOTP still works, allowing authenticated users to regenerate codes.
+        store.hdel_fields(name, &["recoveryVersion"]).await.unwrap();
+        store.hset_pairs(name, &[("recovery", serde_json::to_string(&[&a]).unwrap())]).await.unwrap();
+        assert!(check_second_factor_at(&store, &body_a, name).await.is_err());
+        let secret = store.hget(name, "totpSecret").await.unwrap().unwrap();
+        let counter = (util::now_secs() / STEP).max(0) as u64;
+        let totp = json!({"code": hotp(&secret, counter).unwrap()});
+        assert!(matches!(check_second_factor_at(&store, &totp, name).await, Ok(true)));
+        store.del(&format!("2fa:totp-used:{counter}")).await.unwrap();
+        store.del(name).await.unwrap();
+    }
 
     #[test]
     fn rfc6238_vector() {

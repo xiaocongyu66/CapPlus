@@ -1,7 +1,7 @@
 //! Small HTTP helpers: client IP resolution, origin checks, UA parsing and
 //! path/CIDR matching. Pure functions plus a couple of config reads.
 
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use cap_store::KeyConfig;
 
@@ -34,10 +34,17 @@ pub(crate) fn is_loopback_or_private(addr: &str) -> bool {
 
 pub(crate) fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
     let cfg = settings();
-    if !cfg.trust_proxy {
+    proxy_trusted_with(headers, peer, cfg.trust_proxy, &cfg.proxy_secret)
+}
+
+fn proxy_trusted_with(headers: &HeaderMap, peer: &str, enabled: bool, secret: &str) -> bool {
+    if !enabled {
         return false;
     }
-    match Some(cfg.proxy_secret.as_str()) {
+    if headers.get_all("x-cap-proxy-secret").iter().count() > 1 {
+        return false;
+    }
+    match Some(secret) {
         Some(secret) if !secret.is_empty() => headers
             .get("x-cap-proxy-secret")
             .and_then(|v| v.to_str().ok())
@@ -47,7 +54,10 @@ pub(crate) fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
                 // depend on how much of the secret matched.
                 let a = Sha256::digest(v.as_bytes());
                 let b = Sha256::digest(secret.as_bytes());
-                a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+                a.iter()
+                    .zip(b.iter())
+                    .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                    == 0
             })
             .unwrap_or(false),
         _ => is_loopback_or_private(peer),
@@ -55,9 +65,8 @@ pub(crate) fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
 }
 
 /// Protocol-layer fingerprint forwarded by the trusted proxy: JA3/JA4, HTTP/2
-/// SETTINGS class and whether TLS was used. Unlike anything the client
-/// reports, these come from the connection the proxy actually terminated, so
-/// a scripted client cannot claim a browser fingerprint it does not have.
+/// SETTINGS class and whether TLS was used. These are authenticated proxy
+/// observations, not proof of browser identity: clients can imitate TLS stacks.
 ///
 /// Header contract (both required, signature = hex HMAC-SHA256 of the raw
 /// value with `CAP_PROXY_SECRET`):
@@ -69,20 +78,47 @@ const NET_FP_SIG_HEADER: &str = "x-cap-net-fp-sig";
 /// Bound the value before hashing; a real fingerprint is well under this.
 const NET_FP_MAX_LEN: usize = 512;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NetworkSignalError {
+    Required,
+    Invalid,
+}
+
 pub(crate) fn network_signals(
     headers: &HeaderMap,
     peer: &str,
-) -> Option<cap_detect::NetworkSignals> {
+) -> Result<Option<cap_detect::NetworkSignals>, NetworkSignalError> {
     let cfg = settings();
-    if !proxy_trusted(headers, peer) {
-        return None;
+    network_signals_with(
+        headers,
+        proxy_trusted(headers, peer),
+        &cfg.proxy_secret,
+        cfg.require_network_fingerprint,
+    )
+}
+
+fn network_signals_with(
+    headers: &HeaderMap,
+    trusted: bool,
+    secret: &str,
+    required: bool,
+) -> Result<Option<cap_detect::NetworkSignals>, NetworkSignalError> {
+    if !trusted {
+        return if required {
+            Err(NetworkSignalError::Required)
+        } else {
+            Ok(None)
+        };
     }
-    // Without a shared secret there is no way to tell the proxy's headers
-    // from a client's, so no network signals are derived at all.
-    if cfg.proxy_secret.is_empty() {
-        return None;
+    // Invalid evidence must never be replaced by a TLS-only fallback, even
+    // when fingerprint enforcement is optional.
+    let mut net = parse_signed_network_fp(headers, secret)?;
+    if required && net.is_none() {
+        return Err(NetworkSignalError::Required);
     }
-    let mut net = parse_signed_network_fp(headers, &cfg.proxy_secret);
+    if secret.is_empty() {
+        return Ok(None);
+    }
     // Caddy and Traefik do not compute JA3/JA4 themselves, but both set
     // `X-Forwarded-Proto`; that alone proves whether the hop the proxy
     // terminated was TLS. Explicit fields from a signed fingerprint win.
@@ -101,31 +137,32 @@ pub(crate) fn network_signals(
             }
         }
     }
-    net
+    Ok(net)
 }
 
-/// Signature + parse only; the caller decides whether the sender is trusted.
+/// None means both headers are absent; partial or malformed evidence is Err.
 fn parse_signed_network_fp(
     headers: &HeaderMap,
     secret: &str,
-) -> Option<cap_detect::NetworkSignals> {
-    // A proxy that appends instead of overwriting would let a client prepend
-    // an unsigned header and shadow the real one; with duplicates, trust none.
+) -> Result<Option<cap_detect::NetworkSignals>, NetworkSignalError> {
+    use NetworkSignalError::Invalid;
     let mut values = headers.get_all(NET_FP_HEADER).iter();
-    let raw = values.next()?.to_str().ok()?;
-    if values.next().is_some() {
-        return None;
-    }
-    if raw.is_empty() || raw.len() > NET_FP_MAX_LEN || secret.is_empty() {
-        return None;
-    }
     let mut sigs = headers.get_all(NET_FP_SIG_HEADER).iter();
-    let sig = sigs.next()?.to_str().ok()?.trim();
-    if sigs.next().is_some() {
-        return None;
+    let (raw, sig) = match (values.next(), sigs.next()) {
+        (None, None) => return Ok(None),
+        (Some(raw), Some(sig)) => (raw, sig),
+        _ => return Err(Invalid),
+    };
+    if values.next().is_some() || sigs.next().is_some() {
+        return Err(Invalid);
+    }
+    let raw = raw.to_str().map_err(|_| Invalid)?;
+    let sig = sig.to_str().map_err(|_| Invalid)?;
+    if raw.is_empty() || raw.len() > NET_FP_MAX_LEN || secret.is_empty() {
+        return Err(Invalid);
     }
     if sig.len() != 64 || !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
+        return Err(Invalid);
     }
     let expected = hex_hmac_sha256(secret, raw);
     // Fixed-length hex, compared without early exit.
@@ -133,12 +170,44 @@ fn parse_signed_network_fp(
         .as_bytes()
         .iter()
         .zip(sig.as_bytes())
-        .fold(0u8, |acc, (a, b)| acc | (a.to_ascii_lowercase() ^ b.to_ascii_lowercase()))
+        .fold(0u8, |acc, (a, b)| {
+            acc | (a.to_ascii_lowercase() ^ b.to_ascii_lowercase())
+        })
         == 0;
     if !ok {
-        return None;
+        return Err(Invalid);
     }
-    serde_json::from_str(raw).ok()
+    // Deserialize directly into a strict wire type: duplicate fields, unknown
+    // fields, nulls, non-booleans and empty objects are not observations.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Wire {
+        #[serde(default, deserialize_with = "present_bool")]
+        tls: Option<bool>,
+        #[serde(default, deserialize_with = "present_bool")]
+        ja3_browser: Option<bool>,
+        #[serde(default, deserialize_with = "present_bool")]
+        ja4_browser: Option<bool>,
+        #[serde(default, deserialize_with = "present_bool")]
+        http2_browser: Option<bool>,
+        #[serde(default, deserialize_with = "present_bool")]
+        ua_mismatch: Option<bool>,
+    }
+    fn present_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+        <bool as serde::Deserialize>::deserialize(d).map(Some)
+    }
+    let w: Wire = serde_json::from_str(raw).map_err(|_| Invalid)?;
+    let net = cap_detect::NetworkSignals {
+        tls: w.tls,
+        ja3_browser: w.ja3_browser,
+        ja4_browser: w.ja4_browser,
+        http2_browser: w.http2_browser,
+        ua_mismatch: w.ua_mismatch,
+    };
+    if net == cap_detect::NetworkSignals::default() {
+        return Err(Invalid);
+    }
+    Ok(Some(net))
 }
 
 /// Transport security of the hop the proxy terminated, from the rightmost
@@ -146,12 +215,23 @@ fn parse_signed_network_fp(
 /// taking the left value would let a client prepend `https` and suppress the
 /// `tls_missing` signal.
 fn forwarded_tls(headers: &HeaderMap) -> Option<bool> {
-    let proto = headers.get("x-forwarded-proto")?.to_str().ok()?;
-    proto
+    let proto = headers
+        .get_all("x-forwarded-proto")
+        .iter()
+        .last()?
+        .to_str()
+        .ok()?;
+    match proto
         .rsplit(',')
-        .map(str::trim)
-        .find(|p| !p.is_empty())
-        .map(|p| p.eq_ignore_ascii_case("https"))
+        .next()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "https" => Some(true),
+        "http" => Some(false),
+        _ => None,
+    }
 }
 
 fn hex_hmac_sha256(secret: &str, msg: &str) -> String {
@@ -173,43 +253,75 @@ pub(crate) fn client_ip(headers: &HeaderMap, peer: &str) -> String {
     // the operator declares a trusted proxy (CAP_TRUST_PROXY=true); otherwise
     // the peer address wins, so a client cannot spoof an IP to dodge the
     // limiter or the blocklist.
-    if !proxy_trusted(headers, peer) {
-        return peer.to_string();
+    client_ip_with(
+        headers,
+        peer,
+        proxy_trusted(headers, peer),
+        &settings().ip_header,
+        &settings().trusted_proxy_cidrs,
+    )
+}
+
+pub(crate) fn canonical_ip(value: &str) -> Option<String> {
+    use std::net::IpAddr;
+    value.parse::<IpAddr>().ok().map(|ip| {
+        match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            _ => ip,
+        }
+        .to_string()
+    })
+}
+
+fn client_ip_with(
+    headers: &HeaderMap,
+    peer: &str,
+    trusted: bool,
+    configured: &str,
+    cidrs: &[String],
+) -> String {
+    let fallback = || canonical_ip(peer).unwrap_or_else(|| peer.to_string());
+    if !trusted {
+        return fallback();
     }
-    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let configured = settings().ip_header.clone();
+    // Repeated field lines form one ordered list; malformed lines fail closed.
+    let get = |name: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().ok())
+            .collect::<Option<Vec<_>>>()
+            .map(|values| values.join(","))
+    };
     if !configured.is_empty() {
         // An explicitly configured header is the only source: falling through
         // to XFF would let a client supply the address when the header is
         // absent.
-        return get(configured.as_str())
-            .and_then(forwarded_client)
-            .unwrap_or_else(|| peer.to_string());
+        return get(configured)
+            .and_then(|v| forwarded_client(&v, cidrs))
+            .unwrap_or_else(fallback);
     }
     // X-Forwarded-For is the only default source: Caddy and Traefik set it,
     // while they neither set nor strip `CF-Connecting-IP` / `X-Real-IP`, so
     // trusting those implicitly lets any client claim an arbitrary address.
     // Operators behind Cloudflare can opt in via `RATELIMIT_IP_HEADER`.
     get("x-forwarded-for")
-        .and_then(forwarded_client)
-        .unwrap_or_else(|| peer.to_string())
+        .and_then(|v| forwarded_client(&v, cidrs))
+        .unwrap_or_else(fallback)
 }
 
-/// Pick the client from a forwarded list. Proxies append, so everything left
-/// of the last hop the operator controls is attacker-supplied: walk from the
-/// right and take the first address that is not one of our (private) proxies.
-fn forwarded_client(v: &str) -> Option<String> {
-    let hops: Vec<&str> = v
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
-    hops.iter()
-        .rev()
-        .find(|h| !is_loopback_or_private(h))
-        .or_else(|| hops.first())
-        .filter(|h| h.parse::<std::net::IpAddr>().is_ok())
-        .map(|h| h.to_string())
+/// Default: only the appended rightmost client is authoritative, including
+/// private clients. Walk further left only across explicitly trusted CIDRs.
+/// An invalid/empty hop terminates resolution, never exposing a spoofed left hop.
+fn forwarded_client(v: &str, cidrs: &[String]) -> Option<String> {
+    let mut hops = v.rsplit(',').peekable();
+    while let Some(hop) = hops.next() {
+        let ip = canonical_ip(hop.trim())?;
+        if hops.peek().is_none() || !cidrs.iter().any(|net| cidr_match(net, &ip)) {
+            return Some(ip);
+        }
+    }
+    None
 }
 
 pub(crate) fn header_str(headers: &HeaderMap, name: &str) -> String {
@@ -256,7 +368,10 @@ pub(crate) fn html_response(status: StatusCode, csp: Option<&str>, body: String)
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     if let Some(csp) = csp {
         if let Ok(v) = HeaderValue::from_str(csp) {
             headers.insert("content-security-policy", v);
@@ -285,9 +400,7 @@ pub(crate) fn parse_ua(ua: &str) -> (Option<&'static str>, Option<&'static str>)
     } else {
         None
     };
-    let platform = if ua.contains("iPhone")
-        || (ua.contains("Android") && ua.contains("Mobile"))
-    {
+    let platform = if ua.contains("iPhone") || (ua.contains("Android") && ua.contains("Mobile")) {
         Some("Phone")
     } else if ua.contains("iPad")
         || (ua.contains("Android") && !ua.contains("Mobile"))
@@ -323,15 +436,22 @@ pub(crate) fn cidr_match(net: &str, ip: &str) -> bool {
     match (base, ip) {
         (IpAddr::V4(base), IpAddr::V4(ip)) => {
             let prefix = prefix.unwrap_or(32);
-            if prefix > 32 { return false; }
+            if prefix > 32 {
+                return false;
+            }
             let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
             (u32::from(base) & mask) == (u32::from(ip) & mask)
         }
         (IpAddr::V6(base), IpAddr::V6(ip)) => {
             let prefix = prefix.unwrap_or(128);
-            if prefix > 128 { return false; }
+            if prefix > 128 {
+                return false;
+            }
             let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
             (u128::from(base) & mask) == (u128::from(ip) & mask)
+        }
+        (IpAddr::V6(base), IpAddr::V4(ip)) if base.to_ipv4_mapped().is_some() => {
+            cidr_match(net, &ip.to_ipv6_mapped().to_string())
         }
         (IpAddr::V4(_), IpAddr::V6(ip)) => ip
             .to_ipv4_mapped()
@@ -353,6 +473,7 @@ mod tests {
             ("::/0", "fd00::1"),
             ("2001:db8::1/128", "2001:0db8:0:0:0:0:0:1"),
             ("192.0.2.0/24", "::ffff:192.0.2.42"),
+            ("::ffff:192.0.2.0/120", "192.0.2.42"),
         ] {
             assert!(cidr_match(net, ip), "{net} {ip}");
         }
@@ -381,7 +502,9 @@ mod tests {
             }
             h
         };
-        let got = parse_signed_network_fp(&hdr(body, Some(&sig)), secret).unwrap();
+        let got = parse_signed_network_fp(&hdr(body, Some(&sig)), secret)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             got,
             NetworkSignals {
@@ -392,21 +515,77 @@ mod tests {
                 ua_mismatch: Some(false),
             }
         );
-        // 未签名、错签名、大写 hex 均可按常量化比较判断，但篡改必须被拒。
-        assert!(parse_signed_network_fp(&hdr(body, None), secret).is_none());
-        assert!(parse_signed_network_fp(&hdr(body, Some("00")), secret).is_none());
+        assert_eq!(parse_signed_network_fp(&HeaderMap::new(), secret), Ok(None));
+        assert!(parse_signed_network_fp(&hdr(body, None), secret).is_err());
+        assert!(parse_signed_network_fp(&hdr(body, Some("00")), secret).is_err());
         let tampered = body.replace("\"ja4Browser\":true", "\"ja4Browser\":false");
-        assert!(parse_signed_network_fp(&hdr(&tampered, Some(&sig)), secret).is_none());
-        // 签名正确但内容不是预期结构 → 丢弃而不是 panic。
-        let bad = "not-json";
-        let bad_sig = hex_hmac_sha256(secret, bad);
-        assert!(parse_signed_network_fp(&hdr(bad, Some(&bad_sig)), secret).is_none());
-        // 超长值在验签前被拒。
+        assert!(parse_signed_network_fp(&hdr(&tampered, Some(&sig)), secret).is_err());
+        for bad in [
+            "not-json",
+            "{}",
+            "[]",
+            "null",
+            r#"{"tls":null}"#,
+            r#"{"tls":"true"}"#,
+            r#"{"extra":true}"#,
+            r#"{"tls":true,"tls":false}"#,
+            r#"{"tls":true,"extra":1}"#,
+        ] {
+            assert!(
+                parse_signed_network_fp(&hdr(bad, Some(&hex_hmac_sha256(secret, bad))), secret)
+                    .is_err(),
+                "{bad}"
+            );
+        }
         let long = "x".repeat(NET_FP_MAX_LEN + 1);
-        let long_sig = hex_hmac_sha256(secret, &long);
-        assert!(parse_signed_network_fp(&hdr(&long, Some(&long_sig)), secret).is_none());
-        // 大写 hex 签名同样有效（规范化比较）。
-        assert!(parse_signed_network_fp(&hdr(body, Some(&sig.to_ascii_uppercase())), secret).is_some());
+        assert!(
+            parse_signed_network_fp(&hdr(&long, Some(&hex_hmac_sha256(secret, &long))), secret)
+                .is_err()
+        );
+        assert!(
+            parse_signed_network_fp(&hdr(body, Some(&sig.to_ascii_uppercase())), secret)
+                .unwrap()
+                .is_some()
+        );
+        for name in [NET_FP_HEADER, NET_FP_SIG_HEADER] {
+            let mut h = hdr(body, Some(&sig));
+            h.append(name, h.get(name).unwrap().clone());
+            h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            assert_eq!(
+                network_signals_with(&h, true, secret, false),
+                Err(NetworkSignalError::Invalid)
+            );
+        }
+        let mut sig_only = HeaderMap::new();
+        sig_only.insert(NET_FP_SIG_HEADER, HeaderValue::from_str(&sig).unwrap());
+        assert!(parse_signed_network_fp(&sig_only, secret).is_err());
+        assert!(parse_signed_network_fp(&hdr(body, Some(&sig)), "").is_err());
+        let mut h = hdr(body, Some(&sig));
+        h.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert_eq!(
+            network_signals_with(&h, true, secret, true)
+                .unwrap()
+                .unwrap()
+                .tls,
+            Some(true)
+        );
+        assert_eq!(network_signals_with(&h, false, secret, false), Ok(None));
+        assert!(network_signals_with(&h, false, secret, true).is_err());
+        let mut empty = HeaderMap::new();
+        assert_eq!(network_signals_with(&empty, true, secret, false), Ok(None));
+        assert_eq!(network_signals_with(&empty, true, "", false), Ok(None));
+        empty.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(network_signals_with(&empty, true, secret, true).is_err());
+        assert_eq!(
+            network_signals_with(&empty, true, secret, false)
+                .unwrap()
+                .unwrap()
+                .tls,
+            Some(true)
+        );
+        let mut bad = hdr(body, Some(&"0".repeat(64)));
+        bad.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(network_signals_with(&bad, true, secret, false).is_err());
     }
 
     #[test]
@@ -426,24 +605,81 @@ mod tests {
 
     #[test]
     fn private_ranges() {
-        for ip in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.1", "192.168.1.1", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1"] {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.1",
+            "192.168.1.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
             assert!(is_loopback_or_private(ip), "{ip}");
         }
-        for ip in ["172.2.0.1", "172.200.1.1", "172.32.0.1", "8.8.8.8", "2001:db8::1", "fcdn.example", ""] {
+        for ip in [
+            "172.2.0.1",
+            "172.200.1.1",
+            "172.32.0.1",
+            "8.8.8.8",
+            "2001:db8::1",
+            "fcdn.example",
+            "",
+        ] {
             assert!(!is_loopback_or_private(ip), "{ip}");
         }
     }
 
     #[test]
-    fn forwarded_takes_rightmost_public_hop() {
-        // Client-supplied left part is ignored.
-        assert_eq!(forwarded_client("1.1.1.1, 203.0.113.7").as_deref(), Some("203.0.113.7"));
-        // Our own proxies on the right are skipped.
-        assert_eq!(forwarded_client("6.6.6.6, 203.0.113.7, 10.0.0.2").as_deref(), Some("203.0.113.7"));
-        // All-private chain: first hop.
-        assert_eq!(forwarded_client("10.0.0.5, 10.0.0.2").as_deref(), Some("10.0.0.5"));
-        // Garbage is rejected rather than used as a bucket key.
-        assert_eq!(forwarded_client("not-an-ip"), None);
-        assert_eq!(forwarded_client("  ,  "), None);
+    fn forwarded_respects_explicit_trust_boundary() {
+        for (chain, expected) in [
+            ("1.1.1.1, 203.0.113.7", "203.0.113.7"),
+            ("6.6.6.6, 10.0.0.2", "10.0.0.2"),
+            ("6.6.6.6, fd00::1", "fd00::1"),
+            ("2001:0db8:0:0:0:0:0:1", "2001:db8::1"),
+            ("::ffff:192.0.2.1", "192.0.2.1"),
+        ] {
+            assert_eq!(forwarded_client(chain, &[]).as_deref(), Some(expected));
+        }
+        let cidrs = vec!["10.0.0.0/24".into(), "2001:db8::/32".into()];
+        assert_eq!(
+            forwarded_client("6.6.6.6, 192.168.1.9, 10.0.0.2, 2001:db8::1", &cidrs).as_deref(),
+            Some("192.168.1.9")
+        );
+        assert_eq!(
+            forwarded_client("6.6.6.6, 192.168.1.9, ::ffff:10.0.0.2", &cidrs).as_deref(),
+            Some("192.168.1.9")
+        );
+        for chain in ["not-an-ip", "  ,  ", "6.6.6.6,", "6.6.6.6, bad, 10.0.0.2"] {
+            assert_eq!(forwarded_client(chain, &cidrs), None);
+        }
+    }
+
+    #[test]
+    fn proxy_secret_and_ip_headers_do_not_expand_trust() {
+        let mut h = HeaderMap::new();
+        assert!(!proxy_trusted_with(&h, "127.0.0.1", true, "secret"));
+        assert!(!proxy_trusted_with(&h, "203.0.113.1", true, ""));
+        assert!(proxy_trusted_with(&h, "127.0.0.1", true, ""));
+        h.insert("x-cap-proxy-secret", HeaderValue::from_static("secret"));
+        assert!(proxy_trusted_with(&h, "203.0.113.1", true, "secret"));
+        assert!(!proxy_trusted_with(&h, "127.0.0.1", false, "secret"));
+        assert!(!proxy_trusted_with(&h, "127.0.0.1", true, "wrong"));
+        h.insert("x-forwarded-for", HeaderValue::from_static("6.6.6.6"));
+        h.append("x-forwarded-for", HeaderValue::from_static("10.1.2.3"));
+        assert_eq!(
+            client_ip_with(&h, "::ffff:127.0.0.1", false, "", &[]),
+            "127.0.0.1"
+        );
+        assert_eq!(client_ip_with(&h, "::1", true, "", &[]), "10.1.2.3");
+        assert_eq!(client_ip_with(&h, "::1", true, "x-real-ip", &[]), "::1");
+        h.insert("x-real-ip", HeaderValue::from_static("::ffff:192.0.2.1"));
+        assert_eq!(
+            client_ip_with(&h, "::1", true, "x-real-ip", &[]),
+            "192.0.2.1"
+        );
+        h.append("x-forwarded-for", HeaderValue::from_static("bad"));
+        assert_eq!(client_ip_with(&h, "::1", true, "", &[]), "::1");
     }
 }

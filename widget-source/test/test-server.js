@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const widgetMin = fs.readFileSync(
-  path.join(__dirname, "..", "src", "cap.min.js"),
+  path.join(__dirname, "..", "..", "widget-dist", "widget.js"),
   "utf-8",
 );
 export const wasmBytes = fs.readFileSync(
@@ -13,9 +13,7 @@ export const wasmBytes = fs.readFileSync(
     __dirname,
     "..",
     "..",
-    "wasm-source",
-    "src",
-    "browser",
+    "widget-dist",
     "cap_wasm_bg.wasm",
   ),
 );
