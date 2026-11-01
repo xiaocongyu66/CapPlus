@@ -27,6 +27,26 @@ async fn main() {
     let ok = Arc::new(AtomicU64::new(0));
     let err = Arc::new(AtomicU64::new(0));
     let lat = Arc::new(std::sync::Mutex::new(Vec::<u128>::new()));
+    // Warm up: establish every connection before the clock starts, otherwise
+    // TCP setup lands in the measured window.
+    let warm: Vec<_> = (0..conc)
+        .map(|_| {
+            let client = client.clone();
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Empty::new())
+                    .unwrap();
+                let _ = client.request(req).await;
+            })
+        })
+        .collect();
+    for t in warm {
+        let _ = t.await;
+    }
+
     let start = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(secs);
 

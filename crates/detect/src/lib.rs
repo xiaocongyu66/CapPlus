@@ -114,7 +114,7 @@ fn network_penalty(id: &str) -> i32 {
         .iter()
         .find(|(k, _)| *k == id)
         .map(|(_, v)| *v)
-        .expect("network penalty ids are static")
+        .unwrap_or(0)
 }
 
 /// Protocol-layer findings consumed by `computeTrust({ network })` in
@@ -709,5 +709,37 @@ mod tests {
         assert_eq!(Level::for_score(30), Level::Restricted);
         assert_eq!(Level::for_score(29), Level::Hostile);
         assert_eq!(Level::for_score(0), Level::Hostile);
+    }
+
+    #[test]
+    fn gating_first_then_plain_keeps_gating() {
+        // Dedupe must be order-independent: a gating signal followed by a
+        // plain duplicate stays gating and is only charged once.
+        let t = compute_trust_signals(
+            &[
+                Signal::gating("headless_token"),
+                Signal::new("headless_token"),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(t.reasons.len(), 1);
+        assert!(t.reasons[0].gating);
+        assert_eq!(t.score, 100 - signal_penalty("headless_token"));
+    }
+
+    #[test]
+    fn ja3_counted_when_ja4_absent() {
+        let net = NetworkSignals {
+            ja3_browser: Some(false),
+            ja4_browser: None,
+            ..Default::default()
+        };
+        let t = compute_trust(&TrustInput {
+            signals: &[],
+            network: Some(&net),
+            probe_passed: None,
+        });
+        assert!(t.reasons.iter().any(|r| r.id == "ja3_non_browser"));
     }
 }

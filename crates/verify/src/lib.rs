@@ -95,12 +95,12 @@ fn ext_str(map: &Map<String, Value>, key: &str) -> Option<String> {
 /// Validate the parsed body: `secret` is required, `response` must look like a
 /// Cap token (`siteKey:id:secret`). Extensions are captured when present.
 pub fn parse_request(map: &Map<String, Value>) -> Result<SiteverifyRequest, ErrorCode> {
-    let secret = match map.get("secret").and_then(Value::as_str) {
+    let secret = match map.get("secret").and_then(Value::as_str).map(str::trim) {
         Some(s) if !s.is_empty() => s.to_owned(),
         _ => return Err(ErrorCode::MissingInputSecret),
     };
     let response = match map.get("response").and_then(Value::as_str) {
-        Some(s) if s.split(':').count() == 3 => s.to_owned(),
+        Some(s) if s.trim().split(':').count() == 3 => s.trim().to_owned(),
         _ => return Err(ErrorCode::MissingInputResponse),
     };
     Ok(SiteverifyRequest {

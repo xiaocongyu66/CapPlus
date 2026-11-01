@@ -750,6 +750,22 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
         };
     }
 
+    // Only objects carry probes; anything else fails closed without cloning.
+    if !vector.is_object() {
+        return DetectOutcome {
+            pass: false,
+            checks: vec![Check {
+                id: "probe_incomplete".to_string(),
+                passed: false,
+                gating: true,
+                detail: "probe payload is not an object".to_string(),
+            }],
+            blocked_by: vec!["probe_incomplete".to_string()],
+            risk_flags: Vec::new(),
+            signals: Vec::new(),
+        };
+    }
+
     // Bound hostile strings/arrays before any regex or detail formatting.
     let mut sanitized = vector.clone();
     sanitize_vector(&mut sanitized);

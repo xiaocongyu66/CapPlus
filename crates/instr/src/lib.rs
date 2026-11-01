@@ -403,8 +403,14 @@ pub fn script_blob(script: &str) -> String {
     use std::io::Write;
 
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(script.as_bytes()).expect("deflate");
-    let compressed = enc.finish().expect("deflate finish");
+    // A deflate failure must not panic the server; an empty blob makes the
+    // client time out, which is handled.
+    if enc.write_all(script.as_bytes()).is_err() {
+        return String::new();
+    }
+    let Ok(compressed) = enc.finish() else {
+        return String::new();
+    };
     base64::engine::general_purpose::STANDARD.encode(compressed)
 }
 

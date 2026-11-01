@@ -86,6 +86,12 @@ pub(crate) fn tmpl(t: &str, subs: &[(&str, &str)]) -> String {
     for (k, v) in subs {
         s = s.replace(k, v);
     }
+    // Placeholders are `%NAME%`; a leftover means a substitution was missed
+    // (or an inserted value contained one). Fail loudly in debug builds.
+    debug_assert!(
+        !s.contains('%') || std::env::var("CAP_ALLOW_PLACEHOLDER_LEFTOVER").is_ok(),
+        "unreplaced template placeholder"
+    );
     s
 }
 

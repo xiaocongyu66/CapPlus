@@ -202,11 +202,19 @@ pub fn frame_policy(cors_origins: &[String], parent: &str) -> FramePolicy {
 /// caller's job — see [`frame_policy`]; nothing here depends on it.
 pub fn embed_page(site_key: &str, parent_origin: &str, widget_url: &str) -> String {
     let site = esc(site_key);
-    let parent = esc(parent_origin);
-    let target = if parent.is_empty() {
+    // `parent_origin` lands inside a JS string literal, not HTML: JSON
+    // encoding is the correct escape there (an attacker-supplied quote must
+    // not be able to break out, and HTML entities are not decoded in <script>).
+    let target = if parent_origin.is_empty() {
         "\"*\"".to_string()
     } else {
-        format!("\"{parent}\"")
+        // JSON-encode for the JS string, then escape the characters that could
+        // close the surrounding <script> or be misread as HTML.
+        serde_json::to_string(parent_origin)
+            .unwrap_or_else(|_| "\"*\"".to_string())
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e")
+            .replace('&', "\\u0026")
     };
     let widget = esc(widget_url);
 
@@ -510,9 +518,14 @@ mod tests {
     #[test]
     fn embed_page_escapes_parent_and_widget_url() {
         let page = embed_page("k", "https://a.example.com\"'<&", "/w.js?a=1&b=\"><x");
+        // widget_url is HTML-escaped (it is used outside the JS string).
         assert!(!page.contains("\"<x"), "{page}");
-        assert!(page.contains("&quot;&#39;&lt;&amp;"), "{page}");
         assert!(page.contains("a=1&amp;b="), "{page}");
+        // The parent origin is JSON-encoded for the JS literal, with < > &
+        // escaped so it can neither close the script nor inject HTML.
+        assert!(page.contains(r#"https://a.example.com\"'"#), "{page}");
+        assert!(page.contains("\\u003c"), "{page}");
+        assert!(!page.contains("</script><"), "{page}");
     }
 
     #[test]
