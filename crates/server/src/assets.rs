@@ -6,12 +6,12 @@ use std::sync::Arc;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use cap_core::jwt_sign;
+use cap_core::{jwt_sign, random_hex};
 use cap_store::now_ms;
 use serde_json::json;
 
 use crate::http_util::{cors_origins, html_response};
-use crate::{AppState, CHALLENGE_TTL_MS};
+use crate::AppState;
 
 pub(crate) async fn asset_handler(
     State(st): State<AppState>,
@@ -99,9 +99,13 @@ pub(crate) async fn embed_page(
         .filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| *k == "parent")
         .map(|(_, v)| {
-            form_urlencoded::parse(v.as_bytes())
-                .map(|(_, val)| val.to_string())
-                .collect::<String>()
+            // `v` is already the (still encoded) value: decoding it as a
+            // query string would treat the whole thing as a key and yield an
+            // empty value, so wrap it in a pair before parsing.
+            form_urlencoded::parse(format!("v={v}").as_bytes())
+                .next()
+                .map(|(_, val)| val.into_owned())
+                .unwrap_or_default()
         })
         .unwrap_or_default();
 
@@ -119,10 +123,15 @@ pub(crate) async fn embed_page(
         }
     };
 
+    // The context carries a random session id: challenge and redeem both
+    // present it, so a token solved in one embed session cannot be redeemed
+    // from another. Long-lived because the page may stay open; it only ever
+    // names a session, never grants anything by itself.
     let context = jwt_sign(
         &json!({
             "typ": "embed", "sk": site_key, "parent": parent_origin,
-            "exp": now_ms() + CHALLENGE_TTL_MS,
+            "sid": random_hex(32),
+            "exp": now_ms() + 24 * 60 * 60 * 1000,
         }),
         &key.jwt_secret,
     );

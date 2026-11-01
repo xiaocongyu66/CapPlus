@@ -40,6 +40,47 @@ cappro/
 Storage is Redis (`storage.redis_url` in config.toml, else `REDIS_URL`,
 default `redis://127.0.0.1:6379`).
 
+### Reverse proxy: Caddy / Traefik / nginx
+
+Set `CAP_TRUST_PROXY=true` and `CAP_PROXY_SECRET=<random>` so the server uses
+the proxy's forwarded client IP (rightmost non-private hop) and refuses
+forwarded headers from anyone who does not present the secret.
+
+```caddyfile
+# Caddyfile
+example.com {
+    reverse_proxy 127.0.0.1:3000 {
+        header_up x-cap-proxy-secret {env.CAP_PROXY_SECRET}
+    }
+}
+```
+
+```yaml
+# Traefik (labels on the cap-server service)
+- "traefik.http.middlewares.cap-headers.headers.customrequestheaders.x-cap-proxy-secret=${CAP_PROXY_SECRET}"
+- "traefik.http.routers.cap.middlewares=cap-headers"
+```
+
+Both set `X-Forwarded-For` / `X-Forwarded-Proto` themselves; the server derives
+the `tls` signal from the forwarded proto, so plain-HTTP bots are penalised.
+
+For JA3/JA4 and HTTP/2 fingerprinting, a proxy or plugin that can see the
+ClientHello must send a signed header (HMAC-SHA256 hex of the raw value with
+`CAP_PROXY_SECRET`):
+
+```text
+x-cap-net-fp:     {"tls":true,"ja4Browser":true,"ja3Browser":true,
+                   "http2Browser":true,"uaMismatch":false}
+x-cap-net-fp-sig: <hex>
+```
+
+Caddy and Traefik do not compute these natively; without such a header the
+server simply has no network signals (no honest client is penalised).
+
+Embed sessions are enforced by default: `challenge` and `redeem` must come from
+the same signed embed page (`CAP_REQUIRE_VSESS=0` disables this for direct API
+clients; a token then still works only for the site key that minted it).
+
 ## Status (2026-10-30)
 - Protocols: `sha256-pow` (v1), `rsw` (v2, AES-256-GCM sealed expectations),
   `instrumentation` (v2, generated probe + state check + detection/trust).

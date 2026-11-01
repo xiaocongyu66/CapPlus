@@ -38,6 +38,10 @@ pub struct ServerSection {
     /// auto-discover.
     pub dashboard_dir: String,
     pub demo: bool,
+    /// Require the redeem to come from the same signed embed session that
+    /// fetched the challenge (`CAP_REQUIRE_VSESS`, default on). Set `false`
+    /// for clients that call the API directly without the embed iframe.
+    pub verify_session: Option<bool>,
 }
 
 impl Default for ServerSection {
@@ -47,6 +51,7 @@ impl Default for ServerSection {
             port: 3000,
             dashboard_dir: String::new(),
             demo: false,
+            verify_session: None,
         }
     }
 }
@@ -122,6 +127,7 @@ pub struct Settings {
     pub embed_widget_url: String,
     pub trust_proxy: bool,
     pub proxy_secret: String,
+    pub require_verify_session: bool,
 }
 
 impl Settings {
@@ -306,6 +312,9 @@ pub fn init() -> Result<Settings, String> {
             .unwrap_or(2048),
         trust_proxy: env_bool("CAP_TRUST_PROXY").unwrap_or(file.proxy.trust_proxy),
         proxy_secret: env_str("CAP_PROXY_SECRET").unwrap_or(file.proxy.proxy_secret),
+        require_verify_session: env_bool("CAP_REQUIRE_VSESS")
+            .or(file.server.verify_session)
+            .unwrap_or(true),
         data_dir: dir,
     })
 }

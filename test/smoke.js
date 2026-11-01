@@ -13,8 +13,18 @@ const { createHash } = await import("node:crypto");
 
 const j = async (r) => [r.status, await r.json().catch(() => ({}))];
 
+// 0. embed session: the challenge and redeem must carry the signed context of
+// the iframe that framed the page (CAP_REQUIRE_VSESS, on by default).
+const embedHtml = await (await fetch(
+  `${CAP}/embed/${SITE}?parent=${encodeURIComponent(CAP)}`,
+)).text();
+const contextMatch = embedHtml.match(/var CONTEXT = ("(?:[^"\\]|\\.)*")/);
+if (!contextMatch) throw new Error("embed page did not carry a context");
+const CONTEXT = JSON.parse(contextMatch[1]);
+const embedHeaders = { "x-cap-embed-context": CONTEXT, "user-agent": UA };
+
 // 1. challenge
-const [cs, ch] = await j(await fetch(`${CAP}/${SITE}/challenge`, { method: "POST" }));
+const [cs, ch] = await j(await fetch(`${CAP}/${SITE}/challenge`, { method: "POST", headers: embedHeaders }));
 console.log("challenge:", cs, JSON.stringify(ch.challenge), "nonce?", !!ch.nonce);
 
 // 2. solve
@@ -32,7 +42,7 @@ console.log("solved", sols.length, "challenges");
 const redeemBody = JSON.stringify({ token: ch.token, solutions: sols });
 const [rs, rv] = await j(await fetch(`${CAP}/${SITE}/redeem`, {
   method: "POST",
-  headers: { "content-type": "application/json", origin: CAP, "user-agent": UA },
+  headers: { "content-type": "application/json", origin: CAP, "user-agent": UA, ...embedHeaders },
   body: redeemBody,
 }));
 console.log("redeem:", rs, rv.success, rv.token ? rv.token.slice(0, 24) + "…" : rv);

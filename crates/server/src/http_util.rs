@@ -54,6 +54,109 @@ pub(crate) fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
     }
 }
 
+/// Protocol-layer fingerprint forwarded by the trusted proxy: JA3/JA4, HTTP/2
+/// SETTINGS class and whether TLS was used. Unlike anything the client
+/// reports, these come from the connection the proxy actually terminated, so
+/// a scripted client cannot claim a browser fingerprint it does not have.
+///
+/// Header contract (both required, signature = hex HMAC-SHA256 of the raw
+/// value with `CAP_PROXY_SECRET`):
+///   x-cap-net-fp:     {"tls":true,"ja3Browser":...,"ja4Browser":...,
+///                      "http2Browser":...,"uaMismatch":...}
+///   x-cap-net-fp-sig: 64 hex chars
+const NET_FP_HEADER: &str = "x-cap-net-fp";
+const NET_FP_SIG_HEADER: &str = "x-cap-net-fp-sig";
+/// Bound the value before hashing; a real fingerprint is well under this.
+const NET_FP_MAX_LEN: usize = 512;
+
+pub(crate) fn network_signals(
+    headers: &HeaderMap,
+    peer: &str,
+) -> Option<cap_detect::NetworkSignals> {
+    let cfg = settings();
+    if !proxy_trusted(headers, peer) {
+        return None;
+    }
+    let mut net = if cfg.proxy_secret.is_empty() {
+        None
+    } else {
+        parse_signed_network_fp(headers, &cfg.proxy_secret)
+    };
+    // Caddy and Traefik do not compute JA3/JA4 themselves, but both set
+    // `X-Forwarded-Proto`; that alone proves whether the hop the proxy
+    // terminated was TLS. Explicit fields from a signed fingerprint win.
+    if let Some(tls) = forwarded_tls(headers) {
+        match &mut net {
+            Some(n) => {
+                if n.tls.is_none() {
+                    n.tls = Some(tls);
+                }
+            }
+            None => {
+                net = Some(cap_detect::NetworkSignals {
+                    tls: Some(tls),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    net
+}
+
+/// Signature + parse only; the caller decides whether the sender is trusted.
+fn parse_signed_network_fp(
+    headers: &HeaderMap,
+    secret: &str,
+) -> Option<cap_detect::NetworkSignals> {
+    let raw = headers.get(NET_FP_HEADER)?.to_str().ok()?;
+    if raw.is_empty() || raw.len() > NET_FP_MAX_LEN || secret.is_empty() {
+        return None;
+    }
+    let sig = headers.get(NET_FP_SIG_HEADER)?.to_str().ok()?.trim();
+    if sig.len() != 64 || !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let expected = hex_hmac_sha256(secret, raw);
+    // Fixed-length hex, compared without early exit.
+    let ok = expected
+        .as_bytes()
+        .iter()
+        .zip(sig.as_bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a.to_ascii_lowercase() ^ b.to_ascii_lowercase()))
+        == 0;
+    if !ok {
+        return None;
+    }
+    serde_json::from_str(raw).ok()
+}
+
+/// Transport security of the hop the proxy terminated, from the rightmost
+/// `X-Forwarded-Proto` value: proxies that append put their own hop last, so
+/// taking the left value would let a client prepend `https` and suppress the
+/// `tls_missing` signal.
+fn forwarded_tls(headers: &HeaderMap) -> Option<bool> {
+    let proto = headers.get("x-forwarded-proto")?.to_str().ok()?;
+    proto
+        .rsplit(',')
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .map(|p| p.eq_ignore_ascii_case("https"))
+}
+
+fn hex_hmac_sha256(secret: &str, msg: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("hmac key");
+    mac.update(msg.as_bytes());
+    let out = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(64);
+    for b in out {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 pub(crate) fn client_ip(headers: &HeaderMap, peer: &str) -> String {
     // Forwarded headers are client-controlled. They are only consulted when
     // the operator declares a trusted proxy (CAP_TRUST_PROXY=true); otherwise
@@ -253,6 +356,63 @@ mod tests {
         ] {
             assert!(!cidr_match(net, ip), "{net} {ip}");
         }
+    }
+
+    #[test]
+    fn network_fp_requires_signature_and_shape() {
+        use cap_detect::NetworkSignals;
+        let secret = "proxy-secret";
+        let body = r#"{"tls":true,"ja4Browser":true,"ja3Browser":false,"http2Browser":true,"uaMismatch":false}"#;
+        let sig = hex_hmac_sha256(secret, body);
+        let hdr = |v: &str, sig: Option<&str>| {
+            let mut h = HeaderMap::new();
+            h.insert(NET_FP_HEADER, HeaderValue::from_str(v).unwrap());
+            if let Some(s) = sig {
+                h.insert(NET_FP_SIG_HEADER, HeaderValue::from_str(s).unwrap());
+            }
+            h
+        };
+        let got = parse_signed_network_fp(&hdr(body, Some(&sig)), secret).unwrap();
+        assert_eq!(
+            got,
+            NetworkSignals {
+                tls: Some(true),
+                ja4_browser: Some(true),
+                ja3_browser: Some(false),
+                http2_browser: Some(true),
+                ua_mismatch: Some(false),
+            }
+        );
+        // 未签名、错签名、大写 hex 均可按常量化比较判断，但篡改必须被拒。
+        assert!(parse_signed_network_fp(&hdr(body, None), secret).is_none());
+        assert!(parse_signed_network_fp(&hdr(body, Some("00")), secret).is_none());
+        let tampered = body.replace("\"ja4Browser\":true", "\"ja4Browser\":false");
+        assert!(parse_signed_network_fp(&hdr(&tampered, Some(&sig)), secret).is_none());
+        // 签名正确但内容不是预期结构 → 丢弃而不是 panic。
+        let bad = "not-json";
+        let bad_sig = hex_hmac_sha256(secret, bad);
+        assert!(parse_signed_network_fp(&hdr(bad, Some(&bad_sig)), secret).is_none());
+        // 超长值在验签前被拒。
+        let long = "x".repeat(NET_FP_MAX_LEN + 1);
+        let long_sig = hex_hmac_sha256(secret, &long);
+        assert!(parse_signed_network_fp(&hdr(&long, Some(&long_sig)), secret).is_none());
+        // 大写 hex 签名同样有效（规范化比较）。
+        assert!(parse_signed_network_fp(&hdr(body, Some(&sig.to_ascii_uppercase())), secret).is_some());
+    }
+
+    #[test]
+    fn forwarded_proto_uses_proxy_hop() {
+        // Appended client value must not win over the proxy's own hop.
+        let hdr = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-proto", HeaderValue::from_str(v).unwrap());
+            h
+        };
+        assert_eq!(forwarded_tls(&hdr("https, http")), Some(false));
+        assert_eq!(forwarded_tls(&hdr("http, https")), Some(true));
+        assert_eq!(forwarded_tls(&hdr(" https ")), Some(true));
+        assert_eq!(forwarded_tls(&hdr(", ")), None);
+        assert_eq!(forwarded_tls(&HeaderMap::new()), None);
     }
 
     #[test]

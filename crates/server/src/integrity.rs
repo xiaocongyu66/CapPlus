@@ -10,6 +10,14 @@ use serde_json::{json, Value};
 use crate::http_util::{client_ip, header_str};
 use crate::{v2, AppState, CHALLENGE_TTL_MS};
 
+/// A verified embed context: which allowed parent framed the page, and the
+/// random session id that ties challenge and redeem to that framing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmbedContext {
+    pub parent: String,
+    pub sid: String,
+}
+
 /// Validate an optional embed context. Only the signed, canonical, currently
 /// allowed parent may supply the session hostname; request origins never do.
 pub(crate) fn embed_parent(
@@ -17,7 +25,7 @@ pub(crate) fn embed_parent(
     site_key: &str,
     secret: &str,
     origins: &[String],
-) -> Result<Option<String>, &'static str> {
+) -> Result<Option<EmbedContext>, &'static str> {
     let Some(raw) = headers.get("x-cap-embed-context") else {
         return Ok(None);
     };
@@ -29,9 +37,16 @@ pub(crate) fn embed_parent(
     {
         return Err("invalid_embed_context");
     }
+    let sid = claims["sid"].as_str().ok_or("invalid_embed_context")?;
+    if sid.len() != 32 || !sid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid_embed_context");
+    }
     let parent = claims["parent"].as_str().ok_or("invalid_embed_context")?;
     match cap_embed::frame_policy(origins, parent) {
-        cap_embed::FramePolicy::Allow(canonical) if canonical == parent => Ok(Some(canonical)),
+        cap_embed::FramePolicy::Allow(canonical) if canonical == parent => Ok(Some(EmbedContext {
+            parent: canonical,
+            sid: sid.to_ascii_lowercase(),
+        })),
         _ => Err("invalid_embed_context"),
     }
 }
@@ -42,14 +57,15 @@ pub(crate) async fn remember_challenge_env(
     token: &str,
     headers: &HeaderMap,
     addr: &SocketAddr,
-    parent: Option<&str>,
+    embed: Option<&EmbedContext>,
 ) -> Result<(), String> {
     let ua = header_str(headers, "user-agent");
     let ip = client_ip(headers, &addr.ip().to_string());
     let doc = json!({
         "ua": cap_core::sha256_hex(&ua)[..32].to_string(),
         "ip": if ip.is_empty() { Value::Null } else { json!(ip) },
-        "parent": parent,
+        "parent": embed.map(|e| e.parent.clone()),
+        "sid": embed.map(|e| e.sid.clone()),
     });
     st.kv
         .set_ex(
@@ -69,7 +85,7 @@ pub(crate) async fn check_challenge_env(
     headers: &HeaderMap,
     addr: &SocketAddr,
     require_ip: bool,
-) -> Result<Option<String>, String> {
+) -> Result<ChallengeEnv, String> {
     let raw = st.kv.get(&format!("chalenv:{token}")).await.map_err(|e| {
         eprintln!("[redeem] challenge environment read failed: {e}");
         "store_unavailable".to_string()
@@ -90,7 +106,17 @@ pub(crate) async fn check_challenge_env(
             }
         }
     }
-    Ok(env.get("parent").and_then(Value::as_str).map(str::to_owned))
+    Ok(ChallengeEnv {
+        parent: env.get("parent").and_then(Value::as_str).map(str::to_owned),
+        sid: env.get("sid").and_then(Value::as_str).map(str::to_owned),
+    })
+}
+
+/// What the challenge recorded about the request that asked for it.
+#[derive(Debug, Default)]
+pub(crate) struct ChallengeEnv {
+    pub parent: Option<String>,
+    pub sid: Option<String>,
 }
 
 /// Fail closed for unavailable, missing, or structurally damaged environment records.
@@ -111,7 +137,14 @@ fn parse_challenge_env(raw: Result<Option<String>, String>) -> Result<Value, Str
         ),
         _ => false,
     };
-    if !valid_ua || !valid_ip || !valid_parent {
+    let valid_sid = match env.get("sid") {
+        Some(Value::Null) => true,
+        Some(Value::String(sid)) => {
+            sid.len() == 32 && sid.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        _ => false,
+    };
+    if !valid_ua || !valid_ip || !valid_parent || !valid_sid {
         return Err("challenge_env_invalid".into());
     }
     Ok(env)
@@ -131,12 +164,13 @@ mod embed_context_tests {
         for raw in ["{", "null", "[]", "{}"] {
             assert_eq!(parse_challenge_env(Ok(Some(raw.into()))).unwrap_err(), "challenge_env_invalid");
         }
-        let valid = json!({"ua": cap_core::sha256_hex("UA")[..32], "ip": "192.0.2.1", "parent": "https://app.example:8443"});
+        let valid = json!({"ua": cap_core::sha256_hex("UA")[..32], "ip": "192.0.2.1", "parent": "https://app.example:8443", "sid": "0123456789abcdef0123456789abcdef"});
         assert_eq!(parse_challenge_env(Ok(Some(valid.to_string()))).unwrap(), valid);
         for (field, value) in [
             ("ua", Value::Null), ("ua", json!("")), ("ua", json!(42)),
             ("ip", json!(false)), ("parent", json!(42)),
             ("parent", json!("https://APP.example/path")),
+            ("sid", json!("0123456789abcdef")),
         ] {
             let mut invalid = valid.clone();
             invalid[field] = value;
@@ -157,13 +191,20 @@ mod embed_context_tests {
     fn embed_context_is_scoped_signed_current_and_canonical() {
         let origins = vec!["https://app.example:8443".to_string()];
         let valid = json!({"typ":"embed", "sk":"site-a",
+            "sid":"0123456789abcdef0123456789abcdef",
             "parent":"https://app.example:8443", "exp":now_ms() + 60_000});
         let check = |claims: &Value, secret: &str, site: &str, allowed: &[String]| {
             let mut headers = HeaderMap::new();
             headers.insert("x-cap-embed-context", HeaderValue::from_str(&jwt_sign(claims, secret)).unwrap());
             embed_parent(&headers, site, "secret", allowed)
         };
-        assert_eq!(check(&valid, "secret", "site-a", &origins).unwrap(), Some("https://app.example:8443".into()));
+        assert_eq!(
+            check(&valid, "secret", "site-a", &origins).unwrap(),
+            Some(EmbedContext {
+                parent: "https://app.example:8443".into(),
+                sid: "0123456789abcdef0123456789abcdef".into(),
+            })
+        );
         assert!(check(&valid, "wrong", "site-a", &origins).is_err());
         assert!(check(&valid, "secret", "site-b", &origins).is_err());
         assert!(check(&valid, "secret", "site-a", &["https://other.example".into()]).is_err());
@@ -172,6 +213,10 @@ mod embed_context_tests {
             ("typ", json!("chal")), ("exp", json!(now_ms() - 1)),
             ("exp", Value::Null), ("parent", json!("https://APP.example:8443/path")),
             ("parent", json!("https://evil.example")),
+            ("sid", Value::Null),
+            ("sid", json!("")),
+            ("sid", json!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")),
+            ("sid", json!("0123456789abcdef")),
         ] {
             let mut bad = valid.clone();
             bad[field] = value;

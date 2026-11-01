@@ -13,10 +13,12 @@ use cap_core::{jwt_sig_hex, jwt_verify, random_hex, verify_pow, PowParams, Sessi
 use cap_store::now_ms;
 use serde_json::{json, Value};
 
-use crate::http_util::{client_ip, header_str, hourly_bucket, same_origin};
-use crate::integrity::{check_challenge_env, check_integrity};
+use crate::http_util::{
+    client_ip, cors_origins, header_str, hourly_bucket, network_signals, same_origin,
+};
+use crate::integrity::{check_challenge_env, check_integrity, embed_parent};
 use crate::{
-    rate_allowed, record_geo, v2, AppState, CHALLENGE_TTL_MS, REDEEM_MAX_FAILS,
+    rate_allowed, record_geo, settings, v2, AppState, CHALLENGE_TTL_MS, REDEEM_MAX_FAILS,
     REDEEM_RL_MAX, REDEEM_RL_WINDOW_MS, TOKEN_TTL_MS,
 };
 
@@ -107,10 +109,10 @@ pub(crate) async fn redeem(
     if !allowed {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "too_many_attempts"}))).into_response();
     }
-    let parent = match
+    let env = match
         check_challenge_env(&st, token, &headers, &addr, key.config.require_session_bind).await
     {
-        Ok(parent) => parent,
+        Ok(env) => env,
         Err(reason) => {
             st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
             let status = if reason == "store_unavailable" {
@@ -121,6 +123,45 @@ pub(crate) async fn redeem(
             return (status, Json(json!({ "error": reason }))).into_response();
         }
     };
+    // Server-side embed session: the redeem must come from the same signed
+    // embed context (same sid) that fetched the challenge. A stolen token is
+    // useless in another framing because its chalenv sid no longer matches.
+    let embed = match embed_parent(&headers, &site_key, &key.jwt_secret, &cors_origins(&key.config))
+    {
+        Ok(embed) => embed,
+        Err(reason) => {
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": reason }))).into_response();
+        }
+    };
+    let sent_sid = embed.as_ref().map(|e| e.sid.as_str());
+    match (env.sid.as_deref(), sent_sid) {
+        (Some(bound), Some(sent)) if bound == sent => {}
+        (Some(_), Some(_)) => {
+            st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "verified_session_required",
+                    "reason": "the challenge was solved in a different embed session",
+                })),
+            )
+                .into_response();
+        }
+        (bound, None) | (None, bound) if settings().require_verify_session => {
+            let _ = bound;
+            st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "verified_session_required",
+                    "reason": "solve challenges inside the Cap-hosted iframe (embed.js)",
+                })),
+            )
+                .into_response();
+        }
+        _ => {}
+    }
+    let parent = env.parent;
     if let Err(reason) = check_integrity(&claims, &payload, &key.jwt_secret) {
         st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
         return (
@@ -136,9 +177,14 @@ pub(crate) async fn redeem(
     }
     let is_v2 = claims.get("f").and_then(Value::as_u64) == Some(2);
     let mut v2_trust: Option<(cap_detect::Trust, cap_detect::Action)> = None;
+    // Protocol-layer findings from the trusted proxy. Present for both
+    // protocols: these describe the connection, not the client's claims.
+    let net = network_signals(&headers, &addr.ip().to_string());
     if !is_v2 {
         // v1 carries its instrumentation meta sealed in `ei`. Without it an
         // automated client on the old protocol would never be fingerprinted.
+        let mut sigs: Vec<cap_detect::Signal> = Vec::new();
+        let mut judged = false;
         if let Some(ei) = claims.get("ei").and_then(Value::as_str) {
             let Some(meta) = v2::decrypt_gcm(ei, &key.jwt_secret, v2::INFO_FMT2) else {
                 return (
@@ -163,7 +209,6 @@ pub(crate) async fn redeem(
                 return (StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response();
             }
 
-            let mut sigs: Vec<cap_detect::Signal> = Vec::new();
             // Honeypot: a filled hidden field is a decisive bot signal.
             if payload
                 .get("integrity")
@@ -186,11 +231,23 @@ pub(crate) async fn redeem(
                 };
                 let outcome = cap_detect::detect_automation(p, &opts);
                 sigs.extend(outcome.signals.iter().map(|s| s.as_signal()));
-                let trust = cap_detect::compute_trust_signals(&sigs, None, Some(outcome.pass));
+                let trust =
+                    cap_detect::compute_trust_signals(&sigs, net.as_ref(), Some(outcome.pass));
                 let action = cap_detect::trust_action(&trust);
                 v2_trust = Some((trust, action));
+                judged = true;
             } else if !sigs.is_empty() {
-                let trust = cap_detect::compute_trust_signals(&sigs, None, None);
+                let trust = cap_detect::compute_trust_signals(&sigs, net.as_ref(), None);
+                let action = cap_detect::trust_action(&trust);
+                v2_trust = Some((trust, action));
+                judged = true;
+            }
+        }
+        // No instrumentation to judge (or none installed): the protocol-layer
+        // findings still produce a verdict on their own.
+        if !judged {
+            if let Some(net) = net.as_ref() {
+                let trust = cap_detect::compute_trust_signals(&[], Some(net), None);
                 let action = cap_detect::trust_action(&trust);
                 v2_trust = Some((trust, action));
             }
@@ -261,6 +318,11 @@ pub(crate) async fn redeem(
         if captured.is_none() {
             eprintln!("[redeem] no probe captured (solutions={})", solutions_raw.len());
         }
+        if captured.is_none() && net.is_some() {
+            let trust = cap_detect::compute_trust_signals(&[], net.as_ref(), None);
+            let action = cap_detect::trust_action(&trust);
+            v2_trust = Some((trust, action));
+        }
         if let Some(cap) = captured {
             let accept_language = header_str(&headers, "accept-language");
             let primary_lang = accept_language
@@ -277,7 +339,7 @@ pub(crate) async fn redeem(
             let owned = outcome.signals.clone();
             let sigs: Vec<cap_detect::Signal> =
                 owned.iter().map(|s| s.as_signal()).collect();
-            let trust = cap_detect::compute_trust_signals(&sigs, None, Some(outcome.pass));
+            let trust = cap_detect::compute_trust_signals(&sigs, net.as_ref(), Some(outcome.pass));
             let action = cap_detect::trust_action(&trust);
             v2_trust = Some((trust, action));
         }

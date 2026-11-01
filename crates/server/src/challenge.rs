@@ -16,7 +16,8 @@ use crate::demo::filter_request;
 use crate::http_util::{client_ip, cors_origins, header_str, hourly_bucket, parse_ua, proxy_trusted};
 use crate::integrity::{embed_parent, load_integrity, remember_challenge_env, seal_integrity};
 use crate::{
-    ensure_rsw_keypair, is_blocked, rate_allowed, rsw_minter, v2, AppState, CHALLENGE_TTL_MS,
+    ensure_rsw_keypair, is_blocked, rate_allowed, rsw_minter, settings, v2, AppState,
+    CHALLENGE_TTL_MS,
     DEFAULT_RL_MAX, DEFAULT_RL_WINDOW_MS,
 };
 
@@ -162,12 +163,24 @@ pub(crate) async fn challenge_inner(
         }
     };
     let cfg = key.config.clone();
-    let parent = match embed_parent(&headers, &site_key, &key.jwt_secret, &cors_origins(&cfg)) {
-        Ok(parent) => parent,
+    let embed = match embed_parent(&headers, &site_key, &key.jwt_secret, &cors_origins(&cfg)) {
+        Ok(embed) => embed,
         Err(reason) => {
             return (StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response();
         }
     };
+    // Redeem will require the same signed embed session, so issuing a
+    // challenge outside the embed flow only wastes the solve.
+    if settings().require_verify_session && embed.is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "verified_session_required",
+                "reason": "solve challenges inside the Cap-hosted iframe (embed.js)",
+            })),
+        )
+            .into_response();
+    }
 
     if let Some(resp) = filter_request(&st, &cfg, &headers, &site_key).await {
         return resp;
@@ -261,7 +274,7 @@ pub(crate) async fn challenge_inner(
         });
         seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
         let token = jwt_sign(&payload, &key.jwt_secret);
-        if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, parent.as_deref()).await {
+        if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
             eprintln!("[challenge] challenge environment write failed: {e}");
             return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "store_unavailable"}))).into_response();
         }
@@ -331,7 +344,7 @@ pub(crate) async fn challenge_inner(
         });
         seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
         let token = jwt_sign(&payload, &key.jwt_secret);
-        if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, parent.as_deref()).await {
+        if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
             eprintln!("[challenge] challenge environment write failed: {e}");
             return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "store_unavailable"}))).into_response();
         }
@@ -378,7 +391,7 @@ pub(crate) async fn challenge_inner(
     }
     seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
     let token = jwt_sign(&payload, &key.jwt_secret);
-    if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, parent.as_deref()).await {
+    if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
         eprintln!("[challenge] challenge environment write failed: {e}");
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "store_unavailable"}))).into_response();
     }

@@ -273,7 +273,8 @@ pub fn embed_page_with_context(
   var fetch = window.fetch;
   window.fetch = function(input, init) {{
     var url = new URL(input instanceof Request ? input.url : input, location.href);
-    if (CONTEXT && url.origin === location.origin && url.pathname === "/{site}/challenge") {{
+    var ep = url.pathname;
+    if (CONTEXT && url.origin === location.origin && (ep === "/{site}/challenge" || ep === "/{site}/redeem")) {{
       var request = new Request(input, init);
       var headers = new Headers(request.headers);
       headers.set("x-cap-embed-context", CONTEXT);
@@ -374,7 +375,8 @@ mod tests {
     #[test]
     fn context_fetch_is_scoped_and_script_safe() {
         let html = embed_page_with_context("site-a", "https://app.example", "/widget.js", "</script>&\"");
-        assert!(html.contains("url.origin === location.origin && url.pathname === \"/site-a/challenge\""));
+        assert!(html.contains("url.origin === location.origin"));
+        assert!(html.contains("ep === \"/site-a/challenge\" || ep === \"/site-a/redeem\""));
         assert!(html.contains("headers.set(\"x-cap-embed-context\", CONTEXT)"));
         assert!(html.contains("return fetch.call(window, input, init)"));
         assert!(html.contains("\\u003c/script\\u003e\\u0026\\\""));
