@@ -1,11 +1,14 @@
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { minify } from "terser";
 
-const rustSrcDir = path.join(process.cwd(), "./src/rust");
-const nodeOutDir = path.join(process.cwd(), "./src/node");
-const browserOutDir = path.join(process.cwd(), "./src/browser");
+const sourceDir = fileURLToPath(new URL(".", import.meta.url));
+process.chdir(sourceDir);
+const rustSrcDir = path.join(sourceDir, "src/rust");
+const nodeOutDir = path.join(sourceDir, "src/node");
+const browserOutDir = path.join(sourceDir, "src/browser");
 const packageName = "cap_wasm";
 
 console.log(`Cleaning old build directories...`);

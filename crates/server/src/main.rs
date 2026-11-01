@@ -9,15 +9,15 @@
 //!   GET  /embed.js                   (parent loader, Cap origin)
 //!   GET  /embed/:siteKey             (cross-origin verification iframe)
 //!
-//! Phase 1 supports the `sha256-pow` protocol; `hashwx`/`rsw`/instrumentation
-//! answer `protocol_not_supported` until ported.
+//! Protocols: `sha256-pow` (v1), `hashwx` and `rsw` (v2), with optional
+//! instrumentation probes.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, RawQuery, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -37,15 +37,17 @@ mod siteverify;
 mod metrics_buf;
 mod ratelimit;
 
-pub(crate) use http_util::*;
-pub(crate) use integrity::*;
-pub(crate) use admin_routes::*;
-pub(crate) use assets::*;
-pub(crate) use challenge::*;
-pub(crate) use demo::*;
-pub(crate) use pages::*;
-pub(crate) use redeem::*;
-pub(crate) use siteverify::*;
+use admin_routes::{
+    ipdb_delete, ipdb_download, ipdb_progress, ipdb_put, ipdb_status, release_activate,
+    release_archive, release_delete, release_upload, releases_list,
+};
+use assets::{asset_handler, embed_js, embed_page};
+use challenge::challenge;
+use demo::{demo_page, demo_verify};
+use http_util::{cidr_match, client_ip, proxy_trusted};
+use pages::{login_page, public_asset, root_page, share_page, tester_page};
+use redeem::redeem;
+use siteverify::{siteverify, siteverify_alias, validate};
 mod v2;
 
 // mimalloc: per-thread heaps cut allocator contention on the request path
@@ -53,17 +55,18 @@ mod v2;
 // system allocator only if this line is removed.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-use cap_core::{jwt_sign, jwt_sig_hex, jwt_verify, random_hex, verify_pow, PowParams, SessionBind};
-use cap_store::{now_ms, KeyConfig, Store};
-use cap_verify::{
-    bind_inputs, check_secret, err_response, ok_response, parse_body, parse_request,
-    token_site_key, ErrorCode, SecretCheck,
-};
+use cap_store::{now_ms, Store};
 
 const CHALLENGE_TTL_MS: i64 = 15 * 60 * 1000;
 const TOKEN_TTL_MS: i64 = 2 * 60 * 60 * 1000;
 const DEFAULT_RL_MAX: i64 = 30;
 const DEFAULT_RL_WINDOW_MS: i64 = 5_000;
+/// `/redeem` per IP: generous for real users (one redeem per challenge) but it
+/// caps how much verification work one client can request.
+const REDEEM_RL_MAX: i64 = 60;
+const REDEEM_RL_WINDOW_MS: i64 = 10_000;
+/// Wrong answers allowed per challenge token before it is refused outright.
+const REDEEM_MAX_FAILS: i64 = 5;
 
 static SETTINGS: std::sync::OnceLock<config::Settings> = std::sync::OnceLock::new();
 
@@ -87,6 +90,13 @@ struct AppState {
     metrics: Arc<metrics_buf::MetricsBuffer>,
     /// `CAP_RL_MODE=redis` forces the shared Redis limiter.
     redis_ratelimit: bool,
+    /// Built RSW minters keyed by (keypair fingerprint, t). Building one costs
+    /// two full-size modpows; the keypair changes only when an admin
+    /// regenerates it, so the fingerprint check is enough to stay correct.
+    rsw_minters: Arc<std::sync::Mutex<std::collections::HashMap<(String, u64), Arc<cap_proto::RswMinter>>>>,
+    /// Serialises first-use keypair generation so concurrent requests do not
+    /// each generate (and overwrite) their own keypair.
+    rsw_keygen: Arc<tokio::sync::Mutex<()>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -294,13 +304,23 @@ async fn is_blocked(
 }
 
 /// Load the RSW keypair, generating it on first use (the JS server does the
-/// same at key creation and at challenge time).
+/// same at key creation and at challenge time). Read through the 1 s config
+/// cache path would be wrong here (it is a hash, not JSON), so it is one
+/// HGETALL per call; the expensive part, the minter, is cached separately.
 async fn ensure_rsw_keypair(st: &AppState) -> Result<std::collections::HashMap<String, String>, String> {
-    let fields = st
-        .store
-        .hgetall("settings:rsw_keypair")
-        .await
-        .map_err(|e| e.to_string())?;
+    let load = || async {
+        st.store
+            .hgetall("settings:rsw_keypair")
+            .await
+            .map_err(|e| e.to_string())
+    };
+    let fields = load().await?;
+    if !fields.is_empty() {
+        return Ok(fields);
+    }
+    let _guard = st.rsw_keygen.lock().await;
+    // Another request may have generated it while we waited.
+    let fields = load().await?;
     if !fields.is_empty() {
         return Ok(fields);
     }
@@ -320,10 +340,36 @@ async fn ensure_rsw_keypair(st: &AppState) -> Result<std::collections::HashMap<S
         .await
         .map_err(|e| e.to_string())?;
     eprintln!("[cap] generated the RSW keypair on first use");
-    st.store
-        .hgetall("settings:rsw_keypair")
+    load().await
+}
+
+/// Cached minter for the current keypair and `t`; built on the blocking pool
+/// on a miss.
+async fn rsw_minter(
+    st: &AppState,
+    fields: std::collections::HashMap<String, String>,
+    t: u64,
+) -> Option<Arc<cap_proto::RswMinter>> {
+    let fp = format!(
+        "{}:{}",
+        fields.get("created").map(String::as_str).unwrap_or(""),
+        cap_core::sha256_hex(fields.get("N").map(String::as_str).unwrap_or(""))
+    );
+    let key = (fp, t);
+    if let Some(m) = st.rsw_minters.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(m.clone());
+    }
+    let minter = tokio::task::spawn_blocking(move || v2::rsw_minter(&fields, t))
         .await
-        .map_err(|e| e.to_string())
+        .ok()
+        .flatten()
+        .map(Arc::new)?;
+    let mut map = st.rsw_minters.lock().unwrap_or_else(|e| e.into_inner());
+    // A regenerated keypair makes every old entry dead; t values are clamped
+    // to a small range, so this map stays tiny.
+    map.retain(|(fp, _), _| *fp == key.0);
+    map.insert(key, minter.clone());
+    Some(minter)
 }
 
 /// Attribute a successful solve to a country / ASN. Explicit proxy headers
@@ -393,6 +439,17 @@ async fn record_geo(st: &AppState, site_key: &str, headers: &HeaderMap, addr: &S
 
 
 
+/// Fixed-window limiter in whichever mode is configured. A Redis error falls
+/// back to the in-process limiter instead of letting the request through.
+async fn rate_allowed(st: &AppState, scope: &str, ip: &str, window_ms: i64, max: i64) -> bool {
+    if st.redis_ratelimit {
+        if let Ok(ok) = st.store.rate_hit(scope, ip, window_ms, max).await {
+            return ok;
+        }
+    }
+    st.limiter.hit(scope, ip, window_ms, max)
+}
+
 async fn admin_handler(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -422,7 +479,9 @@ async fn admin_handler(
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
         .collect();
-    let peer_ip = peer.ip().to_string();
+    // Resolved with the same proxy-trust rules as the public API, so the
+    // admin login limiter cannot be dodged by spoofing forwarded headers.
+    let peer_ip = client_ip(&headers, &peer.ip().to_string());
     let req = cap_admin::AdminRequest {
         method: method.as_str(),
         path: &admin_path,
@@ -547,6 +606,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache: Arc::new(cache::ConfigCache::new()),
         limiter: Arc::new(ratelimit::LocalLimiter::new()),
         metrics: Arc::new(metrics_buf::MetricsBuffer::new()),
+        rsw_minters: Default::default(),
+        rsw_keygen: Default::default(),
         redis_ratelimit: std::env::var("CAP_RL_MODE")
             .map(|v| v.eq_ignore_ascii_case("redis"))
             .unwrap_or(false),
@@ -624,18 +685,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tick.tick().await;
                 let _ = metrics.flush(&kv).await;
-            }
-        });
-    }
-
-    // Expire stale cache entries (site keys, settings) every minute.
-    {
-        let cache = state.cache.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                tick.tick().await;
-                cache.sweep();
             }
         });
     }

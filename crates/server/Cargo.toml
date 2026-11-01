@@ -29,6 +29,7 @@ aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
+moka = { version = "0.12", features = ["future"] }
 
 [[bin]]
 name = "cap-server"

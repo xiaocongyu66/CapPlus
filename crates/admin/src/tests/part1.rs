@@ -109,8 +109,24 @@ use super::*;
 
         // global full access
         assert!(auth::scope_guard("POST", "/keys", &global).is_none());
-        assert!(auth::scope_guard("GET", "/settings/headers", &global).is_none());
+        // global settings / API keys / 2FA are session-only, even for an
+        // unscoped key
+        for (m, p) in [
+            ("GET", "/settings/headers"),
+            ("POST", "/settings/apikeys"),
+            ("DELETE", "/settings/apikeys/x"),
+            ("PUT", "/settings/cors"),
+            ("POST", "/integrity"),
+            ("GET", "/settings/sessions"),
+            ("POST", "/auth/2fa/disable"),
+            ("POST", "/logout"),
+        ] {
+            let r = auth::scope_guard(m, p, &global).unwrap();
+            assert_eq!(r.status, 403, "{m} {p}");
+        }
+        assert!(auth::scope_guard("GET", "/about", &global).is_none());
         // no scope (session)
+        assert!(auth::scope_guard("POST", "/settings/apikeys", &none).is_none());
         assert!(auth::scope_guard("POST", "/keys", &none).is_none());
 
         // readonly blocks writes, allows reads

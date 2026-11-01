@@ -1,7 +1,24 @@
 //! `POST /:siteKey/challenge`: mint a PoW challenge plus, when enabled, the
 //! instrumentation script and its sealed metadata (v1 `ei`, v2 challenge list).
 
-use super::*;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use cap_core::{jwt_sign, random_hex, PowParams};
+use cap_store::{now_ms, KeyConfig};
+use serde_json::{json, Value};
+
+use crate::demo::filter_request;
+use crate::http_util::{client_ip, cors_origins, header_str, hourly_bucket, parse_ua, proxy_trusted};
+use crate::integrity::{embed_parent, load_integrity, remember_challenge_env, seal_integrity};
+use crate::{
+    ensure_rsw_keypair, is_blocked, rate_allowed, rsw_minter, v2, AppState, CHALLENGE_TTL_MS,
+    DEFAULT_RL_MAX, DEFAULT_RL_WINDOW_MS,
+};
 
 /// Append the generated instrumentation challenge (script + sealed meta) when
 /// the key enables instrumentation. Shared by the rsw and hashwx v2 branches.
@@ -145,6 +162,12 @@ pub(crate) async fn challenge_inner(
         }
     };
     let cfg = key.config.clone();
+    let parent = match embed_parent(&headers, &site_key, &key.jwt_secret, &cors_origins(&cfg)) {
+        Ok(parent) => parent,
+        Err(reason) => {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response();
+        }
+    };
 
     if let Some(resp) = filter_request(&st, &cfg, &headers, &site_key).await {
         return resp;
@@ -171,14 +194,7 @@ pub(crate) async fn challenge_inner(
         .ratelimit_duration
         .or_else(|| global_rl.as_ref().and_then(|v| v.get("duration").and_then(Value::as_i64)))
         .unwrap_or(DEFAULT_RL_WINDOW_MS);
-    let allowed = if st.redis_ratelimit {
-        st.store
-            .rate_hit(&format!("challenge:{site_key}"), &ip, window, max)
-            .await
-            .unwrap_or(true)
-    } else {
-        st.limiter.hit(&format!("challenge:{site_key}"), &ip, window, max)
-    };
+    let allowed = rate_allowed(&st, &format!("challenge:{site_key}"), &ip, window, max).await;
     if !allowed {
         st.metrics.incr(
             &format!("metrics:ratelimited:{site_key}"),
@@ -241,11 +257,14 @@ pub(crate) async fn challenge_inner(
                 .into_response();
         };
         let mut payload = json!({
-            "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev2,
+            "typ": "chal", "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev2,
         });
         seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
         let token = jwt_sign(&payload, &key.jwt_secret);
-        remember_challenge_env(&st, &token, &headers, &addr).await;
+        if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, parent.as_deref()).await {
+            eprintln!("[challenge] challenge environment write failed: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "store_unavailable"}))).into_response();
+        }
         return Json(json!({
             "token": token,
             "format": 2,
@@ -262,7 +281,7 @@ pub(crate) async fn challenge_inner(
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("store: {e}")})),
+                    { eprintln!("[challenge] store_error: {e}"); Json(json!({"error": "store_error"})) },
                 )
                     .into_response()
             }
@@ -271,12 +290,16 @@ pub(crate) async fn challenge_inner(
         // async workers. Clamp `t` like cap.js ([10_000, 300_000]) — a value
         // above 2^31 wraps negative in the worker (`t | 0`) and never solves.
         let rsw_t = cfg.rsw_t.clamp(10_000, 300_000);
-        let Some((challenge, expected)) = tokio::task::spawn_blocking(move || {
-            v2::rsw_challenge(&fields, rsw_t)
-        })
-        .await
-        .ok()
-        .flatten()
+        let Some(minter) = rsw_minter(&st, fields, rsw_t).await else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "rsw_keypair_unavailable"})),
+            )
+                .into_response();
+        };
+        // Minting is four half-size modpows; still CPU, still off the workers.
+        let Some((challenge, expected)) =
+            tokio::task::spawn_blocking(move || v2::rsw_challenge(&minter)).await.ok()
         else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -304,11 +327,14 @@ pub(crate) async fn challenge_inner(
                 .into_response();
         };
         let mut payload = json!({
-            "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev,
+            "typ": "chal", "f": 2, "n": nonce, "exp": expires, "iat": now, "sk": site_key, "ev": ev,
         });
         seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
         let token = jwt_sign(&payload, &key.jwt_secret);
-        remember_challenge_env(&st, &token, &headers, &addr).await;
+        if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, parent.as_deref()).await {
+            eprintln!("[challenge] challenge environment write failed: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "store_unavailable"}))).into_response();
+        }
         return Json(json!({
             "token": token,
             "format": 2,
@@ -340,7 +366,7 @@ pub(crate) async fn challenge_inner(
     let expires = now + CHALLENGE_TTL_MS;
     let nonce = random_hex(25);
     let mut payload = json!({
-        "n": nonce, "c": params.c, "s": params.s, "d": params.d,
+        "typ": "chal", "n": nonce, "c": params.c, "s": params.s, "d": params.d,
         "exp": expires, "iat": now, "sk": site_key,
     });
     // v1 carries the instrumentation meta sealed in `ei`, exactly like the JS
@@ -352,7 +378,10 @@ pub(crate) async fn challenge_inner(
     }
     seal_integrity(&mut payload, &load_integrity(&st).await, &key.jwt_secret);
     let token = jwt_sign(&payload, &key.jwt_secret);
-    remember_challenge_env(&st, &token, &headers, &addr).await;
+    if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, parent.as_deref()).await {
+        eprintln!("[challenge] challenge environment write failed: {e}");
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "store_unavailable"}))).into_response();
+    }
     let mut body = json!({
         "challenge": {"c": params.c, "s": params.s, "d": params.d},
         "token": token,

@@ -17,7 +17,16 @@ fn block_field(kind: &str, value: &str) -> Option<String> {
     }
     Some(match kind {
         "ip" => value.to_string(),
-        "cidr" => format!("cidr:{value}"),
+        "cidr" => {
+            let (address, prefix) = value.split_once('/')?;
+            let address = address.parse::<std::net::IpAddr>().ok()?;
+            let prefix = prefix.parse::<u32>().ok()?;
+            let max = if address.is_ipv4() { 32 } else { 128 };
+            if prefix > max {
+                return None;
+            }
+            format!("cidr:{address}/{prefix}")
+        },
         "asn" => format!("asn:{value}"),
         "country" => format!("country:{value}"),
         _ => return None,
@@ -47,7 +56,11 @@ pub(crate) async fn block(store: &AdminStore, site_key: &str, body: &Value) -> c
     let expires = if duration <= 0 {
         "0".to_string()
     } else {
-        (util::now_ms() + duration * 1000).to_string()
+        // Saturate rather than wrap: an overflowing duration means "very
+        // long", never "already expired".
+        util::now_ms()
+            .saturating_add(duration.saturating_mul(1000))
+            .to_string()
     };
 
     match store

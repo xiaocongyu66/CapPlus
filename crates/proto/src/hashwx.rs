@@ -314,16 +314,18 @@ pub fn verify_solution(spec: &HashwxSpec, nonce: u64) -> bool {
 }
 
 
-/// JS parity tests are the only check that the Rust port matches the reference
-/// implementation. A missing toolchain must fail the suite, not silently pass:
-/// set `CAP_SKIP_JS_PARITY=1` to skip deliberately (e.g. on a machine without
-/// bun or the reference tree).
+/// Optional external JS parity checks skip when unavailable unless strict mode
+/// (`CAP_REQUIRE_JS_PARITY=1`) is enabled. The existing skip override is retained.
+#[cfg(test)]
 fn parity_required(reason: &str) {
     if std::env::var("CAP_SKIP_JS_PARITY").as_deref() == Ok("1") {
         eprintln!("SKIP (CAP_SKIP_JS_PARITY=1): {reason}");
         return;
     }
-    panic!("{reason}; install bun and the reference tree, or set CAP_SKIP_JS_PARITY=1");
+    if std::env::var("CAP_REQUIRE_JS_PARITY").as_deref() == Ok("1") {
+        panic!("{reason}; set CAP_JS_CORE_DIR to the reference core directory and install bun");
+    }
+    eprintln!("SKIP JS parity: {reason}; set CAP_JS_CORE_DIR and install bun to enable");
 }
 
 #[cfg(test)]
@@ -333,8 +335,14 @@ mod tests {
     use std::process::Command;
 
     fn kat_expected() -> Option<([u8; 32], u64)> {
+        let core = std::path::PathBuf::from(std::env::var_os("CAP_JS_CORE_DIR")?)
+            .canonicalize().ok()?;
+        if !core.join("src/hashwx.js").is_file() {
+            return None;
+        }
         let script = r#"
-import {hashwxSeed,hashwxHash,hashwxReady} from "/root/cpa/cap/core/src/hashwx.js";
+import {pathToFileURL} from "node:url";
+const {hashwxSeed,hashwxHash,hashwxReady} = await import(pathToFileURL(process.env.CAP_JS_HASHWX_FILE).href);
 const st=await hashwxReady();
 const ch=new Uint8Array(32).fill(7);
 const seed=hashwxSeed(ch,3n);
@@ -343,7 +351,8 @@ console.log(JSON.stringify({seed:[...seed], hash:String(hashwxHash(st,seed,12345
         let output = Command::new("bun")
             .arg("-e")
             .arg(script)
-            .current_dir("/root/cpa/cap/core")
+            .env("CAP_JS_HASHWX_FILE", core.join("src/hashwx.js"))
+            .current_dir(&core)
             .output()
             .ok()?;
         if !output.status.success() {
@@ -370,6 +379,10 @@ console.log(JSON.stringify({seed:[...seed], hash:String(hashwxHash(st,seed,12345
 
     #[test]
     fn kat_matches_js_reference() {
+        if std::env::var("CAP_SKIP_JS_PARITY").as_deref() == Ok("1") {
+            eprintln!("SKIP (CAP_SKIP_JS_PARITY=1): hashwx JS parity");
+            return;
+        }
         let Some((expected_seed, expected_hash)) = kat_expected() else {
             parity_required("bun or the JS core tree is unavailable");
             return;

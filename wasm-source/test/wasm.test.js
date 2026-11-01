@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { prng } from "../../core/src/prng.js";
+import { referenceUrl } from "../../test/js-reference.js";
+const reference = referenceUrl("prng.js");
+const { prng } = reference ? await import(reference) : {};
 import wasmPkg from "../src/node/cap_wasm.js";
 
 const { solve_pow } = wasmPkg;
@@ -95,7 +97,7 @@ describe("solve_pow", () => {
   });
 });
 
-describe("solve_pow integration with capjs-core's prng", () => {
+(prng ? describe : describe.skip)("solve_pow integration with capjs-core's prng", () => {
   test("produces nonces compatible with capjs-core's challenge format", async () => {
     const token = "abc123def456";
     const c = 5;

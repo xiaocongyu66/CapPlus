@@ -13,7 +13,7 @@ export const wasmBytes = fs.readFileSync(
     __dirname,
     "..",
     "..",
-    "wasm",
+    "wasm-source",
     "src",
     "browser",
     "cap_wasm_bg.wasm",

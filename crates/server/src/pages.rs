@@ -1,16 +1,14 @@
 //! Dashboard shell: pages, static files and the login-gated admin panel.
 
-use super::*;
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 
-/// The official dashboard's frontend, served straight from the Cap source
-/// tree (`cap/standalone/public`) — the same files `static.js` in the JS
-/// server serves, not a build artifact.
-///
-/// `ADMIN_LEGACY_DIR` (or `dashboard_dir` in config.toml) overrides the
-/// directory. Without it, candidates next to the executable, next to the
-/// build-time manifest, and relative to the working directory are tried in
-/// that order, so the location does not depend on where the process was
-/// started from.
+use crate::{settings, AppState, PUBLIC_UNAUTHED};
+
+/// The dashboard frontend, served from the configured directory, deployed
+/// assets, or the repository's `frontend/` during development.
+/// `ADMIN_LEGACY_DIR` (or `dashboard_dir` in config.toml) overrides the directory.
 pub(crate) fn dashboard_root() -> std::path::PathBuf {
     if let Some(dir) = &settings().dashboard_dir {
         return dir.clone();
@@ -21,17 +19,11 @@ pub(crate) fn dashboard_root() -> std::path::PathBuf {
     ];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("../cap/standalone/public"));
-            candidates.push(dir.join("cap/standalone/public"));
             candidates.push(dir.join("dashboard"));
         }
     }
-    // Build-time location: `<workspace>/crates/server` → `<workspace>/../cap/...`
-    candidates.push(std::path::PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../cap/standalone/public"
-    )));
-    candidates.push("../cap/standalone/public".into());
+    // Repository frontend for development builds.
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../frontend"));
     candidates.push("./static/admin".into());
 
     for p in candidates {

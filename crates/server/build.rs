@@ -1,6 +1,6 @@
 //! Bundle the dashboard front-end into the binary.
 //!
-//! `../cap/standalone/public` is packed into a stored-only zip at build time
+//! The repository's `frontend/` is packed into a stored-only zip at build time
 //! and embedded with `include_bytes!`, so a single-binary install still has a
 //! login page and the admin panel. The server unpacks it into
 //! `cappro/dashboard/` on first start.
@@ -140,10 +140,11 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    // Dashboard: vendored copy first, then the neighbouring Cap checkout.
-    let vendored = manifest.join("../../frontend");
-    let sibling = manifest.join("../../../cap/standalone/public");
-    let dashboard = if vendored.join("index.html").is_file() { vendored } else { sibling };
+    // Use repository assets unless an external dashboard is explicitly selected.
+    println!("cargo:rerun-if-env-changed=ADMIN_LEGACY_DIR");
+    let dashboard = std::env::var_os("ADMIN_LEGACY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest.join("../../frontend"));
     println!("cargo:rerun-if-changed={}", dashboard.display());
     let dashboard_hash = bundle("dashboard", &dashboard, &out_dir);
     std::fs::write(out_dir.join("dashboard-id.txt"), format!("{dashboard_hash:016x}"))

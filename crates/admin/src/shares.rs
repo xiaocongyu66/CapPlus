@@ -97,8 +97,10 @@ pub(crate) async fn create(
     let expires_in_ms = match body.get("expiresInMs") {
         None | Some(Value::Null) => None,
         Some(v) => match v.as_i64() {
-            Some(n) if n >= 0 => Some(n),
-            _ => return bad_request("expiresInMs must be a non-negative number"),
+            // Ten years is plenty; the bound keeps `created + n` from
+            // wrapping into a negative (never-expiring) timestamp.
+            Some(n) if (0..=10 * 365 * 86_400_000).contains(&n) => Some(n),
+            _ => return bad_request("expiresInMs must be a non-negative number of at most ten years"),
         },
     };
 
@@ -393,6 +395,12 @@ pub(crate) async fn get_public(store: &AdminStore, id: &str) -> crate::AdminResp
         Some(s) => s.clone(),
         None => return not_found_share(),
     };
+    // Token shares are only readable with their token (`/share/:token`).
+    // Their id is visible to anyone who can list shares, including scoped
+    // API keys, so it must not work as a credential of its own.
+    if fields.get("tokenHash").is_some_and(|h| !h.is_empty()) {
+        return not_found_share();
+    }
 
     let created = fields
         .get("created")

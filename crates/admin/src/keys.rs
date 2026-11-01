@@ -2,7 +2,7 @@
 //! Config defaults + validation ranges mirror `server.js` (`keyDefaults` plus
 //! the Elysia `t.Object` schemas).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 

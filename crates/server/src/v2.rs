@@ -71,12 +71,12 @@ pub fn decrypt_gcm(blob: &str, secret: &str, info: &str) -> Option<Value> {
     serde_json::from_slice(&plaintext).ok()
 }
 
-/// Build the rsw challenge entry: `{protocol, payload:{N,x,t}}` plus the sealed
-/// expectation `{protocol:"rsw", y}`. Returns `(challenge, expected)`.
-pub fn rsw_challenge(
+/// Build the CRT minter for a stored keypair and time parameter `t`. This is
+/// the expensive step (two full-size modpows); callers cache the result.
+pub fn rsw_minter(
     keypair_fields: &std::collections::HashMap<String, String>,
     t: u64,
-) -> Option<(Value, Value)> {
+) -> Option<RswMinter> {
     let kp_json = serde_json::json!({
         "N": keypair_fields.get("N")?,
         "p": keypair_fields.get("p")?,
@@ -84,14 +84,19 @@ pub fn rsw_challenge(
         "bits": keypair_fields.get("bits").and_then(|b| b.parse::<usize>().ok()),
     });
     let kp = deserialize_keypair(&kp_json)?;
-    let minter = RswMinter::build(&kp, t, None)?;
+    RswMinter::build(&kp, t, None)
+}
+
+/// Build the rsw challenge entry: `{protocol, payload:{N,x,t}}` plus the sealed
+/// expectation `{protocol:"rsw", y}`. Returns `(challenge, expected)`.
+pub fn rsw_challenge(minter: &RswMinter) -> (Value, Value) {
     let minted = minter.mint();
     let challenge = json!({
         "protocol": "rsw",
         "payload": { "N": minter.n_hex, "x": minted.x_hex, "t": minter.t },
     });
     let expected = json!({ "protocol": "rsw", "y": minted.y_hex });
-    Some((challenge, expected))
+    (challenge, expected)
 }
 
 /// Build hashwx challenge entries + their sealed expectations.

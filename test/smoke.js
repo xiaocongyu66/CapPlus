@@ -3,7 +3,12 @@ const CAP = process.env.CAP_URL || "http://localhost:3001";
 const SITE = "rusttest";
 const SECRET = "rust-smoke-secret-32-bytes-padding!";
 const UA = "Mozilla/5.0 (X11; Linux x86_64) RustSmoke/1.0";
-const { prng } = await import("/root/cpa/cap/core/src/prng.js");
+const { resolve } = await import("node:path");
+const { pathToFileURL } = await import("node:url");
+if (!process.env.CAP_JS_CORE_DIR) {
+  throw new Error("Smoke test requires CAP_JS_CORE_DIR pointing to the external JS reference core directory");
+}
+const { prng } = await import(pathToFileURL(resolve(process.env.CAP_JS_CORE_DIR, "src/prng.js")).href);
 const { createHash } = await import("node:crypto");
 
 const j = async (r) => [r.status, await r.json().catch(() => ({}))];

@@ -19,12 +19,6 @@
 
 use crate::rng::{Namer, Rng};
 
-/// JS `n | 0` for a value already produced by int32 arithmetic.
-#[inline]
-pub fn to_int32(n: i64) -> i32 {
-    n as i32
-}
-
 /// One chain step: a node carrying `text`, parented at `parent`.
 struct Node {
     parent: Option<usize>,
@@ -191,6 +185,7 @@ pub fn plan_state(rng: &mut Rng, namer: &mut Namer) -> StatePlan {
 /// implementation. A missing toolchain must fail the suite, not silently pass:
 /// set `CAP_SKIP_JS_PARITY=1` to skip deliberately (e.g. on a machine without
 /// bun or the reference tree).
+#[cfg(test)]
 fn parity_required(reason: &str) {
     if std::env::var("CAP_SKIP_JS_PARITY").as_deref() == Ok("1") {
         eprintln!("SKIP (CAP_SKIP_JS_PARITY=1): {reason}");

@@ -237,29 +237,34 @@ impl Store {
         Ok(self.kv.set_many_ex(&items, ttl_ms_to_secs(ttl_ms)).await?)
     }
 
-    pub async fn peek_token(&self, token: &str) -> Result<Option<i64>, StoreError> {
-        let raw = self.kv.get(&format!("token:{token}")).await?;
-        Ok(raw.and_then(|v| v.parse::<i64>().ok()))
+    /// Everything siteverify needs about a token in one round trip:
+    /// `(bind json, expiry ms, verified marker present)`.
+    pub async fn token_state(
+        &self,
+        token: &str,
+    ) -> Result<(Option<String>, Option<i64>, bool), StoreError> {
+        let got = self
+            .kv
+            .mget(&[
+                format!("bind:{token}"),
+                format!("token:{token}"),
+                format!("verified:{token}"),
+            ])
+            .await?;
+        let mut it = got.into_iter();
+        let bind = it.next().flatten();
+        let expires = it.next().flatten().and_then(|v| v.parse::<i64>().ok());
+        let verified = it.next().flatten().is_some();
+        Ok((bind, expires, verified))
     }
 
-    /// Atomic single-use claim. `true` = this caller consumed the token.
-    pub async fn consume_token(&self, token: &str) -> Result<bool, StoreError> {
-        Ok(self.kv.del(&format!("token:{token}")).await? > 0)
-    }
-
-    /// Raw bind record JSON for a token (parsed by the caller into
-    /// `cap_core::SessionBind`).
-    pub async fn peek_bind(&self, token: &str) -> Result<Option<String>, StoreError> {
-        Ok(self.kv.get(&format!("bind:{token}")).await?)
-    }
-
-    pub async fn has_verified(&self, token: &str) -> Result<bool, StoreError> {
-        Ok(self.kv.exists(&format!("verified:{token}")).await?)
-    }
-
-    pub async fn drop_verified(&self, token: &str) -> Result<(), StoreError> {
-        self.kv.del(&format!("verified:{token}")).await?;
-        Ok(())
+    /// Atomic single-use claim that also drops the `verified:` marker, in
+    /// one round trip. `true` = this caller consumed the token.
+    pub async fn consume_verified(&self, token: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .kv
+            .claim_del(&format!("token:{token}"), &format!("verified:{token}"))
+            .await?)
     }
 
     /// Fixed-window limiter. `true` = allowed.
@@ -410,13 +415,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(store.peek_token(&token).await.unwrap(), Some(expires));
-        assert!(store.has_verified(&token).await.unwrap());
-        assert!(store.consume_token(&token).await.unwrap());
-        assert!(!store.consume_token(&token).await.unwrap());
-        assert_eq!(store.peek_token(&token).await.unwrap(), None);
-        store.drop_verified(&token).await.unwrap();
-        assert!(!store.has_verified(&token).await.unwrap());
+        let (bind, exp, verified) = store.token_state(&token).await.unwrap();
+        assert!(bind.is_some());
+        assert_eq!(exp, Some(expires));
+        assert!(verified);
+        assert!(store.consume_verified(&token).await.unwrap());
+        assert!(!store.consume_verified(&token).await.unwrap());
+        let (_, exp, verified) = store.token_state(&token).await.unwrap();
+        assert_eq!(exp, None);
+        assert!(!verified, "verified marker dropped together with the token");
     }
 
     #[tokio::test]

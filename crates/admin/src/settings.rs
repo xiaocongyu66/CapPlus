@@ -127,8 +127,11 @@ pub(crate) async fn logout(
         }
     }
 
-    let _ = store.del(&format!("session:{session}")).await;
-    let _ = store.srem("sessions", &session).await;
+    // Revocation must not report success while the session still resolves.
+    if store.del(&format!("session:{session}")).await.is_err() {
+        return internal();
+    }
+    let _ = store.srem("sessions", &session).await; // index only
 
     let mut r = ok(json!({ "success": true }));
     // The cookie is HttpOnly, so the dashboard's JS cannot clear it; do it
@@ -234,7 +237,7 @@ pub(crate) async fn apikeys_create(store: &AdminStore, body: &Value) -> AdminRes
 
     let id = util::random_hex(16);
     let token = util::b64_strip(&util::random_bytes(32));
-    let token_hash = match util::argon2_hash(&token) {
+    let token_hash = match util::argon2_hash_async(&token).await {
         Ok(h) => h,
         Err(_) => return internal(),
     };
@@ -281,8 +284,10 @@ pub(crate) async fn apikeys_delete(store: &AdminStore, id: &str) -> AdminRespons
         }
         Err(_) => return internal(),
     }
-    let _ = store.del(&format!("apikey:{id}")).await;
-    let _ = store.srem("apikeys", id).await;
+    if store.del(&format!("apikey:{id}")).await.is_err() {
+        return internal();
+    }
+    let _ = store.srem("apikeys", id).await; // index only
     ok(json!({ "success": true }))
 }
 

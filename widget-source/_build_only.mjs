@@ -1,4 +1,8 @@
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
+// Resolve build inputs and outputs relative to this script.
+process.chdir(fileURLToPath(new URL(".", import.meta.url)));
 import JavaScriptObfuscator from "javascript-obfuscator";
 import { transform } from "lightningcss";
 import { minify } from "terser";

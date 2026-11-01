@@ -100,11 +100,6 @@ fn json_str(s: &str) -> String {
     serde_json::to_string(s).expect("string serialisation cannot fail")
 }
 
-fn json_nums(nums: &[u32]) -> String {
-    let parts: Vec<String> = nums.iter().map(|n| n.to_string()).collect();
-    format!("[{}]", parts.join(","))
-}
-
 /// Base sync probe fields. Every entry is `sf("name", function(){...});`.
 const BASE_FIELDS: &[&str] = &[
     r#"%SF%("ua",function(){return navigator.userAgent});"#,

@@ -1,7 +1,24 @@
 //! `POST /:siteKey/siteverify` (Turnstile-compatible), `/validate` and the
 //! `/turnstile/v0/siteverify` alias.
 
-use super::*;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use cap_core::SessionBind;
+use cap_store::now_ms;
+use cap_verify::{
+    bind_inputs, check_secret, err_response, ok_response, parse_body, parse_request,
+    token_site_key, ErrorCode, SecretCheck,
+};
+use serde_json::json;
+
+use crate::http_util::{client_ip, header_str};
+use crate::{rate_allowed, AppState};
 
 pub(crate) async fn verify_common(
     st: &AppState,
@@ -81,7 +98,16 @@ pub(crate) async fn verify_common(
         }
     };
 
-    match check_secret(&key.secret_hash, &req.secret) {
+    // Legacy `$argon2` hashes cost tens of ms; keep them off async workers.
+    let secret_check = if key.secret_hash.starts_with("$argon2") {
+        let (stored, provided) = (key.secret_hash.clone(), req.secret.clone());
+        tokio::task::spawn_blocking(move || check_secret(&stored, &provided))
+            .await
+            .unwrap_or(SecretCheck::Fast(false))
+    } else {
+        check_secret(&key.secret_hash, &req.secret)
+    };
+    match secret_check {
         SecretCheck::Fast(true) => {}
         SecretCheck::Fast(false) => {
             return (
@@ -105,7 +131,19 @@ pub(crate) async fn verify_common(
         }
     }
 
-    let bind_raw = st.store.peek_bind(&req.response).await.ok().flatten();
+    // One MGET for bind + token + verified marker, then one atomic claim:
+    // two round trips instead of five.
+    let (bind_raw, token_expires, verified) = match st.store.token_state(&req.response).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[siteverify] store_error: {e}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(err_response(ErrorCode::BadRequest, "Temporarily unavailable")),
+            )
+                .into_response();
+        }
+    };
     let bind = bind_raw
         .as_deref()
         .and_then(|raw| serde_json::from_str::<SessionBind>(raw).ok());
@@ -131,23 +169,24 @@ pub(crate) async fn verify_common(
             .into_response();
     }
 
-    // Peek before consume: a burned token must report "duplicate", not
-    // "not verified" — same ordering as the JS implementation.
-    let expires = match st.store.peek_token(&req.response).await {
-        Ok(Some(ts)) if ts > now_ms() => ts,
-        _ => {
-            return (
-                StatusCode::OK,
-                Json(err_response(
-                    ErrorCode::TimeoutOrDuplicate,
-                    "The response has already been redeemed or has expired.",
-                )),
-            )
-                .into_response()
-        }
+    // A burned token must report "duplicate", not "not verified" — same
+    // ordering as the JS implementation.
+    let duplicate = || {
+        (
+            StatusCode::OK,
+            Json(err_response(
+                ErrorCode::TimeoutOrDuplicate,
+                "The response has already been redeemed or has expired.",
+            )),
+        )
+            .into_response()
+    };
+    let expires = match token_expires {
+        Some(ts) if ts > now_ms() => ts,
+        _ => return duplicate(),
     };
 
-    if !st.store.has_verified(&req.response).await.unwrap_or(false) {
+    if !verified {
         return (
             StatusCode::OK,
             Json(err_response(
@@ -158,31 +197,40 @@ pub(crate) async fn verify_common(
             .into_response();
     }
 
-    if consume {
-        if !st.store.consume_token(&req.response).await.unwrap_or(false) {
-            return (
-                StatusCode::OK,
-                Json(err_response(
-                    ErrorCode::TimeoutOrDuplicate,
-                    "The response has already been redeemed or has expired.",
-                )),
-            )
-                .into_response();
-        }
-        let _ = st.store.drop_verified(&req.response).await;
+    if consume && !st.store.consume_verified(&req.response).await.unwrap_or(false) {
+        return duplicate();
     }
 
     let ts = bind.as_ref().map(|b| b.ts).unwrap_or_else(now_ms);
-    let hostname = bind
-        .as_ref()
-        .and_then(|b| b.host.clone())
-        .filter(|h| !h.is_empty())
-        .unwrap_or(ctx_host);
-    let mut resp = ok_response(ts, &hostname);
+    // Caller-provided hostname is only a comparison input, never provenance.
+    let hostname = bound_hostname(bind.as_ref());
+    let mut resp = ok_response(ts, hostname);
     if !consume {
         resp["expires"] = json!(expires);
     }
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+fn bound_hostname(bind: Option<&SessionBind>) -> &str {
+    bind.and_then(|b| b.host.as_deref()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::*;
+
+    #[test]
+    fn response_hostname_uses_only_server_binding() {
+        let mut bind = SessionBind::new(None, "UA", 1);
+        assert_eq!(ok_response(1, bound_hostname(None))["hostname"], "");
+        assert_eq!(ok_response(1, bound_hostname(Some(&bind)))["hostname"], "");
+        bind.host = Some("app.example".into());
+        assert_eq!(ok_response(1, bound_hostname(Some(&bind)))["hostname"], "app.example");
+        // A caller cannot replace the output hostname, even in non-strict mode.
+        assert!(!bind.matches(false, "", "UA", "forged.example"));
+        assert!(bind.matches(false, "", "UA", ""));
+        assert_eq!(bound_hostname(Some(&bind)), "app.example");
+    }
 }
 
 pub(crate) fn error_message(code: ErrorCode) -> &'static str {
@@ -196,6 +244,22 @@ pub(crate) fn error_message(code: ErrorCode) -> &'static str {
     }
 }
 
+/// 300 verifications per 10 s per IP and site key (matches siteverify.js).
+/// Applied to every verification entry point: each one checks a secret.
+async fn verify_limited(st: &AppState, headers: &HeaderMap, addr: &SocketAddr, scope: &str) -> Option<Response> {
+    let ip = client_ip(headers, &addr.ip().to_string());
+    if rate_allowed(st, &format!("siteverify:{scope}"), &ip, 10_000, 300).await {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(err_response(ErrorCode::BadRequest, "Rate limit exceeded")),
+        )
+            .into_response(),
+    )
+}
+
 pub(crate) async fn siteverify(
     State(st): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -203,39 +267,33 @@ pub(crate) async fn siteverify(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // 300 verifications per 10 s per IP (matches siteverify.js).
-    let ip = client_ip(&headers, &addr.ip().to_string());
-    let allowed = if st.redis_ratelimit {
-        st.store
-            .rate_hit(&format!("siteverify:{site_key}"), &ip, 10_000, 300)
-            .await
-            .unwrap_or(true)
-    } else {
-        st.limiter.hit(&format!("siteverify:{site_key}"), &ip, 10_000, 300)
-    };
-    if !allowed {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(err_response(ErrorCode::BadRequest, "Rate limit exceeded")),
-        )
-            .into_response();
+    if let Some(r) = verify_limited(&st, &headers, &addr, &site_key).await {
+        return r;
     }
     verify_common(&st, &headers, &body, Some(&site_key), true).await
 }
 
 pub(crate) async fn siteverify_alias(
     State(st): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Some(r) = verify_limited(&st, &headers, &addr, "_turnstile").await {
+        return r;
+    }
     verify_common(&st, &headers, &body, None, true).await
 }
 
 pub(crate) async fn validate(
     State(st): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(site_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Some(r) = verify_limited(&st, &headers, &addr, &site_key).await {
+        return r;
+    }
     verify_common(&st, &headers, &body, Some(&site_key), false).await
 }

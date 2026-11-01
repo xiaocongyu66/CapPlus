@@ -5,7 +5,9 @@ try {
   ({ chromium } = await import("playwright"));
 } catch {}
 
-const SHOULD_RUN_E2E = !process.env.SKIP_E2E && chromium;
+import { referenceUrl } from "../../test/js-reference.js";
+const coreReference = referenceUrl("index.js");
+const SHOULD_RUN_E2E = !process.env.SKIP_E2E && chromium && coreReference;
 
 if (!SHOULD_RUN_E2E) {
   test.skip("instrumentation e2e skipped", () => {});
@@ -14,10 +16,10 @@ if (!SHOULD_RUN_E2E) {
     "./test-server.js"
   );
   const { generateChallenge, validateChallenge } = await import(
-    "../../core/src/index.js"
+    coreReference
   );
   const { generateInstrumentation, verifyInstrumentationResult } = await import(
-    "../../core/src/instrumentation.js"
+    referenceUrl("instrumentation.js")
   );
   const { inflateRawSync } = await import("node:zlib");
 

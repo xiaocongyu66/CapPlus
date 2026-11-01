@@ -1,7 +1,19 @@
 //! Demo-mode page (reputation test), its verify proxy, and per-key request
 //! filtering (UA / required headers).
 
-use super::*;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use cap_core::random_hex;
+use cap_store::{now_ms, KeyConfig};
+use serde_json::{json, Value};
+
+use crate::http_util::{header_str, hourly_bucket};
+use crate::pages::dashboard_root;
+use crate::siteverify::verify_common;
+use crate::AppState;
 
 /// `GET /demo` — the original challenge tester (`tester.html`) with the demo
 /// site key and secret pre-filled, so the whole solve → verify loop can be
@@ -16,7 +28,10 @@ pub(crate) async fn demo_page(State(st): State<AppState>) -> Response {
     let (site_key, secret) = match demo_widget_credentials(&st).await {
         Ok(k) => k,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("demo key: {e}")).into_response()
+            {
+                eprintln!("[demo] demo key: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "demo key unavailable").into_response();
+            }
         }
     };
 
@@ -66,7 +81,10 @@ pub(crate) async fn demo_verify(State(st): State<AppState>, headers: HeaderMap, 
     let (site_key, secret) = match demo_widget_credentials(&st).await {
         Ok(k) => k,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("demo key: {e}")).into_response()
+            {
+                eprintln!("[demo] demo key: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "demo key unavailable").into_response();
+            }
         }
     };
     let token = serde_json::from_slice::<Value>(&body)

@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { prng } from "../../core/src/prng.js";
+import { referenceUrl } from "../../test/js-reference.js";
+const reference = referenceUrl("prng.js");
+const { prng } = reference ? await import(reference) : {};
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -45,7 +47,7 @@ describe("widget source structure", () => {
   });
 });
 
-describe("widget prng matches capjs-core prng", () => {
+(prng ? describe : describe.skip)("widget prng matches capjs-core prng", () => {
   function widgetPrng(seed, length) {
     function fnv1a(str) {
       let hash = 2166136261;
@@ -116,10 +118,29 @@ describe("regression: shadow root re-attach guard (#243-ish)", () => {
 });
 
 describe("regression: token sometimes not returned (widget@0.1.40)", () => {
-  test("setToken writes the token into the hidden input", () => {
-    expect(widgetSource).toMatch(
-      /#setToken\(value\)\s*\{[\s\S]*?querySelector\(`input\[name='\$\{this\.#fieldName\}'\]`\)[\s\S]*?\.value = value/,
+  // The field name comes from `data-cap-hidden-field-name`, so it is
+  // host-page controlled. Interpolated raw it could close the attribute
+  // selector (`x'][name='other`) and resolve to a different input, sending the
+  // token to the wrong field. Behavioural coverage lives in e2e.test.js
+  // ("hidden field") and e2e-regression.test.js ("custom name"); this asserts
+  // the escaping invariant that those cannot express.
+  test("field name is CSS-escaped in the hidden-input selector", () => {
+    expect(widgetSource).not.toMatch(
+      /querySelector\(\s*`input\[name='\$\{this\.#fieldName\}'\]`\s*\)/,
     );
+    expect(widgetSource).toMatch(
+      /querySelector\(\s*`input\[name='\$\{CSS\.escape\(this\.#fieldName\)\}'\]`\s*\)/,
+    );
+  });
+
+  test("setToken writes the token into the resolved input", () => {
+    expect(widgetSource).toMatch(
+      /#setToken\(value\)\s*\{[\s\S]*?const input =[\s\S]*?this\.#tokenInput[\s\S]*?if \(input\) input\.value = value;/,
+    );
+  });
+
+  test("hidden input is created with the configured field name", () => {
+    expect(widgetSource).toMatch(/#tokenInput\.name = this\.#fieldName/);
   });
 
   test("hidden input is set before solve event is dispatched", () => {

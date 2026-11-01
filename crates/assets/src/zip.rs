@@ -166,7 +166,7 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<ZipEntry>, ZipError> {
             0 => data.to_vec(),
             8 => {
                 let mut out = Vec::with_capacity(uncomp_size.min(MAX_FILE));
-                let mut decoder = flate2::read::DeflateDecoder::new(data);
+                let decoder = flate2::read::DeflateDecoder::new(data);
                 decoder
                     .take(MAX_FILE as u64 + 1)
                     .read_to_end(&mut out)

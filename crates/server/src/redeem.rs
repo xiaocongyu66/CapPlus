@@ -1,7 +1,24 @@
 //! `POST /:siteKey/redeem`: verify the proof, consume the challenge, issue the
 //! verification token and compute the trust verdict.
 
-use super::*;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use cap_core::{jwt_sig_hex, jwt_verify, random_hex, verify_pow, PowParams, SessionBind};
+use cap_store::now_ms;
+use serde_json::{json, Value};
+
+use crate::http_util::{client_ip, header_str, hourly_bucket, same_origin};
+use crate::integrity::{check_challenge_env, check_integrity};
+use crate::{
+    rate_allowed, record_geo, v2, AppState, CHALLENGE_TTL_MS, REDEEM_MAX_FAILS,
+    REDEEM_RL_MAX, REDEEM_RL_WINDOW_MS, TOKEN_TTL_MS,
+};
 
 pub(crate) async fn redeem(
     State(st): State<AppState>,
@@ -17,6 +34,15 @@ pub(crate) async fn redeem(
                 "error": "verified_session_required",
                 "reason": "solve challenges inside the Cap-hosted iframe (embed.js)"
             })),
+        )
+            .into_response();
+    }
+
+    let ip = client_ip(&headers, &addr.ip().to_string());
+    if !rate_allowed(&st, &format!("redeem:{site_key}"), &ip, REDEEM_RL_WINDOW_MS, REDEEM_RL_MAX).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "Rate limit exceeded"})),
         )
             .into_response();
     }
@@ -59,31 +85,44 @@ pub(crate) async fn redeem(
     let Some(claims) = jwt_verify(token, &key.jwt_secret) else {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid_token"}))).into_response();
     };
-    if claims.get("sk").and_then(Value::as_str) != Some(site_key.as_str()) {
+    // A challenge JWT is only good for redeeming a challenge of the site key
+    // it was minted for; `typ` keeps any other token signed with the same
+    // per-key secret from being presented here.
+    if claims.get("sk").and_then(Value::as_str) != Some(site_key.as_str())
+        || claims.get("typ").and_then(Value::as_str) != Some("chal")
+    {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "scope_mismatch"}))).into_response();
     }
-    if let Err(reason) =
+    // 验证前原子预占次数，确保并发请求也不能突破计算预算。
+    let attempt_key = format!("redeem-attempt:{}", jwt_sig_hex(token).unwrap_or_default());
+    let allowed = if st.redis_ratelimit {
+        st.kv
+            .incr_with_expire(&attempt_key, CHALLENGE_TTL_MS / 1000)
+            .await
+            .map(|count| count <= REDEEM_MAX_FAILS)
+            .unwrap_or(false)
+    } else {
+        st.limiter.claim_attempt(&attempt_key, CHALLENGE_TTL_MS, REDEEM_MAX_FAILS)
+    };
+    if !allowed {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "too_many_attempts"}))).into_response();
+    }
+    let parent = match
         check_challenge_env(&st, token, &headers, &addr, key.config.require_session_bind).await
     {
-        let _ = st
-            .kv
-            .hincrby(
-                &format!("metrics:failed:{site_key}"),
-                &hourly_bucket(now_ms()).to_string(),
-                1,
-            )
-            .await;
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": reason }))).into_response();
-    }
+        Ok(parent) => parent,
+        Err(reason) => {
+            st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
+            let status = if reason == "store_unavailable" {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (status, Json(json!({ "error": reason }))).into_response();
+        }
+    };
     if let Err(reason) = check_integrity(&claims, &payload, &key.jwt_secret) {
-        let _ = st
-            .kv
-            .hincrby(
-                &format!("metrics:failed:{site_key}"),
-                &hourly_bucket(now_ms()).to_string(),
-                1,
-            )
-            .await;
+        st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now_ms()).to_string(), 1);
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "integrity", "reason": reason })),
@@ -196,14 +235,7 @@ pub(crate) async fn redeem(
                 .and_then(|m| m.get("blockAutomatedBrowsers"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let _ = st
-                .kv
-                .hincrby(
-                    &format!("metrics:failed:{site_key}"),
-                    &hourly_bucket(now).to_string(),
-                    1,
-                )
-                .await;
+            st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
@@ -214,14 +246,7 @@ pub(crate) async fn redeem(
                 .into_response();
         }
         if timeout_flag {
-            let _ = st
-                .kv
-                .hincrby(
-                    &format!("metrics:failed:{site_key}"),
-                    &hourly_bucket(now).to_string(),
-                    1,
-                )
-                .await;
+            st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": "instr_timeout", "instr_error": true})),
@@ -297,10 +322,8 @@ pub(crate) async fn redeem(
             return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid_token"}))).into_response();
         }
         if !verify_pow(token, params, &solutions) {
-            let _ = st
-                .store
-                .incr_metric(&format!("metrics:failed:{site_key}"), hourly_bucket(now))
-                .await;
+            st.metrics
+                .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": "Invalid solution"})),
@@ -324,7 +347,7 @@ pub(crate) async fn redeem(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("nonce_store_error: {e}")})),
+                { eprintln!("[redeem] nonce_store_error: {e}"); Json(json!({"error": "nonce_store_error"})) },
             )
                 .into_response()
         }
@@ -336,10 +359,7 @@ pub(crate) async fn redeem(
             trust.score, trust.level
         );
         if matches!(action, cap_detect::Action::Deny) && key.config.block_on_deny {
-            let _ = st
-                .store
-                .incr_metric(&format!("metrics:failed:{site_key}"), hourly_bucket(now))
-                .await;
+            st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
             let mut doc = json!({ "success": false, "error": "trust_denied" });
             if st.admin_cfg.demo {
                 doc["trust"] = trust_json(trust);
@@ -351,8 +371,8 @@ pub(crate) async fn redeem(
 
     let redeem_token = format!("{site_key}:{}:{}", random_hex(8), random_hex(15));
     let ua = header_str(&headers, "user-agent");
-    let ip = client_ip(&headers, &addr.ip().to_string());
-    let bind = SessionBind::new(if ip.is_empty() { None } else { Some(ip) }, &ua, now);
+    let mut bind = SessionBind::new(if ip.is_empty() { None } else { Some(ip) }, &ua, now);
+    bind.host = parent.as_deref().and_then(cap_embed::origin_hostname);
     let token_expires = now + TOKEN_TTL_MS;
     if let Err(e) = st
         .store
@@ -361,7 +381,7 @@ pub(crate) async fn redeem(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("bind_failed: {e}")})),
+            { eprintln!("[redeem] bind_failed: {e}"); Json(json!({"error": "bind_failed"})) },
         )
             .into_response();
     }

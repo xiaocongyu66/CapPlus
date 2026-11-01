@@ -1,4 +1,8 @@
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
+// Resolve build inputs, outputs and subprocesses relative to this script.
+process.chdir(fileURLToPath(new URL(".", import.meta.url)));
 import JavaScriptObfuscator from "javascript-obfuscator";
 import { transform } from "lightningcss";
 import { chromium } from "playwright";

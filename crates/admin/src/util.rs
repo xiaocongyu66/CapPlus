@@ -107,6 +107,23 @@ pub fn argon2_verify(password: &str, phc: &str) -> bool {
     }
 }
 
+/// [`argon2_verify`] on the blocking pool. Argon2 is deliberately slow
+/// (tens of ms); running it inline would stall an async worker per request.
+pub async fn argon2_verify_async(password: &str, phc: &str) -> bool {
+    let (password, phc) = (password.to_string(), phc.to_string());
+    tokio::task::spawn_blocking(move || argon2_verify(&password, &phc))
+        .await
+        .unwrap_or(false)
+}
+
+/// [`argon2_hash`] on the blocking pool.
+pub async fn argon2_hash_async(password: &str) -> Result<String, String> {
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || argon2_hash(&password))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Normalize an integrity hash the way `integrity.js#norm` does: trim, lower,
 /// drop a leading `sha256-`, and require 64 hex chars. Returns `None` otherwise.
 pub fn norm_hash(v: &Value) -> Option<String> {

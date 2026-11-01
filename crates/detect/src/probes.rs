@@ -225,6 +225,7 @@ const ALLOW_TOP: &[&str] = &[
 
 mod detect;
 mod support;
+#[cfg(test)]
 mod tests;
 
 pub use detect::*;

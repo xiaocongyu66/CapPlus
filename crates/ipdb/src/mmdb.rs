@@ -51,6 +51,7 @@ pub struct Mmdb {
     node_count: usize,
     record_size: u32,
     ip_version: u16,
+    #[cfg(test)]
     tree_size: usize,
     data_start: usize,
 }
@@ -64,6 +65,7 @@ impl Mmdb {
             node_count: 0,
             record_size: 0,
             ip_version: 0,
+            #[cfg(test)]
             tree_size: 0,
             data_start: 0,
         };
@@ -82,6 +84,7 @@ impl Mmdb {
             node_count,
             record_size,
             ip_version,
+            #[cfg(test)]
             tree_size,
             data_start: tree_size,
             ..db

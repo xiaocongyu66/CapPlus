@@ -65,55 +65,12 @@ fn unauth(msg: &str) -> AdminResponse {
     resp(401, json!({ "success": false, "error": msg }))
 }
 
-/// Resolve the client IP for rate limiting.
-///
-/// The lead documents proxy trust, so the *first* `x-forwarded-for` value is
-/// used when the header is present. Without the header we return the literal
-/// `"unknown"`; because a constant key would throttle every anonymous client
-/// as one bucket, login limiting is skipped for `"unknown"` (documented in
-/// [`login`]).
-pub(crate) fn client_ip(headers: &[(String, String)], peer: &str) -> String {
-    // The transport peer is authoritative. Only when it is a local/private
-    // address (i.e. a reverse proxy) is the forwarded header consulted; that
-    // matches how `trust_proxy` works for the public API, and it means an
-    // anonymous client always lands in a stable bucket instead of skipping
-    // the limiter.
-    let local = peer.starts_with("127.")
-        || peer == "::1"
-        || peer.starts_with("10.")
-        || peer.starts_with("192.168.")
-        || peer.starts_with("172.16.")
-        || peer.starts_with("172.17.")
-        || peer.starts_with("172.18.")
-        || peer.starts_with("172.19.")
-        || peer.starts_with("172.2")
-        || peer.starts_with("172.30.")
-        || peer.starts_with("172.31.");
-    if !local {
-        return if peer.is_empty() {
-            "unknown".into()
-        } else {
-            peer.to_string()
-        };
-    }
-    match header(headers, "x-forwarded-for") {
-        Some(v) => v
-            .split(',')
-            .map(|p| p.trim())
-            .find(|p| !p.is_empty())
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| peer.to_string()),
-        None => peer.to_string(),
-    }
-}
-
 /// `POST /auth/login` — verifies the admin key, mints a session token, stores
 /// its argon2 hash in `session:<hash>` (TTL 30d) and registers it in `sessions`.
 ///
-/// Rate limiting: fixed window per client IP, key
-/// `rl:login:<ip>:60000:<window>`, allowed while `count <= 20`. When the client
-/// IP is `"unknown"` (no `x-forwarded-for`) the limit is skipped — a shared
-/// constant bucket would lock out every anonymous client at once.
+/// Rate limiting: fixed window per client IP ([`AdminRequest::peer`]), key
+/// `rl:login:<ip>:<LOGIN_WINDOW_MS>:<window>`, allowed while
+/// `count <= LOGIN_MAX`. It is never skipped.
 pub(crate) async fn login(
     store: &AdminStore,
     cfg: &AdminConfig,
@@ -123,7 +80,7 @@ pub(crate) async fn login(
         return ok(json!({ "success": true, "demo": true }));
     }
 
-    let ip = client_ip(req.headers, req.peer);
+    let ip = req.peer;
     {
         let window = util::now_ms() / LOGIN_WINDOW_MS;
         let key = format!("rl:login:{ip}:{LOGIN_WINDOW_MS}:{window}");
@@ -160,7 +117,7 @@ pub(crate) async fn login(
     let expires = now + SESSION_TTL_MS;
     let created = now;
 
-    let hashed_token = match util::argon2_hash(&session_token) {
+    let hashed_token = match util::argon2_hash_async(&session_token).await {
         Ok(h) => h,
         Err(_) => return internal(),
     };
@@ -188,9 +145,13 @@ pub(crate) async fn login(
     // install (same host, different service) resolves to nothing here, so the
     // panel shows the login page instead of a broken half-session.
     let cookie_value = cookie_value(&hashed_token);
-    let _ = store
+    if store
         .set_ex(&cookie_session_key(&cookie_value), "1", ttl_seconds)
-        .await;
+        .await
+        .is_err()
+    {
+        return internal();
+    }
     r.headers.push((
         "Set-Cookie".into(),
         auth_cookie(Some(&cookie_value), Some(expires), request_is_https(req.headers)),
@@ -253,7 +214,7 @@ pub(crate) async fn authenticate(
         return Err(unauth("Unauthorized. An invalid session token was used."));
     }
 
-    if !util::argon2_verify(token, hash) {
+    if !util::argon2_verify_async(token, hash).await {
         return Err(unauth("Unauthorized. An invalid session token was used."));
     }
 
@@ -287,7 +248,7 @@ async fn authenticate_bot(
         _ => return Err(unauth("Unauthorized. Deleted or non-existent bot token.")),
     };
 
-    if !util::argon2_verify(token, &token_hash) {
+    if !util::argon2_verify_async(token, &token_hash).await {
         return Err(unauth("Unauthorized. Invalid bot token."));
     }
 
@@ -337,6 +298,18 @@ pub(crate) fn scope_guard(
 ) -> Option<AdminResponse> {
     let scope = scope.as_ref()?;
     let is_read = method == "GET" || method == "HEAD";
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // API keys manage site data only. Everything global (settings, other API
+    // keys, sessions, 2FA, integrity baseline, ipdb) needs an admin session:
+    // otherwise a leaked unscoped key could mint new keys or rewrite CORS and
+    // rate limits.
+    if !matches!(segs.first().copied(), Some("keys" | "shares" | "about")) {
+        return Some(resp(
+            403,
+            json!({ "success": false, "error": "Forbidden. Session token required." }),
+        ));
+    }
 
     if scope.readonly && !is_read {
         return Some(resp(
@@ -346,7 +319,6 @@ pub(crate) fn scope_guard(
     }
 
     let site_keys = scope.site_keys.as_ref()?;
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     // Share routes are passed through here; the fine-grained site-key check
     // (body.siteKey on create, share owner on delete, per-key filtering on

@@ -2,8 +2,7 @@ use serde_json::json;
 
 use super::*;
 
-    /// The vendored reference detector (`crates/detect/testdata/js/detect.js`),
-    /// falling back to the sibling Cap checkout for local development.
+    /// Use the vendored detector or an explicitly configured external core.
     fn js_reference_path() -> Option<std::path::PathBuf> {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let vendored = manifest.join("testdata").join("js").join("detect.js");
@@ -12,10 +11,7 @@ use super::*;
                 return Some(p);
             }
         }
-        workspace_root()
-            .join("..")
-            .join("cap")
-            .join("core")
+        std::path::PathBuf::from(std::env::var_os("CAP_JS_CORE_DIR")?)
             .join("src")
             .join("detect.js")
             .canonicalize()

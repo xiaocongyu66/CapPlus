@@ -353,7 +353,7 @@ pub fn sanitize_vector(v: &mut Value) {
 // completeness / geometry
 // ---------------------------------------------------------------------------
 
-pub(crate) fn type_ok(v: Option<&Value>, kind: Kind) -> bool {
+pub(super) fn type_ok(v: Option<&Value>, kind: Kind) -> bool {
     match kind {
         Kind::Str => matches!(v, Some(Value::String(_))),
         Kind::Bool => matches!(v, Some(Value::Bool(_))),

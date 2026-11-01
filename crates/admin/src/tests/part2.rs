@@ -9,18 +9,6 @@ use super::*;
         assert_eq!(share_view_id("/shares/"), None);
         assert_eq!(share_view_id("/shares/a/b"), None);
         assert_eq!(share_view_id("/keys/abc"), None);
-
-        // A public peer is authoritative; the forwarded header is ignored.
-        let h = vec![(
-            "X-Forwarded-For".to_string(),
-            "203.0.113.7, 10.0.0.2".into(),
-        )];
-        assert_eq!(auth::client_ip(&h, "198.51.100.9"), "198.51.100.9");
-        // Behind a local proxy the header is used, first value only.
-        assert_eq!(auth::client_ip(&h, "127.0.0.1"), "203.0.113.7");
-        let h = vec![("x-forwarded-for".into(), "   ".into())];
-        assert_eq!(auth::client_ip(&h, "127.0.0.1"), "127.0.0.1");
-        assert_eq!(auth::client_ip(&[], "127.0.0.1"), "127.0.0.1");
     }
 
     // --- redis-backed: demo mode is read-only ----------------------------
@@ -141,7 +129,7 @@ use super::*;
         };
 
         let ip = format!("198.51.100.{}", (util::now_ms() % 200) + 1);
-        let headers = vec![("X-Forwarded-For".to_string(), format!("{ip}, 10.0.0.1"))];
+        let headers = vec![("x-test-peer".to_string(), ip.clone())];
 
         // 200 attempts are allowed (they fail auth but still count).
         for i in 0..200 {
@@ -176,19 +164,17 @@ use super::*;
         let window = util::now_ms() / 20_000;
         let _ = store.del(&format!("rl:login:{ip}:20000:{window}")).await;
 
-        // No x-forwarded-for -> "unknown" -> limiting skipped (never 429).
-        for _ in 0..25 {
-            let r = call(
-                &store,
-                &cfg,
-                "POST",
-                "/auth/login",
-                vec![],
-                json!({"admin_key": "wrong"}),
-            )
-            .await;
-            assert_eq!(r.status, 401);
+        // Forwarded headers are ignored by the admin crate: rotating them
+        // does not escape the bucket of the resolved client address.
+        let mut spoofed = headers.clone();
+        spoofed.push(("X-Forwarded-For".into(), "203.0.113.99".into()));
+        for _ in 0..200 {
+            let _ = call(&store, &cfg, "POST", "/auth/login", spoofed.clone(), json!({"admin_key": "wrong"})).await;
         }
+        let r = call(&store, &cfg, "POST", "/auth/login", spoofed, json!({"admin_key": "wrong"})).await;
+        assert_eq!(r.status, 429);
+        let window = util::now_ms() / 20_000;
+        let _ = store.del(&format!("rl:login:{ip}:20000:{window}")).await;
     }
 
     // --- redis-backed: shares create/get/list/delete + expiry ------------

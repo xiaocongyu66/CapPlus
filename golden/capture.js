@@ -1,8 +1,15 @@
 // Captures a real widget-generated instrumentation payload + challenge from the
 // JS stack, so the Rust detect/instr ports can be diffed against ground truth.
-const CHROME = "/bin/chromium", PORT = 9281, TO = "http://localhost:4000/";
-const OUT = new URL("./instr-sample.json", import.meta.url).pathname;
-const proc = Bun.spawn([CHROME, `--remote-debugging-port=${PORT}`, "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", `--user-data-dir=/tmp/gold-${Date.now()}`, "about:blank"], { stdout: "ignore", stderr: "ignore" });
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const CHROME = process.env.CHROME_BIN || "chromium", PORT = 9281, TO = "http://localhost:4000/";
+const OUT = fileURLToPath(new URL("./instr-sample.json", import.meta.url));
+const profile = mkdtempSync(join(tmpdir(), "cap-gold-"));
+process.on("exit", () => rmSync(profile, { recursive: true, force: true }));
+const proc = Bun.spawn([CHROME, `--remote-debugging-port=${PORT}`, "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", `--user-data-dir=${profile}`, "about:blank"], { stdout: "ignore", stderr: "ignore" });
 const sleep = (ms) => Bun.sleep(ms);
 for (let i = 0; i < 100; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/json/version`)).ok) break; } catch {} await sleep(200); }
 let page; for (let i = 0; i < 40 && !page; i++) { const t = await (await fetch(`http://127.0.0.1:${PORT}/json`)).json(); page = t.find((x) => x.type === "page"); if (!page) await sleep(250); }

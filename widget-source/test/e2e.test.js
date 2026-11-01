@@ -5,7 +5,9 @@ try {
   ({ chromium } = await import("playwright"));
 } catch {}
 
-const SHOULD_RUN_E2E = !process.env.SKIP_E2E && chromium;
+import { referenceUrl } from "../../test/js-reference.js";
+const coreReference = referenceUrl("index.js");
+const SHOULD_RUN_E2E = !process.env.SKIP_E2E && chromium && coreReference;
 
 if (!SHOULD_RUN_E2E) {
   test.skip("e2e tests skipped (set SKIP_E2E=0 and `bun add playwright`)", () => {});
@@ -14,7 +16,7 @@ if (!SHOULD_RUN_E2E) {
     "./test-server.js"
   );
   const { generateChallenge, validateChallenge } = await import(
-    "../../core/src/index.js"
+    coreReference
   );
 
   const SECRET = "e2e-test-secret-32-bytes-padding-junk-1234";

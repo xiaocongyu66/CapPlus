@@ -45,15 +45,19 @@ fn hotp(secret_b32: &str, counter: u64) -> Option<String> {
 
 /// Verify a 6-digit code against the current time step (±1).
 pub(crate) fn verify(secret_b32: &str, code: &str) -> bool {
+    matching_counter(secret_b32, code).is_some()
+}
+
+/// The time step a valid code belongs to, so the caller can mark it used.
+fn matching_counter(secret_b32: &str, code: &str) -> Option<u64> {
     let code = code.trim().replace(' ', "");
     if code.len() != DIGITS as usize || !code.chars().all(|c| c.is_ascii_digit()) {
-        return false;
+        return None;
     }
     let now = util::now_secs() / STEP;
-    (-DRIFT..=DRIFT).any(|d| {
-        let counter = (now + d).max(0) as u64;
-        hotp(secret_b32, counter).as_deref() == Some(code.as_str())
-    })
+    (-DRIFT..=DRIFT)
+        .map(|d| (now + d).max(0) as u64)
+        .find(|&counter| hotp(secret_b32, counter).as_deref() == Some(code.as_str()))
 }
 
 /// `otpauth://` URI for authenticator apps.
@@ -128,7 +132,7 @@ pub(crate) async fn enable(store: &AdminStore, body: &Value) -> crate::AdminResp
     let codes = recovery_codes();
     let mut hashes = Vec::new();
     for c in &codes {
-        match util::argon2_hash(c) {
+        match util::argon2_hash_async(c).await {
             Ok(h) => hashes.push(h),
             Err(_) => return internal(),
         }
@@ -164,9 +168,13 @@ pub(crate) async fn disable(
     if !util::admin_key_eq(&cfg.admin_key, provided) {
         return resp(401, json!({ "success": false, "error": "Incorrect admin key" }));
     }
-    let _ = store
+    if store
         .hdel_fields(TWOFA_KEY, &["totpSecret", "totpEnabled", "recovery", "totpPending"])
-        .await;
+        .await
+        .is_err()
+    {
+        return internal();
+    }
     ok(json!({ "success": true }))
 }
 
@@ -182,8 +190,15 @@ pub(crate) async fn check_second_factor(
 
     if let Some(code) = body.get("code").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
         if let Some(secret) = h.get("totpSecret") {
-            if verify(secret, code) {
-                return Ok(true);
+            if let Some(counter) = matching_counter(secret, code) {
+                // One login per time step: an observed code cannot be
+                // replayed inside its validity window. SET NX makes the
+                // claim atomic across concurrent logins.
+                let used_key = format!("2fa:totp-used:{counter}");
+                let ttl = STEP * (2 * DRIFT + 2);
+                if store.set_nx_ex(&used_key, "1", ttl).await.unwrap_or(false) {
+                    return Ok(true);
+                }
             }
         }
         return Err(resp(
@@ -201,7 +216,14 @@ pub(crate) async fn check_second_factor(
             .get("recovery")
             .and_then(|v| serde_json::from_str(v).ok())
             .unwrap_or_default();
-        if let Some(pos) = hashes.iter().position(|h| util::argon2_verify(code, h)) {
+        let mut found = None;
+        for (i, h) in hashes.iter().enumerate() {
+            if util::argon2_verify_async(code, h).await {
+                found = Some(i);
+                break;
+            }
+        }
+        if let Some(pos) = found {
             // Consume atomically: the read-modify-write below is not, so two
             // concurrent logins with the same code would both succeed.
             let used_key = format!("2fa:recovery-used:{}", hashes[pos]);
@@ -216,7 +238,10 @@ pub(crate) async fn check_second_factor(
                 ));
             }
             hashes.remove(pos);
-            let _ = store
+            // The NX marker above already stops reuse; if removing the code
+            // from the list fails, refuse the login rather than leave a code
+            // that works again once the marker expires.
+            if store
                 .hset_pairs(
                     TWOFA_KEY,
                     &[(
@@ -224,7 +249,11 @@ pub(crate) async fn check_second_factor(
                         serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into()),
                     )],
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                return Err(internal());
+            }
             return Ok(true);
         }
         return Err(resp(

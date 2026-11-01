@@ -92,6 +92,18 @@ impl Kv {
         Ok(got.as_deref() == Some("OK"))
     }
 
+    /// `MGET k1 k2 …` in one round trip.
+    pub async fn mget(&self, keys: &[String]) -> KvResult<Vec<Option<String>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cmd = redis::cmd("MGET");
+        for k in keys {
+            cmd.arg(k);
+        }
+        self.query(cmd).await
+    }
+
     /// `DEL key` → number of keys removed.
     pub async fn del(&self, key: &str) -> KvResult<i64> {
         self.query(redis::cmd("DEL").arg(key).clone()).await
@@ -132,6 +144,23 @@ impl Kv {
         .invoke_async(&mut conn)
         .await
         .map_err(Into::into)
+    }
+
+    /// Atomically delete `claim` and, only if it existed, `also`. Returns
+    /// whether `claim` was deleted by this call, so it works as a single-use
+    /// claim that cleans up a companion key in the same round trip.
+    pub async fn claim_del(&self, claim: &str, also: &str) -> KvResult<bool> {
+        let mut conn = self.conn.clone();
+        let n: i64 = redis::Script::new(
+            "local c = redis.call('DEL', KEYS[1]) \
+             if c == 1 then redis.call('DEL', KEYS[2]) end \
+             return c",
+        )
+        .key(claim)
+        .key(also)
+        .invoke_async(&mut conn)
+        .await?;
+        Ok(n == 1)
     }
 
     /// Several `HINCRBY`s in one pipeline round trip.

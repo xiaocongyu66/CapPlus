@@ -1,14 +1,5 @@
 use super::*;
 
-pub(crate) fn parity_required(reason: &str) {
-    if std::env::var("CAP_SKIP_JS_PARITY").as_deref() == Ok("1") {
-        eprintln!("SKIP (CAP_SKIP_JS_PARITY=1): {reason}");
-        return;
-    }
-    panic!("{reason}; install bun and the reference tree, or set CAP_SKIP_JS_PARITY=1");
-}
-
-    use super::*;
     use serde_json::{json, Value};
 
 

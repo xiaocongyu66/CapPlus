@@ -1,7 +1,11 @@
 //! Small HTTP helpers: client IP resolution, origin checks, UA parsing and
 //! path/CIDR matching. Pure functions plus a couple of config reads.
 
-use super::*;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use cap_store::KeyConfig;
+
+use crate::settings;
 
 /// JS-compatible metric bucket: epoch seconds rounded down to the hour.
 pub(crate) fn hourly_bucket(now_ms: i64) -> i64 {
@@ -9,25 +13,23 @@ pub(crate) fn hourly_bucket(now_ms: i64) -> i64 {
 }
 
 pub(crate) fn is_loopback_or_private(addr: &str) -> bool {
-    if addr == "::1" || addr.starts_with("127.") || addr.starts_with("::ffff:127.") {
-        return true;
-    }
-    if addr.starts_with("10.")
-        || addr.starts_with("192.168.")
-        || addr.starts_with("169.254.")
-        || addr.starts_with("fc")
-        || addr.starts_with("fd")
-    {
-        return true;
-    }
-    if let Some(rest) = addr.strip_prefix("172.") {
-        if let Some(second) = rest.split('.').next() {
-            if let Ok(n) = second.parse::<u8>() {
-                return (16..=31).contains(&n);
-            }
+    use std::net::IpAddr;
+    let ip = match addr.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            // fc00::/7 unique-local, fe80::/10 link-local
+            v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
         }
     }
-    false
 }
 
 pub(crate) fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
@@ -39,42 +41,63 @@ pub(crate) fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
         Some(secret) if !secret.is_empty() => headers
             .get("x-cap-proxy-secret")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == secret)
+            .map(|v| {
+                use sha2::{Digest, Sha256};
+                // Compare fixed-size digests so the comparison time does not
+                // depend on how much of the secret matched.
+                let a = Sha256::digest(v.as_bytes());
+                let b = Sha256::digest(secret.as_bytes());
+                a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+            })
             .unwrap_or(false),
         _ => is_loopback_or_private(peer),
     }
 }
 
 pub(crate) fn client_ip(headers: &HeaderMap, peer: &str) -> String {
-    // Forwarded headers are client-controlled. Like cap.js `getClientIp`,
-    // they are only trusted when the operator declares a trusted proxy
-    // (CAP_TRUST_PROXY=true); otherwise the peer address wins, so a client
-    // cannot spoof an IP to dodge the limiter or the blocklist.
+    // Forwarded headers are client-controlled. They are only consulted when
+    // the operator declares a trusted proxy (CAP_TRUST_PROXY=true); otherwise
+    // the peer address wins, so a client cannot spoof an IP to dodge the
+    // limiter or the blocklist.
     if !proxy_trusted(headers, peer) {
         return peer.to_string();
     }
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let configured = settings().ip_header.clone();
     if !configured.is_empty() {
-        if let Some(v) = headers.get(configured.as_str()).and_then(|v| v.to_str().ok()) {
-            if let Some(first) = v.split(',').next() {
-                let ip = first.trim();
-                if !ip.is_empty() {
-                    return ip.to_string();
-                }
-            }
+        // An explicitly configured header is the only source: falling through
+        // to XFF would let a client supply the address when the header is
+        // absent.
+        return get(configured.as_str())
+            .and_then(forwarded_client)
+            .unwrap_or_else(|| peer.to_string());
+    }
+    // Single-value headers that a proxy sets (overwrites) rather than appends.
+    for h in ["cf-connecting-ip", "x-real-ip"] {
+        if let Some(ip) = get(h).and_then(forwarded_client) {
+            return ip;
         }
     }
-    for h in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"] {
-        if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
-            if let Some(first) = v.split(',').next() {
-                let ip = first.trim();
-                if !ip.is_empty() {
-                    return ip.to_string();
-                }
-            }
-        }
-    }
-    peer.to_string()
+    get("x-forwarded-for")
+        .and_then(forwarded_client)
+        .unwrap_or_else(|| peer.to_string())
+}
+
+/// Pick the client from a forwarded list. Proxies append, so everything left
+/// of the last hop the operator controls is attacker-supplied: walk from the
+/// right and take the first address that is not one of our (private) proxies.
+fn forwarded_client(v: &str) -> Option<String> {
+    let hops: Vec<&str> = v
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    hops.iter()
+        .rev()
+        .find(|h| !is_loopback_or_private(h))
+        .or_else(|| hops.first())
+        .filter(|h| h.parse::<std::net::IpAddr>().is_ok())
+        .map(|h| h.to_string())
 }
 
 pub(crate) fn header_str(headers: &HeaderMap, name: &str) -> String {
@@ -171,24 +194,87 @@ pub(crate) fn parse_ua(ua: &str) -> (Option<&'static str>, Option<&'static str>)
     (platform, os)
 }
 
-/// Whether `ip` falls inside `net` (`a.b.c.d/len`, IPv4 only).
+/// 判断 IPv4 或 IPv6 地址是否属于给定网段。
 pub(crate) fn cidr_match(net: &str, ip: &str) -> bool {
-    let (base, len) = match net.split_once('/') {
-        Some((b, l)) => (b, l),
-        None => return net == ip,
+    use std::net::IpAddr;
+    let (base, prefix) = match net.split_once('/') {
+        Some((base, prefix)) => (base, Some(prefix)),
+        None => (net, None),
     };
-    let Ok(len) = len.parse::<u32>() else {
+    let (Ok(base), Ok(ip)) = (base.parse::<IpAddr>(), ip.parse::<IpAddr>()) else {
         return false;
     };
-    if len > 32 {
-        return false;
+    let prefix = match prefix.map(str::parse::<u32>).transpose() {
+        Ok(prefix) => prefix,
+        Err(_) => return false,
+    };
+    match (base, ip) {
+        (IpAddr::V4(base), IpAddr::V4(ip)) => {
+            let prefix = prefix.unwrap_or(32);
+            if prefix > 32 { return false; }
+            let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+            (u32::from(base) & mask) == (u32::from(ip) & mask)
+        }
+        (IpAddr::V6(base), IpAddr::V6(ip)) => {
+            let prefix = prefix.unwrap_or(128);
+            if prefix > 128 { return false; }
+            let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+            (u128::from(base) & mask) == (u128::from(ip) & mask)
+        }
+        (IpAddr::V4(_), IpAddr::V6(ip)) => ip
+            .to_ipv4_mapped()
+            .is_some_and(|ip| cidr_match(net, &ip.to_string())),
+        _ => false,
     }
-    let (Ok(base), Ok(ip)) = (
-        base.parse::<std::net::Ipv4Addr>(),
-        ip.parse::<std::net::Ipv4Addr>(),
-    ) else {
-        return false;
-    };
-    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
-    (u32::from(base) & mask) == (u32::from(ip) & mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_and_ipv6_cidrs() {
+        for (net, ip) in [
+            ("192.0.2.0/24", "192.0.2.42"),
+            ("0.0.0.0/0", "203.0.113.1"),
+            ("2001:db8::/32", "2001:db8:abcd::1"),
+            ("::/0", "fd00::1"),
+            ("2001:db8::1/128", "2001:0db8:0:0:0:0:0:1"),
+            ("192.0.2.0/24", "::ffff:192.0.2.42"),
+        ] {
+            assert!(cidr_match(net, ip), "{net} {ip}");
+        }
+        for (net, ip) in [
+            ("2001:db8::/32", "2001:db9::1"),
+            ("::/129", "::1"),
+            ("192.0.2.0/33", "192.0.2.1"),
+            ("::/0", "192.0.2.1"),
+            ("invalid/24", "192.0.2.1"),
+        ] {
+            assert!(!cidr_match(net, ip), "{net} {ip}");
+        }
+    }
+
+    #[test]
+    fn private_ranges() {
+        for ip in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.1", "192.168.1.1", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1"] {
+            assert!(is_loopback_or_private(ip), "{ip}");
+        }
+        for ip in ["172.2.0.1", "172.200.1.1", "172.32.0.1", "8.8.8.8", "2001:db8::1", "fcdn.example", ""] {
+            assert!(!is_loopback_or_private(ip), "{ip}");
+        }
+    }
+
+    #[test]
+    fn forwarded_takes_rightmost_public_hop() {
+        // Client-supplied left part is ignored.
+        assert_eq!(forwarded_client("1.1.1.1, 203.0.113.7").as_deref(), Some("203.0.113.7"));
+        // Our own proxies on the right are skipped.
+        assert_eq!(forwarded_client("6.6.6.6, 203.0.113.7, 10.0.0.2").as_deref(), Some("203.0.113.7"));
+        // All-private chain: first hop.
+        assert_eq!(forwarded_client("10.0.0.5, 10.0.0.2").as_deref(), Some("10.0.0.5"));
+        // Garbage is rejected rather than used as a bucket key.
+        assert_eq!(forwarded_client("not-an-ip"), None);
+        assert_eq!(forwarded_client("  ,  "), None);
+    }
 }

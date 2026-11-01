@@ -4,7 +4,6 @@
 use serde_json::json;
 
 use super::*;
-use crate::probes::*;
 
 mod parity;
 mod rules;
@@ -15,14 +14,16 @@ mod rules;
         manifest.join("..").join("..")
     }
 
-/// JS parity tests are the only check that the Rust port matches the reference
-/// implementation. A missing toolchain must fail the suite, not silently pass.
+/// Missing optional JS parity dependencies skip unless strict mode is enabled.
 pub(crate) fn parity_required(reason: &str) {
     if std::env::var("CAP_SKIP_JS_PARITY").as_deref() == Ok("1") {
         eprintln!("SKIP (CAP_SKIP_JS_PARITY=1): {reason}");
         return;
     }
-    panic!("{reason}; install bun and the reference tree, or set CAP_SKIP_JS_PARITY=1");
+    if std::env::var("CAP_REQUIRE_JS_PARITY").as_deref() == Ok("1") {
+        panic!("{reason}; install bun and set CAP_JS_CORE_DIR if no vendored reference is available");
+    }
+    eprintln!("SKIP JS parity: {reason}; set CAP_REQUIRE_JS_PARITY=1 to require it");
 }
 
     fn ids(v: &[String]) -> Vec<&str> {

@@ -54,9 +54,9 @@ pub struct AdminRequest<'a> {
     pub query: &'a str,
     pub headers: &'a [(String, String)],
     pub body: &'a [u8],
-    /// Transport peer address. Rate limiting keys on this, never on a
-    /// client-supplied header (which would let a login brute-forcer dodge the
-    /// limiter by omitting or rotating `x-forwarded-for`).
+    /// Client address, already resolved by the host server with its
+    /// proxy-trust rules. Rate limiting keys on this; the admin crate never
+    /// reads forwarded headers itself.
     pub peer: &'a str,
 }
 
@@ -382,12 +382,6 @@ async fn dispatch(
             }
         }
         ["auth", "2fa", "setup"] => {
-            if scope.is_some() {
-                return resp(
-                    403,
-                    json!({ "success": false, "error": "Forbidden. Session token required." }),
-                );
-            }
             if method == "POST" {
                 totp::setup(store).await
             } else {
@@ -395,12 +389,6 @@ async fn dispatch(
             }
         }
         ["auth", "2fa", "enable"] => {
-            if scope.is_some() {
-                return resp(
-                    403,
-                    json!({ "success": false, "error": "Forbidden. Session token required." }),
-                );
-            }
             if method == "POST" {
                 totp::enable(store, body).await
             } else {
@@ -408,12 +396,6 @@ async fn dispatch(
             }
         }
         ["auth", "2fa", "disable"] => {
-            if scope.is_some() {
-                return resp(
-                    403,
-                    json!({ "success": false, "error": "Forbidden. Session token required." }),
-                );
-            }
             if method == "POST" {
                 totp::disable(store, cfg, body).await
             } else {
@@ -421,12 +403,6 @@ async fn dispatch(
             }
         }
         ["auth", "2fa"] => {
-            if scope.is_some() {
-                return resp(
-                    403,
-                    json!({ "success": false, "error": "Forbidden. Session token required." }),
-                );
-            }
             if read {
                 ok(totp::status(store).await)
             } else {

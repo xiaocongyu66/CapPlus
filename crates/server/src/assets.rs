@@ -1,7 +1,17 @@
 //! Asset serving (published releases and the CDN cache) and the verified
 //! embed loader (`/embed.js` + the iframe page).
 
-use super::*;
+use std::sync::Arc;
+
+use axum::extract::{Path, RawQuery, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use cap_core::jwt_sign;
+use cap_store::now_ms;
+use serde_json::json;
+
+use crate::http_util::{cors_origins, html_response};
+use crate::{AppState, CHALLENGE_TTL_MS};
 
 pub(crate) async fn asset_handler(
     State(st): State<AppState>,
@@ -97,7 +107,9 @@ pub(crate) async fn embed_page(
 
     let policy = cap_embed::frame_policy(&cors_origins(&key.config), &parent);
     let (frame_ancestors, parent_origin) = match policy {
-        cap_embed::FramePolicy::Allow(origin) => (origin, parent.clone()),
+        // Use the canonical origin for postMessage as well, never the raw
+        // query value.
+        cap_embed::FramePolicy::Allow(origin) => (origin.clone(), origin),
         cap_embed::FramePolicy::Deny => {
             return html_response(
                 StatusCode::FORBIDDEN,
@@ -107,7 +119,16 @@ pub(crate) async fn embed_page(
         }
     };
 
-    let html = cap_embed::embed_page(&site_key, &parent_origin, &st.embed_widget_url);
+    let context = jwt_sign(
+        &json!({
+            "typ": "embed", "sk": site_key, "parent": parent_origin,
+            "exp": now_ms() + CHALLENGE_TTL_MS,
+        }),
+        &key.jwt_secret,
+    );
+    let html = cap_embed::embed_page_with_context(
+        &site_key, &parent_origin, &st.embed_widget_url, &context,
+    );
     html_response(
         StatusCode::OK,
         Some(&format!("frame-ancestors {frame_ancestors}")),

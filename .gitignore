@@ -3,3 +3,6 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Claude Code session state (worktrees, local settings)
+/.claude/

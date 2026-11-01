@@ -5,7 +5,6 @@
 
 use super::*;
 
-    use super::*;
     use base64::Engine;
     use serde_json::json;
 
@@ -40,13 +39,21 @@ use super::*;
         body: Value,
     ) -> AdminResponse {
         let bytes = serde_json::to_vec(&body).unwrap();
+        // The host server resolves the client address before calling in; the
+        // tests stand in for it with a fixed `x-test-peer`, otherwise a fresh
+        // address per call so unrelated tests never share a login bucket.
+        let peer = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-test-peer"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| format!("test-{}", uniq()));
         let req = AdminRequest {
             method,
             path,
             query: "",
             headers: &headers,
             body: &bytes,
-            peer: "127.0.0.1",
+            peer: &peer,
         };
         handle(store, cfg, &req).await
     }

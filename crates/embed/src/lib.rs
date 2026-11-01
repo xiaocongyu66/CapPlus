@@ -86,10 +86,19 @@ fn parse_origin(input: &str) -> Option<String> {
         return None;
     }
 
-    // Reject characters that can never appear in a host.
-    if host.chars().any(|c| {
-        c.is_ascii_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '@' | '\\')
-    }) {
+    // The origin ends up verbatim in a `frame-ancestors` CSP header, so only
+    // host characters are allowed: anything like `;`, `,`, `'` or a space
+    // would inject a directive. IPv6 literals keep their brackets.
+    let ipv6 = host.starts_with('[') && host.ends_with(']');
+    let ok = if ipv6 {
+        host[1..host.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+    } else {
+        host.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    };
+    if !ok {
         return None;
     }
 
@@ -107,6 +116,14 @@ fn parse_origin(input: &str) -> Option<String> {
         Some(p) => format!("{scheme}://{host}:{p}"),
     };
     Some(canonical)
+}
+
+/// Return the hostname of an origin, without its scheme or port.
+pub fn origin_hostname(origin: &str) -> Option<String> {
+    let canonical = parse_origin(origin)?;
+    let (_, authority) = canonical.split_once("://")?;
+    let (host, _) = split_host_port(authority)?;
+    Some(host.to_string())
 }
 
 fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
@@ -201,6 +218,21 @@ pub fn frame_policy(cors_origins: &[String], parent: &str) -> FramePolicy {
 /// `postMessage` target (empty → `"*"`). The `frame-ancestors` CSP header is the
 /// caller's job — see [`frame_policy`]; nothing here depends on it.
 pub fn embed_page(site_key: &str, parent_origin: &str, widget_url: &str) -> String {
+    embed_page_with_context(site_key, parent_origin, widget_url, "")
+}
+
+/// Build a frame whose challenge fetches carry the server-signed embed context.
+pub fn embed_page_with_context(
+    site_key: &str,
+    parent_origin: &str,
+    widget_url: &str,
+    context: &str,
+) -> String {
+    let context = serde_json::to_string(context)
+        .expect("context string")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
     let site = esc(site_key);
     // `parent_origin` lands inside a JS string literal, not HTML: JSON
     // encoding is the correct escape there (an attacker-supplied quote must
@@ -237,6 +269,18 @@ pub fn embed_page(site_key: &str, parent_origin: &str, widget_url: &str) -> Stri
 (function(){{
   var SITE = "{site}";
   var PARENT = {target};
+  var CONTEXT = {context};
+  var fetch = window.fetch;
+  window.fetch = function(input, init) {{
+    var url = new URL(input instanceof Request ? input.url : input, location.href);
+    if (CONTEXT && url.origin === location.origin && url.pathname === "/{site}/challenge") {{
+      var request = new Request(input, init);
+      var headers = new Headers(request.headers);
+      headers.set("x-cap-embed-context", CONTEXT);
+      return fetch.call(window, new Request(request, {{ headers: headers }}));
+    }}
+    return fetch.call(window, input, init);
+  }};
   var widget = document.createElement("cap-widget");
   widget.setAttribute("data-cap-api-endpoint", "/{site}/");
   widget.addEventListener("solve", function (e) {{
@@ -326,6 +370,39 @@ pub fn loader_js() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_fetch_is_scoped_and_script_safe() {
+        let html = embed_page_with_context("site-a", "https://app.example", "/widget.js", "</script>&\"");
+        assert!(html.contains("url.origin === location.origin && url.pathname === \"/site-a/challenge\""));
+        assert!(html.contains("headers.set(\"x-cap-embed-context\", CONTEXT)"));
+        assert!(html.contains("return fetch.call(window, input, init)"));
+        assert!(html.contains("\\u003c/script\\u003e\\u0026\\\""));
+        assert_eq!(origin_hostname("https://APP.example:8443"), Some("app.example".into()));
+        assert_eq!(origin_hostname("http://[::1]:8080"), Some("[::1]".into()));
+    }
+
+    #[test]
+    fn parent_cannot_inject_csp() {
+        let star = vec!["*".to_string()];
+        for bad in [
+            "https://a;sandbox",
+            "https://a,https://evil",
+            "https://a'unsafe-inline'",
+            "https://a\"b",
+            "https://a b",
+        ] {
+            assert_eq!(frame_policy(&star, bad), FramePolicy::Deny, "{bad}");
+        }
+        assert_eq!(
+            frame_policy(&star, "https://App.Example.com:443/x"),
+            FramePolicy::Allow("https://app.example.com".into())
+        );
+        assert_eq!(
+            frame_policy(&star, "http://[::1]:8080"),
+            FramePolicy::Allow("http://[::1]:8080".into())
+        );
+    }
 
     fn list(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()

@@ -1,36 +1,64 @@
 //! Asset-integrity baseline sealing and challenge environment continuity.
 
-use super::*;
+use std::net::SocketAddr;
 
-/// Record the UA/IP/host that asked for the challenge so redeem can reject a
-/// solve submitted from a different environment (`session_env_changed`).
+use axum::http::HeaderMap;
+use cap_core::jwt_verify;
+use cap_store::now_ms;
+use serde_json::{json, Value};
+
+use crate::http_util::{client_ip, header_str};
+use crate::{v2, AppState, CHALLENGE_TTL_MS};
+
+/// Validate an optional embed context. Only the signed, canonical, currently
+/// allowed parent may supply the session hostname; request origins never do.
+pub(crate) fn embed_parent(
+    headers: &HeaderMap,
+    site_key: &str,
+    secret: &str,
+    origins: &[String],
+) -> Result<Option<String>, &'static str> {
+    let Some(raw) = headers.get("x-cap-embed-context") else {
+        return Ok(None);
+    };
+    let claims = raw.to_str().ok().and_then(|v| jwt_verify(v, secret))
+        .ok_or("invalid_embed_context")?;
+    if claims["typ"].as_str() != Some("embed")
+        || claims["sk"].as_str() != Some(site_key)
+        || claims["exp"].as_i64().unwrap_or(0) <= now_ms()
+    {
+        return Err("invalid_embed_context");
+    }
+    let parent = claims["parent"].as_str().ok_or("invalid_embed_context")?;
+    match cap_embed::frame_policy(origins, parent) {
+        cap_embed::FramePolicy::Allow(canonical) if canonical == parent => Ok(Some(canonical)),
+        _ => Err("invalid_embed_context"),
+    }
+}
+
+/// Record UA/IP continuity and the server-validated embedding parent.
 pub(crate) async fn remember_challenge_env(
     st: &AppState,
     token: &str,
     headers: &HeaderMap,
     addr: &SocketAddr,
-) {
+    parent: Option<&str>,
+) -> Result<(), String> {
     let ua = header_str(headers, "user-agent");
     let ip = client_ip(headers, &addr.ip().to_string());
-    let origin = header_str(headers, "origin");
-    let host = if origin.is_empty() {
-        header_str(headers, "referer")
-    } else {
-        origin
-    };
     let doc = json!({
         "ua": cap_core::sha256_hex(&ua)[..32].to_string(),
         "ip": if ip.is_empty() { Value::Null } else { json!(ip) },
-        "host": if host.is_empty() { Value::Null } else { json!(host) },
+        "parent": parent,
     });
-    let _ = st
-        .kv
+    st.kv
         .set_ex(
             &format!("chalenv:{token}"),
             &doc.to_string(),
             CHALLENGE_TTL_MS / 1000,
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Reject a redeem whose UA (or, with session binding, IP) differs from the
@@ -41,13 +69,12 @@ pub(crate) async fn check_challenge_env(
     headers: &HeaderMap,
     addr: &SocketAddr,
     require_ip: bool,
-) -> Result<(), String> {
-    let Ok(Some(raw)) = st.kv.get(&format!("chalenv:{token}")).await else {
-        return Ok(());
-    };
-    let Ok(env) = serde_json::from_str::<Value>(&raw) else {
-        return Ok(());
-    };
+) -> Result<Option<String>, String> {
+    let raw = st.kv.get(&format!("chalenv:{token}")).await.map_err(|e| {
+        eprintln!("[redeem] challenge environment read failed: {e}");
+        "store_unavailable".to_string()
+    });
+    let env = parse_challenge_env(raw)?;
     let ua = header_str(headers, "user-agent");
     let ua_now = cap_core::sha256_hex(&ua)[..32].to_string();
     if let Some(want) = env.get("ua").and_then(Value::as_str) {
@@ -63,7 +90,102 @@ pub(crate) async fn check_challenge_env(
             }
         }
     }
-    Ok(())
+    Ok(env.get("parent").and_then(Value::as_str).map(str::to_owned))
+}
+
+/// Fail closed for unavailable, missing, or structurally damaged environment records.
+fn parse_challenge_env(raw: Result<Option<String>, String>) -> Result<Value, String> {
+    let raw = raw?.ok_or_else(|| "challenge_env_missing".to_string())?;
+    let env: Value = serde_json::from_str(&raw)
+        .map_err(|_| "challenge_env_invalid".to_string())?;
+    let valid_ua = env.get("ua").and_then(Value::as_str)
+        .map(|ua| ua.len() == 32 && ua.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or(false);
+    let valid_ip = matches!(env.get("ip"), Some(Value::Null))
+        || env.get("ip").and_then(Value::as_str).map(|ip| !ip.is_empty()).unwrap_or(false);
+    let valid_parent = match env.get("parent") {
+        Some(Value::Null) => true,
+        Some(Value::String(parent)) => matches!(
+            cap_embed::frame_policy(&["*".to_string()], parent),
+            cap_embed::FramePolicy::Allow(canonical) if canonical == *parent
+        ),
+        _ => false,
+    };
+    if !valid_ua || !valid_ip || !valid_parent {
+        return Err("challenge_env_invalid".into());
+    }
+    Ok(env)
+}
+
+#[cfg(test)]
+mod embed_context_tests {
+    use super::*;
+
+    use axum::http::HeaderValue;
+    use cap_core::jwt_sign;
+
+    #[test]
+    fn challenge_env_fails_closed() {
+        assert_eq!(parse_challenge_env(Err("store_unavailable".into())).unwrap_err(), "store_unavailable");
+        assert_eq!(parse_challenge_env(Ok(None)).unwrap_err(), "challenge_env_missing");
+        for raw in ["{", "null", "[]", "{}"] {
+            assert_eq!(parse_challenge_env(Ok(Some(raw.into()))).unwrap_err(), "challenge_env_invalid");
+        }
+        let valid = json!({"ua": cap_core::sha256_hex("UA")[..32], "ip": "192.0.2.1", "parent": "https://app.example:8443"});
+        assert_eq!(parse_challenge_env(Ok(Some(valid.to_string()))).unwrap(), valid);
+        for (field, value) in [
+            ("ua", Value::Null), ("ua", json!("")), ("ua", json!(42)),
+            ("ip", json!(false)), ("parent", json!(42)),
+            ("parent", json!("https://APP.example/path")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert_eq!(parse_challenge_env(Ok(Some(invalid.to_string()))).unwrap_err(), "challenge_env_invalid");
+        }
+        for field in ["ua", "ip", "parent"] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert_eq!(parse_challenge_env(Ok(Some(invalid.to_string()))).unwrap_err(), "challenge_env_invalid");
+        }
+        let mut direct = valid;
+        direct["parent"] = Value::Null;
+        direct["ip"] = Value::Null;
+        assert_eq!(parse_challenge_env(Ok(Some(direct.to_string()))).unwrap(), direct);
+    }
+
+    #[test]
+    fn embed_context_is_scoped_signed_current_and_canonical() {
+        let origins = vec!["https://app.example:8443".to_string()];
+        let valid = json!({"typ":"embed", "sk":"site-a",
+            "parent":"https://app.example:8443", "exp":now_ms() + 60_000});
+        let check = |claims: &Value, secret: &str, site: &str, allowed: &[String]| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-cap-embed-context", HeaderValue::from_str(&jwt_sign(claims, secret)).unwrap());
+            embed_parent(&headers, site, "secret", allowed)
+        };
+        assert_eq!(check(&valid, "secret", "site-a", &origins).unwrap(), Some("https://app.example:8443".into()));
+        assert!(check(&valid, "wrong", "site-a", &origins).is_err());
+        assert!(check(&valid, "secret", "site-b", &origins).is_err());
+        assert!(check(&valid, "secret", "site-a", &["https://other.example".into()]).is_err());
+        assert!(check(&valid, "secret", "site-a", &["https://app.example".into()]).is_err());
+        for (field, value) in [
+            ("typ", json!("chal")), ("exp", json!(now_ms() - 1)),
+            ("exp", Value::Null), ("parent", json!("https://APP.example:8443/path")),
+            ("parent", json!("https://evil.example")),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            assert!(check(&bad, "secret", "site-a", &origins).is_err(), "{bad}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://evil.example"));
+        headers.insert("referer", HeaderValue::from_static("https://evil.example/path"));
+        assert_eq!(embed_parent(&headers, "site-a", "secret", &origins).unwrap(), None);
+        headers.insert("x-cap-embed-context", HeaderValue::from_static("invalid"));
+        assert!(embed_parent(&headers, "site-a", "secret", &origins).is_err());
+        headers.insert("x-cap-embed-context", HeaderValue::from_static(""));
+        assert!(embed_parent(&headers, "site-a", "secret", &origins).is_err());
+    }
 }
 
 /// The operator's asset baseline (`settings:integrity`), or `None` when no

@@ -125,9 +125,6 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn releases_dir(&self) -> PathBuf {
-        self.data_dir.join("releases")
-    }
     pub fn tmp_dir(&self) -> PathBuf {
         self.data_dir.join("tmp")
     }

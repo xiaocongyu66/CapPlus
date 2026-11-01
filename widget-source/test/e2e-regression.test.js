@@ -10,14 +10,16 @@ try {
   ({ chromium } = await import("playwright"));
 } catch {}
 
-const SHOULD_RUN_E2E = !process.env.SKIP_E2E && chromium;
+import { referenceUrl } from "../../test/js-reference.js";
+const coreReference = referenceUrl("index.js");
+const SHOULD_RUN_E2E = !process.env.SKIP_E2E && chromium && coreReference;
 
 if (!SHOULD_RUN_E2E) {
   test.skip("regression e2e skipped", () => {});
 } else {
   const { widgetMin, wasmBytes } = await import("./test-server.js");
   const { generateChallenge, validateChallenge } = await import(
-    "../../core/src/index.js"
+    coreReference
   );
 
   const SECRET = "regression-secret-32-bytes-padding-junk-!";
