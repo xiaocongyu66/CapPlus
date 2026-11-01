@@ -86,10 +86,11 @@ pub(crate) fn tmpl(t: &str, subs: &[(&str, &str)]) -> String {
     for (k, v) in subs {
         s = s.replace(k, v);
     }
-    // Placeholders are `%NAME%`; a leftover means a substitution was missed
-    // (or an inserted value contained one). Fail loudly in debug builds.
+    // A leftover placeholder means a substitution was missed. (`%` itself is
+    // legitimate in generated JS — modulo, CSS percentages — so only the known
+    // keys are checked.)
     debug_assert!(
-        !s.contains('%') || std::env::var("CAP_ALLOW_PLACEHOLDER_LEFTOVER").is_ok(),
+        subs.iter().all(|(k, _)| !s.contains(k)),
         "unreplaced template placeholder"
     );
     s
