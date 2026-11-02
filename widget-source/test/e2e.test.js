@@ -48,6 +48,7 @@ if (!SHOULD_RUN_E2E) {
 <script src="/widget.js"></script>
 <script>
   const w = document.getElementById("cap");
+  w.setBusinessToken({ businessToken: "e2e-business-fixture", expires: Date.now() + 600000 });
   w.addEventListener("solve", (e) => {
     document.getElementById("solveResult").textContent = e.detail.token;
   });

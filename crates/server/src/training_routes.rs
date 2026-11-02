@@ -223,7 +223,7 @@ mod tests {
         let _ = crate::SETTINGS.set(crate::config::Settings {
             data_dir: root.clone(), hostname: "127.0.0.1".into(), port: 0,
             ip_header: String::new(), rsw_bits: 2048, admin_key: String::new(),
-            demo: false, redis_url: redis.clone(), dashboard_dir: None,
+            demo: false, demo_allowed_domains: None, redis_url: redis.clone(), dashboard_dir: None,
             cdn_fallback: false, cache_host: String::new(), widget_version: String::new(),
             wasm_version: String::new(), embed_widget_url: String::new(),
             trust_proxy: false, proxy_secret: String::new(), require_network_fingerprint: false,

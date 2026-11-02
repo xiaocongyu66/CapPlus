@@ -29,6 +29,10 @@ if (!SHOULD_RUN_E2E) {
       hostname: "127.0.0.1",
       fetch: async (req) => {
         const url = new URL(req.url);
+        if (req.method === "POST" && /\/(challenge|redeem)$/.test(url.pathname)) {
+          const body = await req.clone().json();
+          if (body.businessToken !== "e2e-business-fixture") return Response.json({ error: "invalid business fixture" }, { status: 403 });
+        }
         if (url.pathname === "/widget.js") {
           return new Response(widgetMin, {
             headers: { "Content-Type": "application/javascript" },
@@ -73,6 +77,7 @@ if (!SHOULD_RUN_E2E) {
 <cap-widget id="b" data-cap-api-endpoint="/cap/"></cap-widget>
 <div id="aRes"></div><div id="bRes"></div>
 <script src="/widget.js"></script>
+<script>document.querySelectorAll('cap-widget').forEach(w => w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 }));</script>
 <script>
   document.getElementById("a").addEventListener("solve", (e) => { document.getElementById("aRes").textContent = e.detail.token; });
   document.getElementById("b").addEventListener("solve", (e) => { document.getElementById("bRes").textContent = e.detail.token; });
@@ -87,6 +92,7 @@ if (!SHOULD_RUN_E2E) {
 <cap-widget id="cap" data-cap-api-endpoint="/cap/" data-cap-worker-count="1"></cap-widget>
 <div id="solveResult"></div>
 <script src="/widget.js"></script>
+<script>document.querySelectorAll('cap-widget').forEach(w => w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 }));</script>
 <script>
   document.getElementById("cap").addEventListener("solve", (e) => {
     document.getElementById("solveResult").textContent = e.detail.token;

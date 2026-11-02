@@ -25,11 +25,12 @@ pub(crate) async fn verify_common(
     headers: &HeaderMap,
     body: &Bytes,
     path_site_key: Option<&str>,
-    consume: bool,
 ) -> Response {
     let content_type = header_str(headers, "content-type");
-    let raw = String::from_utf8_lossy(body);
-    let Some(map) = parse_body(&content_type, &raw) else {
+    let Ok(raw) = std::str::from_utf8(body) else {
+        return (StatusCode::BAD_REQUEST, Json(err_response(ErrorCode::BadRequest, "Invalid UTF-8"))).into_response();
+    };
+    let Some(map) = parse_body(&content_type, raw) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(err_response(
@@ -84,9 +85,10 @@ pub(crate) async fn verify_common(
             .into_response();
     }
 
-    let key = match st.cache.key(&st.store, &site_key).await {
-        Some(k) => Arc::unwrap_or_clone(k),
-        None => {
+    let key = match st.cache.key_checked(&st.store, &site_key).await {
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(err_response(ErrorCode::BadRequest, "Temporarily unavailable"))).into_response(),
+        Ok(Some(k)) => Arc::unwrap_or_clone(k),
+        Ok(None) => {
             return (
                 StatusCode::OK,
                 Json(err_response(
@@ -148,22 +150,18 @@ pub(crate) async fn verify_common(
         }
     }
 
-    // One MGET for bind + token + verified marker, then one atomic claim:
-    // two round trips instead of five.
-    let (bind_raw, token_expires, verified) = match st.store.token_state(&req.response).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[siteverify] store_error: {e}");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(err_response(ErrorCode::BadRequest, "Temporarily unavailable")),
-            )
-                .into_response();
-        }
+    let binding = cap_core::business::BusinessBinding {
+        site: site_key.clone(), session: req.session.clone(), action: req.action.clone(),
+        nonce: req.nonce.clone(), request_digest: req.request_digest.clone(),
     };
-    let bind = bind_raw
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<SessionBind>(raw).ok());
+    let state = match st.store.business_token_state(&binding, &req.response).await {
+        Ok(state) => state,
+        Err(error) => return business_verify_error(error),
+    };
+    let bind = match serde_json::from_str::<SessionBind>(&state.bind_json) {
+        Ok(bind) => Some(bind),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(err_response(ErrorCode::BadRequest, "Temporarily unavailable"))).into_response(),
+    };
     let strict = key.config.require_session_bind;
     let (ctx_ip, ctx_ua, ctx_host) = bind_inputs(
         &req,
@@ -198,34 +196,27 @@ pub(crate) async fn verify_common(
         )
             .into_response()
     };
-    let expires = match token_expires {
-        Some(ts) if ts > now_ms() => ts,
-        _ => return duplicate(),
-    };
-
-    if !verified {
-        return (
-            StatusCode::OK,
-            Json(err_response(
-                ErrorCode::InvalidInputResponse,
-                "Token was not issued by a verified embed session",
-            )),
-        )
-            .into_response();
-    }
-
-    if consume && !st.store.consume_verified(&req.response).await.unwrap_or(false) {
-        return duplicate();
+    if state.expires_ms <= now_ms() { return duplicate(); }
+    // Pass the exact snapshot checked above; never reserialize it for CAS.
+    if let Err(error) = st.store.consume_business(&binding, &req.response, &state.bind_json).await {
+        return business_verify_error(error);
     }
 
     let ts = bind.as_ref().map(|b| b.ts).unwrap_or_else(now_ms);
     // Caller-provided hostname is only a comparison input, never provenance.
     let hostname = bound_hostname(bind.as_ref());
-    let mut resp = ok_response(ts, hostname);
-    if !consume {
-        resp["expires"] = json!(expires);
-    }
-    (StatusCode::OK, Json(resp)).into_response()
+    (StatusCode::OK, [("cache-control", "no-store")], Json(ok_response(ts, hostname))).into_response()
+}
+
+fn business_verify_error(error: cap_store::BusinessStoreError) -> Response {
+    use cap_store::BusinessStoreError::*;
+    let (status, code, message) = match error {
+        Storage(_) | Busy => (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::BadRequest, "Temporarily unavailable"),
+        Expired | Used => (StatusCode::OK, ErrorCode::TimeoutOrDuplicate, "The response has already been redeemed or has expired."),
+        Mismatch | Conflict => (StatusCode::OK, ErrorCode::InvalidInputResponse, "Business or session mismatch"),
+        Invalid => (StatusCode::OK, ErrorCode::InvalidInputResponse, "Invalid business response"),
+    };
+    (status, Json(err_response(code, message))).into_response()
 }
 
 fn bound_hostname(bind: Option<&SessionBind>) -> &str {
@@ -235,6 +226,26 @@ fn bound_hostname(bind: Option<&SessionBind>) -> &str {
 #[cfg(test)]
 mod hostname_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn business_error_semantics_fail_closed() {
+        use cap_store::BusinessStoreError::*;
+        for (error, status, code) in [
+            (Storage(cap_kv::KvError("private diagnostic".into())), StatusCode::SERVICE_UNAVAILABLE, "bad-request"),
+            (Busy, StatusCode::SERVICE_UNAVAILABLE, "bad-request"),
+            (Expired, StatusCode::OK, "timeout-or-duplicate"),
+            (Used, StatusCode::OK, "timeout-or-duplicate"),
+            (Mismatch, StatusCode::OK, "invalid-input-response"),
+        ] {
+            let response = business_verify_error(error);
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["success"], false);
+            assert_eq!(value["error-codes"][0], code);
+            assert!(!String::from_utf8_lossy(&body).contains("private diagnostic"));
+        }
+    }
 
     #[test]
     fn response_hostname_uses_only_server_binding() {
@@ -294,7 +305,7 @@ pub(crate) async fn siteverify(
     if let Some(r) = verify_limited(&st, &headers, &addr, &site_key).await {
         return r;
     }
-    verify_common(&st, &headers, &body, Some(&site_key), true).await
+    verify_common(&st, &headers, &body, Some(&site_key)).await
 }
 
 pub(crate) async fn siteverify_alias(
@@ -306,7 +317,7 @@ pub(crate) async fn siteverify_alias(
     if let Some(r) = verify_limited(&st, &headers, &addr, "_turnstile").await {
         return r;
     }
-    verify_common(&st, &headers, &body, None, true).await
+    verify_common(&st, &headers, &body, None).await
 }
 
 pub(crate) async fn validate(
@@ -319,5 +330,5 @@ pub(crate) async fn validate(
     if let Some(r) = verify_limited(&st, &headers, &addr, &site_key).await {
         return r;
     }
-    verify_common(&st, &headers, &body, Some(&site_key), false).await
+    verify_common(&st, &headers, &body, Some(&site_key)).await
 }

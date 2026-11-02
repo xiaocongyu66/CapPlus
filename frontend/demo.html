@@ -1,111 +1,14 @@
 <!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cap demo</title>
-
-    <style>
-      body {
-        padding: 0px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        min-height: 100vh;
-        margin: 0px;
-        flex-direction: column;
-      }
-
-      button {
-        margin-top: 10px;
-        font-family:
-          system,
-          -apple-system,
-          "BlinkMacSystemFont",
-          ".SFNSText-Regular",
-          "San Francisco",
-          "Roboto",
-          "Segoe UI",
-          "Helvetica Neue",
-          "Lucida Grande",
-          "Ubuntu",
-          "arial",
-          sans-serif;
-        background-color: rgba(20, 20, 25);
-        border: 1px solid rgba(60, 60, 70);
-        border-radius: 12px;
-        color: #ffffff;
-        cursor: pointer;
-        font-size: 14px;
-        padding: 12px 16px;
-        text-align: center;
-        transition:
-          transform 0.2s,
-          background-color 0.2s,
-          border-color 0.2s;
-        width: fit-content;
-      }
-
-      button:focus {
-        outline: 0;
-      }
-
-      button:hover {
-        background-color: rgba(40, 40, 40);
-        border: 1px solid rgba(100, 100, 120);
-      }
-
-      button:active {
-        transform: scale(0.98);
-      }
-      .source {
-        color: black;
-        font-family:
-          system,
-          -apple-system,
-          "BlinkMacSystemFont",
-          ".SFNSText-Regular",
-          "San Francisco",
-          "Roboto",
-          "Segoe UI",
-          "Helvetica Neue",
-          "Lucida Grande",
-          "Ubuntu",
-          "arial",
-          sans-serif;
-        margin-top: 10px;
-        font-size: 13px;
-      }
-    </style>
-  </head>
-  <body>
-    <cap-widget
-      id="cap"
-      onsolve="console.log(`Token: ${event.detail.token}`)"
-      data-cap-api-endpoint="/api/"
-      data-cap-hidden-field-name="test-endpoint"
-    ></cap-widget>
-
-    <cap-widget
-      id="floating"
-      onsolve="console.log(`Token: ${event.detail.token}`)"
-      data-cap-api-endpoint="/api/"
-    ></cap-widget>
-
-    <button data-cap-floating="#floating" data-cap-floating-position="bottom">
-      Trigger floating mode
-    </button>
-
-    <a href="https://github.com/tiagozip/cap/tree/main/demo" target="_blank" class="source">
-      Source code
-    </a>
-  </body>
-
-  <!--
-  <script src="https://cdn.jsdelivr.net/npm/@cap.js/widget"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@cap.js/widget/cap-floating.min.js"></script>
-  -->
-
-  <script src="/cap.js"></script>
-  <script src="/cap-floating.js"></script>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cap 受控演示</title>
+</head>
+<body>
+  <h1>Cap 受控业务绑定演示</h1>
+  <p>旧匿名组件演示已停用。请前往 <a href="/demo">受控演示页面</a>，使用已有真实管理员会话获取短期业务凭据。</p>
+  <p>如尚未授权，请先 <a href="/login">登录管理页</a>。Demo 模式的模拟登录不会生成有效会话，不能绕过授权。</p>
+  <p>站点密钥不会下发浏览器，业务凭据不会保存到浏览器持久存储。演示仅生成固定验证回执，不显示无法归属于本次请求的全站最近信誉分。</p>
+</body>
 </html>

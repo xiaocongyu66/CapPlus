@@ -48,6 +48,7 @@ impl std::fmt::Display for ErrorCode {
 /// * anything unparseable, or a JSON value that is not an object → `None`
 ///   (the caller maps that to `bad-request` / HTTP 400, like the JS handler).
 pub fn parse_body(content_type: &str, raw: &str) -> Option<Map<String, Value>> {
+    if raw.len() > 16 * 1024 { return None; }
     let ct = content_type.to_ascii_lowercase();
     let text = raw.trim();
     if text.is_empty() {
@@ -55,17 +56,29 @@ pub fn parse_body(content_type: &str, raw: &str) -> Option<Map<String, Value>> {
         return Some(Map::new());
     }
     if ct.contains("application/x-www-form-urlencoded") {
-        // `Object.fromEntries(new URLSearchParams(text))`: last duplicate wins.
+        // Ambiguous duplicate fields are rejected, including business bindings.
         let mut map = Map::new();
         for (k, v) in form_urlencoded::parse(text.as_bytes()) {
-            map.insert(k.into_owned(), Value::String(v.into_owned()));
+            if map.insert(k.into_owned(), Value::String(v.into_owned())).is_some() { return None; }
         }
         return Some(map);
     }
-    match serde_json::from_str::<Value>(text) {
-        Ok(Value::Object(map)) => Some(map),
-        _ => None,
+    struct UniqueObject;
+    impl<'de> serde::de::Visitor<'de> for UniqueObject {
+        type Value = Map<String, Value>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("an object with unique fields") }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
+            let mut map = Map::new();
+            while let Some((key, value)) = input.next_entry::<String, Value>()? {
+                if map.insert(key, value).is_some() { return Err(serde::de::Error::custom("duplicate field")); }
+            }
+            Ok(map)
+        }
     }
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let map = serde::Deserializer::deserialize_map(&mut deserializer, UniqueObject).ok()?;
+    deserializer.end().ok()?;
+    Some(map)
 }
 
 /// The parsed, validated shape of a `/siteverify` request.
@@ -73,6 +86,10 @@ pub fn parse_body(content_type: &str, raw: &str) -> Option<Map<String, Value>> {
 pub struct SiteverifyRequest {
     pub secret: String,
     pub response: String,
+    pub session: String,
+    pub action: String,
+    pub nonce: String,
+    pub request_digest: String,
     /// Standard Turnstile extension.
     pub remoteip: Option<String>,
     /// Cap extension: the end user's IP.
@@ -103,9 +120,34 @@ pub fn parse_request(map: &Map<String, Value>) -> Result<SiteverifyRequest, Erro
         Some(s) if s.trim().split(':').count() == 3 => s.trim().to_owned(),
         _ => return Err(ErrorCode::MissingInputResponse),
     };
+    if secret.len() > 1024 || response.len() > 256 || map.contains_key("consume") {
+        return Err(ErrorCode::BadRequest);
+    }
+    for (name, max) in [("remoteip", 256), ("clientIp", 256), ("userAgent", 4096), ("hostname", 1024)] {
+        if let Some(value) = map.get(name) {
+            let value = value.as_str().ok_or(ErrorCode::BadRequest)?;
+            if value.len() > max || value.chars().any(char::is_control) { return Err(ErrorCode::BadRequest); }
+        }
+    }
+    if response.split(':').any(str::is_empty) || response.chars().any(char::is_control) {
+        return Err(ErrorCode::BadRequest);
+    }
+    let field = |name: &str| -> Result<String, ErrorCode> {
+        map.get(name).and_then(Value::as_str).map(str::to_owned).ok_or(ErrorCode::BadRequest)
+    };
+    let binding = cap_core::business::BusinessBinding {
+        site: token_site_key(&response).ok_or(ErrorCode::BadRequest)?.into(),
+        session: field("session")?, action: field("action")?,
+        nonce: field("nonce")?, request_digest: field("requestDigest")?,
+    };
+    binding.validate().map_err(|_| ErrorCode::BadRequest)?;
     Ok(SiteverifyRequest {
         secret,
         response,
+        session: binding.session,
+        action: binding.action,
+        nonce: binding.nonce,
+        request_digest: binding.request_digest,
         remoteip: ext_str(map, "remoteip"),
         client_ip: ext_str(map, "clientIp"),
         user_agent: ext_str(map, "userAgent"),
@@ -294,9 +336,11 @@ mod tests {
     }
 
     #[test]
-    fn form_duplicate_keys_last_wins() {
-        let m = parse_body("application/x-www-form-urlencoded", "a=1&a=2").unwrap();
-        assert_eq!(m.get("a").unwrap(), "2");
+    fn duplicate_fields_are_rejected() {
+        assert!(parse_body("application/x-www-form-urlencoded", "a=1&a=2").is_none());
+        assert!(parse_body("application/json", r#"{"session":"a","session":"b"}"#).is_none());
+        assert!(parse_body("application/json", "{} {}").is_none());
+        assert!(parse_body("application/json", &" ".repeat(16385)).is_none());
     }
 
     #[test]
@@ -345,10 +389,44 @@ mod tests {
         assert_eq!(parse_request(&m), Err(ErrorCode::MissingInputResponse));
     }
 
+    fn with_binding(mut map: Map<String, Value>) -> Map<String, Value> {
+        for (key, value) in [("session", "sess".to_owned()), ("action", "pay".to_owned()), ("nonce", "n".to_owned()), ("requestDigest", "a".repeat(64))] {
+            map.insert(key.into(), json!(value));
+        }
+        map
+    }
+
+    #[test]
+    fn business_binding_is_required_and_not_normalized() {
+        let legacy = body_json(r#"{"secret":"s","response":"site:id:secret"}"#);
+        assert_eq!(parse_request(&legacy), Err(ErrorCode::BadRequest));
+        let valid = with_binding(legacy);
+        for field in ["session", "action", "nonce", "requestDigest"] {
+            let mut missing = valid.clone(); missing.remove(field);
+            assert_eq!(parse_request(&missing), Err(ErrorCode::BadRequest));
+            for bad in [json!(null), json!(1), json!(false), json!([]), json!(""), json!("x".repeat(1025))] {
+                let mut wrong = valid.clone(); wrong.insert(field.into(), bad);
+                assert_eq!(parse_request(&wrong), Err(ErrorCode::BadRequest));
+            }
+        }
+        for (field, bad) in [("session", json!(" sess")), ("action", json!("pay ")), ("requestDigest", json!("A".repeat(64))), ("consume", json!(false))] {
+            let mut wrong = valid.clone(); wrong.insert(field.into(), bad);
+            assert_eq!(parse_request(&wrong), Err(ErrorCode::BadRequest));
+        }
+        for field in ["remoteip", "clientIp", "userAgent", "hostname"] {
+            for bad in [json!(42), json!(null), json!("a\nb"), json!("x".repeat(4097))] {
+                let mut wrong = valid.clone(); wrong.insert(field.into(), bad);
+                assert_eq!(parse_request(&wrong), Err(ErrorCode::BadRequest));
+            }
+        }
+        let mut nonce = valid; nonce.insert("nonce".into(), json!(" n "));
+        assert_eq!(parse_request(&nonce).unwrap().nonce, " n ");
+    }
+
     #[test]
     fn request_accepts_valid_token() {
         let m = body_json(r#"{"secret":"s","response":"site:abc:def"}"#);
-        let r = parse_request(&m).unwrap();
+        let r = parse_request(&with_binding(m)).unwrap();
         assert_eq!(r.secret, "s");
         assert_eq!(r.response, "site:abc:def");
         assert_eq!(r.remoteip, None);
@@ -363,7 +441,7 @@ mod tests {
             r#"{"secret":"s","response":"k:i:j","remoteip":" 1.2.3.4 ",
                 "clientIp":"5.6.7.8","userAgent":"  Mozilla/5.0 ","hostname":" app.example.com "}"#,
         );
-        let r = parse_request(&m).unwrap();
+        let r = parse_request(&with_binding(m)).unwrap();
         assert_eq!(r.remoteip.as_deref(), Some("1.2.3.4"));
         assert_eq!(r.client_ip.as_deref(), Some("5.6.7.8"));
         assert_eq!(r.user_agent.as_deref(), Some("Mozilla/5.0"));
@@ -373,9 +451,9 @@ mod tests {
     #[test]
     fn request_blank_extensions_are_none() {
         let m = body_json(
-            r#"{"secret":"s","response":"k:i:j","remoteip":"   ","clientIp":"","userAgent":5}"#,
+            r#"{"secret":"s","response":"k:i:j","remoteip":"   ","clientIp":"","userAgent":""}"#,
         );
-        let r = parse_request(&m).unwrap();
+        let r = parse_request(&with_binding(m)).unwrap();
         assert_eq!(r.remoteip, None);
         assert_eq!(r.client_ip, None);
         assert_eq!(r.user_agent, None);
@@ -388,7 +466,7 @@ mod tests {
             "secret=s&response=k%3Ai%3Aj&userAgent=UA",
         )
         .unwrap();
-        let r = parse_request(&m).unwrap();
+        let r = parse_request(&with_binding(m)).unwrap();
         assert_eq!(r.response, "k:i:j");
         assert_eq!(r.user_agent.as_deref(), Some("UA"));
     }
@@ -506,6 +584,7 @@ mod tests {
         SiteverifyRequest {
             secret: "s".into(),
             response: "k:i:j".into(),
+            session: "sess".into(), action: "pay".into(), nonce: "n".into(), request_digest: "a".repeat(64),
             remoteip: remoteip.map(str::to_owned),
             client_ip: client_ip.map(str::to_owned),
             user_agent: user_agent.map(str::to_owned),

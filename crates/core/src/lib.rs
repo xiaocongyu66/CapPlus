@@ -5,6 +5,8 @@
 //! (sign/verify), the sha256-pow solution check, UA hashing and the session
 //! bind record.
 
+pub mod business;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -87,6 +89,11 @@ pub fn jwt_sign(payload: &serde_json::Value, secret: &str) -> String {
 
 /// Returns the decoded payload when the signature matches, `None` otherwise.
 pub fn jwt_verify(token: &str, secret: &str) -> Option<serde_json::Value> {
+    serde_json::from_slice(&jwt_verified_payload(token, secret)?).ok()
+}
+
+// 保留已验签的原始 JSON，供严格类型解析拒绝重复字段。
+fn jwt_verified_payload(token: &str, secret: &str) -> Option<Vec<u8>> {
     // Pin the header instead of only relying on the HMAC: the signing input
     // must be the exact HS256/JWT header we issue.
     let rest = token.strip_prefix(JWT_HEADER_B64)?.strip_prefix('.')?;
@@ -101,8 +108,7 @@ pub fn jwt_verify(token: &str, secret: &str) -> Option<serde_json::Value> {
         return None;
     }
     let payload_b64 = &rest[..last];
-    let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    URL_SAFE_NO_PAD.decode(payload_b64).ok()
 }
 
 /// Raw signature bytes of a JWT (used as the nonce-consumption key).

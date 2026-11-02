@@ -60,6 +60,51 @@ Rust 版**只支持 verified-embed**：`redeem` 必须来自 Cap 自己 origin �
 
 ---
 
+### 受控 demo 的监听与域名配置
+
+`SERVER_HOSTNAME` 只负责监听 IP（例如 `127.0.0.1` 或 `0.0.0.0`），**不是授权域名**。
+受控 demo 另设 `CAP_DEMO_ALLOWED_DOMAINS=demo.example.test,other.example.test`，
+或在 `CAPPRO_DIR/config.toml` 中配置：
+
+```toml
+[server]
+hostname = "127.0.0.1"
+port = 3000
+demo = true
+demo_allowed_domains = ["demo.example.test"]
+```
+
+环境变量优先于 TOML。列表限 1–50 个显式裸域名，复用站点域名规范化，
+不允许 IP、scheme、port、path、空项或任何通配符。显式非法配置启动失败；
+未配置不阻止普通非 demo 部署启动，但 demo 页面及已授权签发返回明确的 503。
+请求 Host/Origin 不能生成或改变此列表，伪造 Host 不替代 Bearer 授权；
+非名单 parent 的 iframe 请求被拒绝。
+
+示例：监听 `127.0.0.1:3000`，TLS 反代将 `https://demo.example.test` 转发到此地址，
+浏览器访问该域名，而不是把 `SERVER_HOSTNAME` 改成域名。
+需要真实管理会话：先在 `DEMO_MODE=false` 的同源管理页正常登录，再保留 Redis、
+数据目录和浏览器管理会话切换 `DEMO_MODE=true`。Demo 模拟登录本身不创建 session；
+会话过期后须通过真实管理登录重新授权，不能增加匿名后门。
+
+已有专用 demo key 的 `corsOrigins` 与新列表不一致（包括旧 `*`）时签发失败并提示迁移，
+不会自动改其他站点、替换共享 key 或轮换 secret。操作者应核实 `demo:widget-key`
+指向的专用站点，显式迁移其域名配置；历史已公开的 demo secret 应另行由操作者轮换。
+业务凭据/上下文仍为必需参数，域名配置不豁免业务绑定。
+
+真实 main 回归（只使用测试自建 Redis，双 URL 必须相同，指定未占用回环端口和 DB 15）：
+
+```sh
+cargo build -p cap-server
+CAP_DEMO_TEST_ISOLATED=YES \
+REDIS_URL=redis://127.0.0.1:19388/15 \
+CAP_TEST_REDIS_URL=redis://127.0.0.1:19388/15 \
+python3 test/demo_main_isolated.py
+```
+
+脚本创建临时 CAPPRO_DIR、随机密码 Redis 和回环 TLS 反代，执行真实登录/重启/签发、
+iframe HTML/CSP 检查；禁止默认/共享 Redis、8401 和 FLUSHDB，结束逐键删除并关闭自建进程。
+此检查不等于真实浏览器渲染或完整 solve/redeem 验收。
+
 ## 3. 部署（systemd + nginx 示例）
 
 ```ini

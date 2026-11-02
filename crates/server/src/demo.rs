@@ -1,39 +1,37 @@
 //! Demo-mode page (reputation test), its verify proxy, and per-key request
 //! filtering (UA / required headers).
 
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use crate::business::{failure, store_failure};
 use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use cap_core::business::{
+    BusinessBinding, request_digest, sign_business_token, verify_business_token,
+};
 use cap_core::random_hex;
-use cap_store::{now_ms, KeyConfig};
-use serde_json::{json, Value};
+use cap_store::{KeyConfig, now_ms};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::http_util::{header_str, hourly_bucket};
 use crate::pages::dashboard_root;
 use crate::siteverify::verify_common;
-use crate::AppState;
 
-/// `GET /demo` — the original challenge tester (`tester.html`) with the demo
-/// site key and secret pre-filled, so the whole solve → verify loop can be
-/// exercised from one page. Everything else (layout, log box, messages) is the
-/// upstream file, unmodified.
+/// Public shell only. Business issuance and verification require a real admin session.
 pub(crate) async fn demo_page(State(st): State<AppState>) -> Response {
     if !st.admin_cfg.demo {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    // The reputation test page: click "开始验证", and the panel underneath
-    // shows the score, level, recommended action and every penalty reason.
-    let (site_key, secret) = match demo_widget_credentials(&st).await {
-        Ok(k) => k,
-        Err(e) => {
-            {
-                eprintln!("[demo] demo key: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "demo key unavailable").into_response();
-            }
-        }
-    };
+    if crate::settings().demo_allowed_domains.is_none() {
+        return failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "demo_domains_missing: configure CAP_DEMO_ALLOWED_DOMAINS or server.demo_allowed_domains (not SERVER_HOSTNAME)",
+        );
+    }
+    // Do not create keys as a side effect of an unauthenticated page view.
 
     let path = dashboard_root().join("reputation.html");
     let html = match tokio::fs::read_to_string(&path).await {
@@ -43,99 +41,280 @@ pub(crate) async fn demo_page(State(st): State<AppState>) -> Response {
                 StatusCode::NOT_FOUND,
                 "reputation.html is missing from the dashboard bundle",
             )
-                .into_response()
+                .into_response();
         }
     };
-    let html = html
-        .replace(
-            r#"<cap-embed id="cap" data-site-key=""></cap-embed>"#,
-            &format!(r#"<cap-embed id="cap" data-site-key="{site_key}"></cap-embed>"#),
-        )
-        .replace(
-            r#"<script src="/embed.js"></script>"#,
-            &format!(
-                "<script>window.CAP_SITE={:?};window.CAP_SECRET={:?};</script><script src=\"/embed.js\"></script>",
-                site_key, secret
-            ),
-        )
-        .replace(
-            r#"fetch("/verify""#,
-            &format!(r#"fetch("/demo/verify""#),
-        );
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (StatusCode::OK, headers, html).into_response()
 }
 
-/// `POST /demo/verify` — siteverify for the demo page (the secret never
-/// leaves the server; the page just forwards the token).
-pub(crate) async fn demo_verify(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if !st.admin_cfg.demo {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-    let (site_key, secret) = match demo_widget_credentials(&st).await {
-        Ok(k) => k,
-        Err(e) => {
-            {
-                eprintln!("[demo] demo key: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "demo key unavailable").into_response();
-            }
-        }
+fn demo_configuration_failure(error: &str) -> Response {
+    // Only expose operator guidance, never raw Redis errors/URLs/credentials.
+    let message = if error.starts_with("demo_domains_missing:") {
+        "demo_domains_missing: configure CAP_DEMO_ALLOWED_DOMAINS or server.demo_allowed_domains"
+    } else {
+        "demo_configuration_unavailable: operator must check dedicated demo key corsOrigins against CAP_DEMO_ALLOWED_DOMAINS; no automatic key rotation"
     };
-    let token = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| v.get("response").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_default();
-    let payload = json!({ "secret": secret, "response": token });
-    let bytes = Bytes::from(payload.to_string());
-    // This is a server-to-server call on behalf of the browser that solved the
-    // challenge, so forward its UA for the session-binding check.
-    let mut fwd = headers.clone();
+    failure(StatusCode::SERVICE_UNAVAILABLE, message)
+}
+
+fn matching_demo_domains(configured: &[String], expected: &[String]) -> bool {
+    let Ok(mut configured) = cap_embed::normalize_domains(configured) else {
+        return false;
+    };
+    configured.sort();
+    configured.dedup();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    expected.dedup();
+    configured == expected
+}
+
+const DEMO_BODY_LIMIT: usize = 16 * 1024;
+const DEMO_TTL_MS: i64 = 120_000;
+// The only operation offered here is a verification receipt, not arbitrary business execution.
+const DEMO_OPERATION: &[u8] = br#"{"operation":"demo-verification-receipt","version":1}"#;
+
+#[derive(Serialize, Deserialize)]
+struct DemoContext {
+    owner: String,
+    expires: i64,
+    binding: BusinessBinding,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DemoVerifyRequest {
+    response: String,
+    handle: String,
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Exactly one real session authentication; no demo-mode authenticate shortcut,
+/// query token or cookie fallback. Hash the authenticated bearer for ownership.
+async fn demo_owner(st: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+    if !st.admin_cfg.demo {
+        return Err(failure(StatusCode::NOT_FOUND, "not_found"));
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 4096)
+        .ok_or_else(|| failure(StatusCode::UNAUTHORIZED, "admin_session_required"))?;
+    crate::admin_routes::require_admin(st, headers)
+        .await
+        .map_err(no_store)?;
+    Ok(cap_core::sha256_hex(bearer))
+}
+
+async fn demo_body(request: Request) -> Result<Bytes, Response> {
+    if !header_str(request.headers(), "content-type")
+        .split(';')
+        .next()
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err(failure(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_required"));
+    }
+    axum::body::to_bytes(request.into_body(), DEMO_BODY_LIMIT)
+        .await
+        .map_err(|_| failure(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"))
+}
+
+fn demo_digest() -> String {
+    request_digest("POST", "/demo/verify", DEMO_OPERATION).expect("fixed demo operation")
+}
+
+/// POST /demo/credential. Only an empty JSON object is accepted: the server
+/// chooses site/action/session/nonce/digest, never a browser-controlled proxy.
+pub(crate) async fn demo_credential(State(st): State<AppState>, request: Request) -> Response {
+    let owner = match demo_owner(&st, request.headers()).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let body = match demo_body(request).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if serde_json::from_slice::<Value>(&body).ok() != Some(json!({})) {
+        return failure(StatusCode::BAD_REQUEST, "empty_object_required");
+    }
+    if !crate::rate_allowed(&st, "demo-credential", &owner, DEMO_TTL_MS, 20).await {
+        return failure(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let (site, _) = match demo_widget_credentials(&st).await {
+        Ok(v) => v,
+        Err(error) => return demo_configuration_failure(&error),
+    };
+    let Ok(Some(key)) = st.cache.key_checked(&st.store, &site).await else {
+        return failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "demo_configuration_unavailable",
+        );
+    };
+    let binding = BusinessBinding {
+        site: site.clone(),
+        session: random_hex(32),
+        action: "demo-verification-receipt".into(),
+        nonce: random_hex(32),
+        request_digest: demo_digest(),
+    };
+    let now = now_ms();
+    let token = match sign_business_token(binding.clone(), &key.jwt_secret, now, Some(DEMO_TTL_MS))
+    {
+        Ok(v) => v,
+        Err(_) => return failure(StatusCode::INTERNAL_SERVER_ERROR, "credential_failed"),
+    };
+    let claims = match verify_business_token(&token, &key.jwt_secret, now) {
+        Ok(v) => v,
+        Err(_) => return failure(StatusCode::INTERNAL_SERVER_ERROR, "credential_failed"),
+    };
+    let issued = match st.store.issue_business(&claims, &token).await {
+        Ok(v) => v,
+        Err(e) => return store_failure(e),
+    };
+    let handle = random_hex(48);
+    let context = DemoContext {
+        owner,
+        expires: issued.claims.exp,
+        binding,
+    };
+    match st
+        .kv
+        .set_nx_ex(
+            &format!("demo:context:{handle}"),
+            &serde_json::to_string(&context).expect("demo context"),
+            DEMO_TTL_MS / 1000,
+        )
+        .await
+    {
+        Ok(true) => (),
+        _ => return failure(StatusCode::SERVICE_UNAVAILABLE, "context_unavailable"),
+    }
+    no_store(
+        Json(
+            json!({"businessToken": issued.token, "expires": issued.claims.exp,
+        "handle": handle, "siteKey": site}),
+        )
+        .into_response(),
+    )
+}
+
+fn context_matches(context: &DemoContext, owner: &str, now: i64) -> bool {
+    context.owner == owner
+        && context.expires > now
+        && context.expires <= now + DEMO_TTL_MS
+        && context.binding.action == "demo-verification-receipt"
+        && context.binding.request_digest == demo_digest()
+        && context.binding.validate().is_ok()
+}
+
+/// POST /demo/verify. Context is authoritative; success is only a fixed demo
+/// verification receipt. Do not attach site-global last-trust as this user's score.
+pub(crate) async fn demo_verify(State(st): State<AppState>, request: Request) -> Response {
+    let owner = match demo_owner(&st, request.headers()).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let headers = request.headers().clone();
+    let body = match demo_body(request).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let req: DemoVerifyRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    if req.response.is_empty()
+        || req.response.len() > 256
+        || req.handle.len() != 48
+        || !req.handle.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return failure(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let raw = match st.kv.get(&format!("demo:context:{}", req.handle)).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return failure(StatusCode::BAD_REQUEST, "context_expired"),
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "context_unavailable"),
+    };
+    let context: DemoContext = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "context_unavailable"),
+    };
+    if !context_matches(&context, &owner, now_ms()) {
+        return failure(StatusCode::FORBIDDEN, "context_mismatch_or_expired");
+    }
+    let (site, secret) = match demo_widget_credentials(&st).await {
+        Ok(v) => v,
+        Err(error) => return demo_configuration_failure(&error),
+    };
+    if context.binding.site != site {
+        return failure(StatusCode::FORBIDDEN, "context_mismatch_or_expired");
+    }
+    let b = context.binding;
+    let bytes = Bytes::from(
+        json!({"secret": secret, "response": req.response,
+        "session": b.session, "action": b.action, "nonce": b.nonce,
+        "requestDigest": b.request_digest})
+        .to_string(),
+    );
+    // Do not forward arbitrary x-cap-client-* verification overrides.
+    let mut fwd = HeaderMap::new();
+    fwd.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     if let Some(ua) = headers.get(header::USER_AGENT) {
         fwd.insert(HeaderName::from_static("x-cap-client-ua"), ua.clone());
     }
-    let resp = verify_common(&st, &fwd, &bytes, Some(&site_key), true).await;
-    // Attach the score of the solve that produced this token.
-    let last = st
-        .kv
-        .get(&format!("demo:last-trust:{site_key}"))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or(Value::Null);
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap_or_default();
-    let mut doc: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    if let Some(obj) = doc.as_object_mut() {
-        obj.insert(
-            "trust".into(),
-            last.get("trust").cloned().unwrap_or(Value::Null),
-        );
-        obj.insert(
-            "action".into(),
-            last.get("action").cloned().unwrap_or(Value::Null),
-        );
-    }
-    (status, Json(doc)).into_response()
+    no_store(verify_common(&st, &fwd, &bytes, Some(&site)).await)
 }
 
 /// A site key + secret for the demo page. Created on first use and kept in
 /// Redis under `demo:widget-key`; demo instances have no real keys otherwise.
 pub(crate) async fn demo_widget_credentials(st: &AppState) -> Result<(String, String), String> {
-    if let Ok(Some(existing)) = st.kv.get("demo:widget-key").await {
-        if let Some((sk, secret)) = existing.split_once(':') {
-            if st.kv.exists(&format!("key:{sk}")).await.unwrap_or(false) {
-                return Ok((sk.to_string(), secret.to_string()));
-            }
+    let domains = crate::settings().demo_allowed_domains.clone().ok_or(
+        "demo_domains_missing: configure CAP_DEMO_ALLOWED_DOMAINS or server.demo_allowed_domains (not SERVER_HOSTNAME)"
+    )?;
+    if let Some(existing) = st
+        .kv
+        .get("demo:widget-key")
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        let (sk, secret) = existing
+            .split_once(':')
+            .ok_or("invalid demo pointer; operator repair required")?;
+        if !cap_embed::validate_site_key(sk) || secret.is_empty() {
+            return Err("invalid demo pointer; operator repair required".into());
         }
+        let key = st
+            .store
+            .key(sk)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("missing demo key; operator repair required")?;
+        // Never rotate an existing/shared key or silently relax legacy policy.
+        if !matching_demo_domains(key.config.cors_origins.as_deref().unwrap_or(&[]), &domains) {
+            return Err(
+                "demo_domains_migration_required: existing demo key corsOrigins must match CAP_DEMO_ALLOWED_DOMAINS; operator migration required (key not rotated)"
+                    .into(),
+            );
+        }
+        return Ok((sk.to_string(), secret.to_string()));
     }
 
     let site_key = random_hex(5);
@@ -147,7 +326,7 @@ pub(crate) async fn demo_widget_credentials(st: &AppState) -> Result<(String, St
         "difficulty": 4, "challengeCount": 80, "saltSize": 32,
         "instrumentation": true, "obfuscationLevel": 5,
         "blockAutomatedBrowsers": false, "ratelimitMax": null,
-        "ratelimitDuration": null, "corsOrigins": ["*"],
+        "ratelimitDuration": null, "corsOrigins": domains,
         "blockNonBrowserUA": false, "requiredHeaders": null,
         // Demo only: let headless/automated browsers through so the test
         // page always reaches siteverify.
@@ -194,11 +373,27 @@ pub(crate) async fn demo_widget_credentials(st: &AppState) -> Result<(String, St
             } else {
                 eprintln!("[cap] demo page created site key {site_key}");
             }
+            if !cap_embed::validate_site_key(sk) || secret.is_empty() {
+                return Err("invalid demo pointer".into());
+            }
+            let key = st
+                .store
+                .key(sk)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("missing demo key")?;
+            if !matching_demo_domains(key.config.cors_origins.as_deref().unwrap_or(&[]), &domains) {
+                return Err("demo domains require operator migration".into());
+            }
             return Ok((sk.to_string(), secret.to_string()));
         }
     }
     Err("demo key could not be stored".into())
 }
+
+#[cfg(test)]
+#[path = "demo_tests.rs"]
+mod tests;
 
 /// `true` when the UA looks like a real browser (mirrors the JS check).
 pub(crate) fn is_browser_ua(ua: &str) -> bool {
@@ -220,12 +415,28 @@ pub(crate) fn is_browser_ua(ua: &str) -> bool {
 
 /// Per-key filtering: block non-browser UAs and requests missing the
 /// configured headers. Global settings apply unless the key overrides them.
-pub(crate) async fn filter_request(st: &AppState, cfg: &KeyConfig, headers: &HeaderMap, site_key: &str) -> Option<Response> {
-    let global = match st.cache.setting_optional(&st.kv, "settings:filtering").await
-        .and_then(|v| crate::cache::effective_filtering(v.as_ref(), cfg)) {
+pub(crate) async fn filter_request(
+    st: &AppState,
+    cfg: &KeyConfig,
+    headers: &HeaderMap,
+    site_key: &str,
+) -> Option<Response> {
+    let global = match st
+        .cache
+        .setting_optional(&st.kv, "settings:filtering")
+        .await
+        .and_then(|v| crate::cache::effective_filtering(v.as_ref(), cfg))
+    {
         Ok(global) => global,
-        Err(_) => return Some((StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "store_unavailable"}))).into_response()),
+        Err(_) => {
+            return Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "store_unavailable"})),
+                )
+                    .into_response(),
+            );
+        }
     };
 
     let block_ua = global.block_ua;
@@ -255,7 +466,9 @@ pub(crate) async fn filter_request(st: &AppState, cfg: &KeyConfig, headers: &Hea
     Some(
         (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "filtered", "reason": "Request does not look like a real browser"})),
+            Json(
+                json!({"error": "filtered", "reason": "Request does not look like a real browser"}),
+            ),
         )
             .into_response(),
     )

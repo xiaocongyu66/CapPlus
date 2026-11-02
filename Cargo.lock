@@ -374,6 +374,7 @@ dependencies = [
 name = "cap-store"
 version = "0.1.0"
 dependencies = [
+ "cap-core",
  "cap-kv",
  "serde",
  "serde_json",

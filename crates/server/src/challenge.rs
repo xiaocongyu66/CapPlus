@@ -121,14 +121,38 @@ pub(crate) fn append_instrumentation(
     expected_list.push(meta);
 }
 
+fn parse_business_body(body: &[u8]) -> Result<String, ()> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request { business_token: String }
+    if body.len() > 16 * 1024 { return Err(()); }
+    let request: Request = serde_json::from_slice(body).map_err(|_| ())?;
+    if request.business_token.is_empty() || request.business_token.len() > cap_core::business::MAX_BUSINESS_TOKEN_BYTES { return Err(()); }
+    Ok(request.business_token)
+}
+
+#[cfg(test)]
+mod business_body_tests {
+    use super::*;
+    #[test]
+    fn requires_bounded_body_credential() {
+        assert_eq!(parse_business_body(br#"{"businessToken":"abc"}"#), Ok("abc".into()));
+        for bad in [b"".as_slice(), b"{}", br#"{"businessToken":null}"#, br#"{"businessToken":""}"#, br#"{"businessToken":"abc","ttl":300}"#, br#"{"businessToken":"a","businessToken":"b"}"#] {
+            assert!(parse_business_body(bad).is_err());
+        }
+        assert!(parse_business_body(&serde_json::to_vec(&json!({"businessToken":"x".repeat(8193)})).unwrap()).is_err());
+    }
+}
+
 pub(crate) async fn challenge(
     State(st): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(site_key): Path<String>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Response {
     let started = std::time::Instant::now();
-    let resp = challenge_inner(st.clone(), addr, site_key.clone(), headers).await;
+    let resp = challenge_inner(st.clone(), addr, site_key.clone(), headers, body).await;
     if resp.status().is_success() {
         record_latency(&st, &site_key, started.elapsed().as_millis() as i64);
     }
@@ -150,13 +174,15 @@ pub(crate) async fn challenge_inner(
     addr: SocketAddr,
     site_key: String,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Response {
     if !cap_embed::validate_site_key(&site_key) {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "Invalid site key or secret"}))).into_response();
     }
-    let key = match st.cache.key(&st.store, &site_key).await {
-        Some(k) => Arc::unwrap_or_clone(k),
-        None => {
+    let key = match st.cache.key_checked(&st.store, &site_key).await {
+        Err(_) => return crate::business::failure(StatusCode::SERVICE_UNAVAILABLE, "store_unavailable"),
+        Ok(Some(k)) => Arc::unwrap_or_clone(k),
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "Invalid site key or secret"})),
@@ -231,6 +257,16 @@ pub(crate) async fn challenge_inner(
             .into_response();
     }
 
+    let credential = match parse_business_body(&body) {
+        Ok(token) => token,
+        Err(()) => return crate::business::failure(StatusCode::BAD_REQUEST, "business_token_required"),
+    };
+    let business = match crate::business::checked_credential(&st, &site_key, &key.jwt_secret, &credential).await {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    let business_hash = cap_core::sha256_hex(&credential);
+
     // Filtering (UA allow/deny rules) happens after the limiter: otherwise a
     // request that gets filtered would still write a Redis counter per hit.
     if let Some(resp) = filter_request(&st, &cfg, &headers, &site_key).await {
@@ -276,7 +312,7 @@ pub(crate) async fn challenge_inner(
                 .into_response();
         };
         let now = now_ms();
-        let expires = now + CHALLENGE_TTL_MS;
+        let expires = (now + CHALLENGE_TTL_MS).min(business.exp);
         let nonce = random_hex(32);
         let mut challenges = challs;
         let mut expected_list = expected;
@@ -308,6 +344,11 @@ pub(crate) async fn challenge_inner(
             eprintln!("[challenge] integrity seal failed: {reason}");
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
         }
+        if business.validate_at(now_ms()).is_err() {
+            return crate::business::failure(StatusCode::BAD_REQUEST, "business_expired");
+        }
+        payload["businessHash"] = json!(business_hash);
+        payload["businessBinding"] = json!(business.binding);
         let token = jwt_sign(&payload, &key.jwt_secret);
         if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
             eprintln!("[challenge] challenge environment write failed: {e}");
@@ -350,7 +391,7 @@ pub(crate) async fn challenge_inner(
             Err(error) => return crate::cpu_error_response(error),
         };
         let now = now_ms();
-        let expires = now + CHALLENGE_TTL_MS;
+        let expires = (now + CHALLENGE_TTL_MS).min(business.exp);
         let nonce = random_hex(32);
 
         let mut challenges = vec![challenge];
@@ -383,6 +424,11 @@ pub(crate) async fn challenge_inner(
         eprintln!("[challenge] integrity seal failed: {reason}");
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
     }
+        if business.validate_at(now_ms()).is_err() {
+            return crate::business::failure(StatusCode::BAD_REQUEST, "business_expired");
+        }
+        payload["businessHash"] = json!(business_hash);
+        payload["businessBinding"] = json!(business.binding);
         let token = jwt_sign(&payload, &key.jwt_secret);
         if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
             eprintln!("[challenge] challenge environment write failed: {e}");
@@ -416,7 +462,7 @@ pub(crate) async fn challenge_inner(
         d: cfg.difficulty.clamp(1, cap_core::MAX_CHALLENGE_DIFFICULTY),
     };
     let now = now_ms();
-    let expires = now + CHALLENGE_TTL_MS;
+    let expires = (now + CHALLENGE_TTL_MS).min(business.exp);
     let nonce = random_hex(25);
     let mut payload = json!({
         "typ": "chal", "n": nonce, "c": params.c, "s": params.s, "d": params.d,
@@ -442,7 +488,12 @@ pub(crate) async fn challenge_inner(
         eprintln!("[challenge] integrity seal failed: {reason}");
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "integrity_unavailable"}))).into_response();
     }
-    let token = jwt_sign(&payload, &key.jwt_secret);
+    if business.validate_at(now_ms()).is_err() {
+            return crate::business::failure(StatusCode::BAD_REQUEST, "business_expired");
+        }
+        payload["businessHash"] = json!(business_hash);
+        payload["businessBinding"] = json!(business.binding);
+        let token = jwt_sign(&payload, &key.jwt_secret);
     if let Err(e) = remember_challenge_env(&st, &token, &headers, &addr, embed.as_ref()).await {
         eprintln!("[challenge] challenge environment write failed: {e}");
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "store_unavailable"}))).into_response();

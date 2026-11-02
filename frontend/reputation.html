@@ -1,123 +1,125 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cap 信誉分测试页</title>
-    <style>
-      :root { color-scheme: light dark; }
-      body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; line-height: 1.6; }
-      h1 { font-size: 20px; margin-bottom: 4px; }
-      .sub { color: #888; font-size: 13px; margin-bottom: 24px; }
-      #cap { display: block; margin: 18px 0; }
-      button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid #8884; background: #8881; cursor: pointer; }
-      button:hover { background: #8882; }
-      .card { border: 1px solid #8883; border-radius: 12px; padding: 16px; margin-top: 18px; background: #8880; }
-      .score { font-size: 44px; font-weight: 700; }
-      .level { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; margin-left: 8px; vertical-align: middle; }
-      .trusted    { background: #16a34a22; color: #16a34a; }
-      .neutral    { background: #3b82f622; color: #3b82f6; }
-      .suspicious { background: #f59e0b22; color: #f59e0b; }
-      .hostile    { background: #ef444422; color: #ef4444; }
-      pre { background: #8881; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
-      .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; font-size: 14px; }
-      .kv b { color: #888; font-weight: 500; }
-      .reason { color: #ef4444; }
-      .hint { color: #888; font-size: 13px; }
-    </style>
-  </head>
-  <body>
-    <h1>Cap 信誉分测试页</h1>
-    <div class="sub">站点 key：<code id="site"></code> · 求解后自动调用 siteverify 并展示信誉分</div>
-
-    <cap-embed id="cap" data-site-key=""></cap-embed>
-    <button id="go">重新验证</button>
-
-    <div id="result" class="card" style="display:none">
-      <div>
-        <span class="score" id="score">--</span>
-        <span class="level" id="level">--</span>
-      </div>
-      <div class="kv" style="margin-top:12px">
-        <b>建议动作</b><span id="action">--</span>
-        <b>风险原因</b><span id="reasons">--</span>
-        <b>验证结果</b><span id="verified">--</span>
-      </div>
-      <details style="margin-top:12px">
-        <summary class="hint">查看原始数据</summary>
-        <pre id="raw"></pre>
-      </details>
-    </div>
-
-    <script src="/embed.js"></script>
-    <script>
-      const $ = (id) => document.getElementById(id);
-      const w = $("cap");
-      $("site").textContent = window.CAP_SITE || "?";
-
-      const LV = { trusted: "可信", neutral: "中性", suspicious: "可疑", hostile: "敌意" };
-      const AC = { allow: "放行（allow）", interact: "轻交互（interact）", restrict: "限制（restrict）", deny: "拒绝（deny）" };
-
-      function show(data) {
-        $("result").style.display = "block";
-        const t = data.trust || {};
-        $("score").textContent = t.score ?? "--";
-        const lv = t.level || "neutral";
-        const el = $("level");
-        el.className = "level " + lv;
-        el.textContent = LV[lv] || lv;
-        $("action").textContent = AC[data.action] || data.action || "--";
-        const rs = (t.reasons && t.reasons.length)
-          ? t.reasons.map(r => `${r.id}（-${r.penalty}${r.gating ? "，强信号" : ""}）`).join("；")
-          : "无（环境自洽）";
-        $("reasons").innerHTML = '<span class="' + (rs === "无（环境自洽）" ? "" : "reason") + '">' + rs + "</span>";
-        $("verified").textContent = data.verified ? "siteverify 通过 ✓" : "siteverify 失败 ✗";
-        $("raw").textContent = JSON.stringify(data, null, 2);
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cap 受控业务绑定演示</title>
+  <style>
+    body { font: 16px/1.6 system-ui,sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; }
+    button { font: inherit; padding: 8px 16px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #widget { margin: 20px 0; }
+  </style>
+</head>
+<body>
+  <h1>受控业务绑定演示</h1>
+  <p>此操作仅生成固定演示验证回执，不执行任意业务。需要当前浏览器已有的真实管理员会话。
+    <a href="/login">登录管理页</a>。Demo 模式的模拟登录不会签发有效会话，无法匿名运行本演示。</p>
+  <p>不展示站点全局最近一次信誉分：该数据无法安全归属于本次请求。</p>
+  <button id="go">获取凭据并开始新一轮</button>
+  <p id="status" role="status">等待管理员授权。</p>
+  <div id="widget"></div>
+  <pre id="result"></pre>
+  <script src="/embed.js"></script>
+  <script>
+    const go = document.getElementById("go");
+    const status = document.getElementById("status");
+    const host = document.getElementById("widget");
+    const result = document.getElementById("result");
+    let round = 0;
+    let active = null;
+    // Same session representation used by the management UI. Business
+    // credentials and context handles stay in memory, never localStorage.
+    function adminAuthorization() {
+      const auth = JSON.parse(localStorage.getItem("cap_auth") || "null");
+      if (!auth || typeof auth.token !== "string" || !auth.token ||
+          typeof auth.hash !== "string" || !auth.hash || auth.type === "bot") {
+        throw new Error("需要真实管理员会话，请先登录管理页；Demo 模拟登录不提供授权。");
       }
-
-      async function verify(token) {
-        // 小延迟确保 redeem 响应已被捕获
-        await new Promise((res) => setTimeout(res, 150));
-        let body = {};
-        try {
-          const r = await fetch("/verify", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ response: token }),
-          });
-          body = await r.json();
-        } catch (e) {
-          body = { success: false };
-        }
-        show({
-          verified: body.success === true,
-          token,
-          trust: body.trust,
-          action: body.action,
+      return `Bearer ${btoa(JSON.stringify({token: auth.token, hash: auth.hash}))}`;
+    }
+    function clearRound() {
+      if (active) window.CapEmbed?.destroy(active);
+      active = null;
+      host.replaceChildren();
+    }
+    async function post(path, authorization, body) {
+      const response = await fetch(path, {
+        method: "POST", credentials: "omit", cache: "no-store",
+        headers: {"Content-Type": "application/json", Authorization: authorization},
+        body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(response.status === 401 || response.status === 403
+          ? "授权失败或会话已变更，请登录管理页。Demo 模拟登录不能用于此操作。"
+          : `演示不可用 (${response.status}): ${data.error || "请求失败"}`);
+      }
+      return data;
+    }
+    go.addEventListener("click", async () => {
+      const current = ++round;
+      clearRound();
+      go.disabled = true;
+      result.textContent = "";
+      status.textContent = "正在申请短期业务凭据…";
+      try {
+        const authorization = adminAuthorization();
+        const credential = await post("/demo/credential", authorization, {});
+        if (current !== round) return;
+        if (typeof credential.businessToken !== "string" || !Number.isFinite(credential.expires) ||
+            credential.expires <= Date.now() || !/^[a-f0-9]{48}$/.test(credential.handle) ||
+            !/^[A-Za-z0-9_-]{1,64}$/.test(credential.siteKey)) throw new Error("无效演示凭据");
+        if (typeof window.CapEmbed?.setBusinessToken !== "function") throw new Error("当前 embed 尚不支持业务绑定，请更新部署。");
+        const widget = document.createElement("cap-embed");
+        widget.dataset.siteKey = credential.siteKey;
+        active = widget;
+        let submitted = false;
+        widget.addEventListener("cap-ready", () => {
+          if (current !== round || submitted) return;
+          try {
+            if (adminAuthorization() !== authorization) throw new Error("管理会话已变更，请重新开始。");
+            window.CapEmbed.setBusinessToken(widget, {
+              businessToken: credential.businessToken, expires: credential.expires
+            });
+            status.textContent = "凭据已设置，请在组件中点击验证。每轮重试需重新获取凭据。";
+          } catch (error) {
+            clearRound();
+            status.textContent = error.message;
+          }
+        }, {once: true});
+        widget.addEventListener("cap-token", async event => {
+          if (current !== round || submitted || typeof event.detail?.token !== "string") return;
+          submitted = true;
+          try {
+            if (adminAuthorization() !== authorization) throw new Error("管理会话已变更，请重新开始。");
+            const data = await post("/demo/verify", authorization, {
+              response: event.detail.token, handle: credential.handle
+            });
+            if (current !== round) return;
+            status.textContent = data.success === true ? "固定演示操作验证通过。" : "验证未通过，请开始新一轮。";
+            result.textContent = JSON.stringify(data, null, 2);
+          } catch (error) {
+            if (current === round) status.textContent = error.message;
+          } finally {
+            if (current === round) clearRound();
+          }
         });
+        widget.addEventListener("cap-error", () => {
+          if (current === round) {
+            status.textContent = "组件失败或凭据过期，请重新获取凭据。";
+            clearRound();
+          }
+        });
+        host.append(widget);
+        window.CapEmbed.mount(widget);
+      } catch (error) {
+        if (current === round) { clearRound(); status.textContent = error.message; }
+      } finally {
+        if (current === round) go.disabled = false;
       }
-
-      function reset() {
-        $("result").style.display = "none";
-        const iframe = $("cap").querySelector("iframe");
-        if (iframe) iframe.src = iframe.src; // reload the embed
-      }
-
-      $("go").addEventListener("click", reset);
-
-      w.addEventListener("cap-token", (e) => {
-        const token = e.detail && e.detail.token;
-        if (token) verify(token);
-      });
-      w.addEventListener("cap-ready", () => {
-        $("result").style.display = "none";
-      });
-      w.addEventListener("cap-error", (e) => {
-        // Never block the page with alert(): surface the widget error inline.
-        $("result").style.display = "block";
-        $("verified").textContent = "widget 错误";
-        $("action").textContent = JSON.stringify(e.detail || e);
-      });
-    </script>
-  </body>
+    });
+    window.addEventListener("pagehide", () => { ++round; clearRound(); });
+  </script>
+</body>
 </html>

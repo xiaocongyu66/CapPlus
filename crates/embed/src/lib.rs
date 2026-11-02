@@ -231,6 +231,11 @@ pub fn embed_page_with_context(
   var PARENT = {target};
   var CONTEXT = {context};
   var THEME = "{theme}";
+  var handshake = null, revision = 0, defined = false;
+  function send(type, detail) {{
+    if (!handshake || !PARENT || PARENT === "*") return;
+    parent.postMessage(Object.assign({{ type: type, siteKey: SITE, handshake: handshake, revision: revision }}, detail), PARENT);
+  }}
   var fetch = window.fetch;
   window.fetch = function(input, init) {{
     var url = new URL(input instanceof Request ? input.url : input, location.href);
@@ -256,23 +261,37 @@ pub fn embed_page_with_context(
     if (e.source !== parent) return;
     if (PARENT && PARENT !== "*" && e.origin !== PARENT) return;
     var d = e.data;
-    if (!d || d.type !== "cap:theme") return;
-    applyTheme(d.theme);
+    if (!d || typeof d !== "object") return;
+    if (d.type === "cap:theme") {{ applyTheme(d.theme); return; }}
+    if (!PARENT || PARENT === "*" || e.origin !== PARENT || !defined) return;
+    if (d.type === "cap:hello" && typeof d.handshake === "string" && /^[a-f0-9]{{64}}$/.test(d.handshake)) {{
+      widget.reset();
+      handshake = d.handshake;
+      revision = 0;
+      send("cap:ready", {{}});
+    }} else if (d.type === "cap:credential" && d.handshake === handshake &&
+               Number.isSafeInteger(d.revision) && d.revision > revision) {{
+      try {{
+        widget.setBusinessToken(d.credential);
+        revision = d.revision;
+        send("cap:ack", {{}});
+      }} catch (_) {{ send("cap:error", {{ error: "Invalid business credential" }}); }}
+    }}
   }});
+  widget.addEventListener("reset", function () {{ send("cap:reset", {{}}); }});
   widget.addEventListener("solve", function (e) {{
     var token = e && e.detail && e.detail.token;
     if (!token) return;
-    parent.postMessage({{ type: "cap:token", siteKey: SITE, token: token }}, PARENT || "*");
+    send("cap:token", {{ token: token }});
   }});
   widget.addEventListener("progress", function (e) {{
-    parent.postMessage({{ type: "cap:progress", siteKey: SITE, progress: e.detail && e.detail.progress }}, PARENT || "*");
+    send("cap:progress", {{ progress: e.detail && e.detail.progress }});
   }});
   widget.addEventListener("error", function (e) {{
-    parent.postMessage({{ type: "cap:error", siteKey: SITE, error: String((e && e.detail && e.detail.error) || "error") }}, PARENT || "*");
+    send("cap:error", {{ error: "Verification failed" }});
   }});
   document.getElementById("w").appendChild(widget);
-  // Tell the parent we are alive and ready to be interacted with.
-  parent.postMessage({{ type: "cap:ready", siteKey: SITE }}, PARENT || "*");
+  customElements.whenDefined("cap-widget").then(function() {{ defined = true; }});
 }})();
 </script>
 <script src="{widget}"></script>
@@ -328,6 +347,17 @@ const LOADER: &str = r#"(function(){
   }
 
   var mounted = new Map();
+  var credentials = new WeakMap();
+  function nonce(){
+    var bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, function(b){ return b.toString(16).padStart(2, "0"); }).join("");
+  }
+  function validateCredential(c){
+    if (!c || typeof c.businessToken !== "string" || !c.businessToken.length || c.businessToken.length > 8192 ||
+        !Number.isSafeInteger(c.expires) || c.expires <= Date.now()) throw new Error("Invalid business credential");
+    return { businessToken: c.businessToken, expires: c.expires };
+  }
   var paused = new WeakSet();
   var themeAttrs = ["class", "style", "data-cap-theme", "data-theme", "data-bs-theme", "data-color-mode", "data-mode", "data-color-scheme"];
   function destroy(el){
@@ -346,6 +376,35 @@ const LOADER: &str = r#"(function(){
     var name = el.getAttribute("data-field-name") || "cap-token";
     var parentOrigin = location.origin;
     var theme = detectTheme(el);
+    var handshake = null, ready = false, revision = 0, acknowledged = 0, loaded = false;
+    var pending = null;
+    credentials.set(el, function(c){
+      pending = c;
+      input.value = "";
+      revision++;
+      acknowledged = 0;
+      deliver();
+    });
+    function deliver(){
+      if (!ready || !pending) return;
+      var c = pending;
+      pending = null;
+      if (c.expires <= Date.now()) {
+        el.dispatchEvent(new CustomEvent("cap-error", { detail: { error: "Business credential expired" } }));
+        return;
+      }
+      iframe.contentWindow.postMessage({ type: "cap:credential", handshake: handshake, revision: revision, credential: c }, CAP_ORIGIN);
+    }
+    function onLoad(){
+      if (loaded) { pending = null; revision++; }
+      loaded = true;
+      ready = false;
+      acknowledged = 0;
+      input.value = "";
+      handshake = nonce();
+      iframe.contentWindow.postMessage({ type: "cap:hello", handshake: handshake }, CAP_ORIGIN);
+      sendTheme();
+    }
     var iframe = document.createElement("iframe");
     iframe.src = CAP_ORIGIN + "/embed/" + encodeURIComponent(site) +
       "?parent=" + encodeURIComponent(parentOrigin) +
@@ -367,7 +426,7 @@ const LOADER: &str = r#"(function(){
         iframe.contentWindow.postMessage({ type: "cap:theme", theme: t }, CAP_ORIGIN);
       } catch (e) {}
     }
-    iframe.addEventListener("load", sendTheme);
+    iframe.addEventListener("load", onLoad);
 
     // Theme toggles are almost always attribute/class swaps on <html> or
     // <body>; mirror both. Pages that swap stylesheets can call
@@ -385,21 +444,34 @@ const LOADER: &str = r#"(function(){
       if (ev.origin !== CAP_ORIGIN) return;
       if (ev.source !== iframe.contentWindow) return;
       var d = ev.data;
-      if (!d || d.siteKey !== site) return;
-      if (d.type === "cap:token" && typeof d.token === "string") {
+      if (!d || d.siteKey !== site || !handshake || d.handshake !== handshake) return;
+      if (d.type === "cap:ready" && d.revision === 0 && !ready) {
+        ready = true;
+        sendTheme();
+        deliver();
+        el.dispatchEvent(new CustomEvent("cap-ready"));
+      } else if (d.type === "cap:ack" && ready && revision > 0 && d.revision === revision) {
+        acknowledged = revision;
+      } else if (d.type === "cap:token" && ready && acknowledged === revision && acknowledged > 0 &&
+                 d.revision === revision && typeof d.token === "string" && d.token.length > 0 && d.token.length <= 8192) {
+        acknowledged = 0;
         input.value = d.token;
         el.dispatchEvent(new CustomEvent("cap-token", { detail: { token: d.token } }));
-      } else if (d.type === "cap:ready") {
-        sendTheme();
-        el.dispatchEvent(new CustomEvent("cap-ready"));
-      } else if (d.type === "cap:error") {
-        el.dispatchEvent(new CustomEvent("cap-error", { detail: d }));
+      } else if (d.type === "cap:reset" && ready && d.revision === revision) {
+        input.value = "";
+        acknowledged = 0;
+      } else if (d.type === "cap:error" && ready && d.revision === revision) {
+        el.dispatchEvent(new CustomEvent("cap-error", { detail: { error: "Verification failed" } }));
       }
     }
     window.addEventListener("message", onMessage);
     mounted.set(el, function(){
       if (mo) mo.disconnect();
-      iframe.removeEventListener("load", sendTheme);
+      pending = null;
+      handshake = null;
+      ready = false;
+      credentials.delete(el);
+      iframe.removeEventListener("load", onLoad);
       window.removeEventListener("message", onMessage);
       iframe.remove();
       input.remove();
@@ -426,6 +498,12 @@ const LOADER: &str = r#"(function(){
     scan: function(){ scan(true); },
     mount: function(el){ if (el) { paused.delete(el); init(el); } },
     destroy: destroy,
+    // Private one-slot pending credential; reload/destroy/reset require re-issuance.
+    setBusinessToken: function(el, credential){
+      var c = validateCredential(credential);
+      if (!el || !el.isConnected || !credentials.has(el)) throw new Error("CapEmbed is not mounted");
+      credentials.get(el)(c);
+    },
     // Force a theme for one widget ("dark"/"light") or return to automatic.
     setTheme: function(el, theme){
       if (!el) return;
@@ -473,7 +551,7 @@ mod tests {
         assert!(html.contains("headers.set(\"x-cap-embed-context\", CONTEXT)"));
         assert!(html.contains("<html lang=\"en\" data-theme=\"light\">"));
         assert!(html.contains("widget.setAttribute(\"data-cap-theme\", THEME)"));
-        assert!(html.contains("d.type !== \"cap:theme\""));
+        assert!(html.contains("d.type === \"cap:theme\""));
         assert!(html.contains("applyTheme(d.theme)"));
         assert!(html.contains("e.source !== parent"));
         assert!(html.contains("--cap-background:#17181c"));
@@ -709,10 +787,12 @@ mod tests {
     }
 
     #[test]
-    fn embed_page_empty_parent_targets_star() {
+    fn embed_page_empty_parent_cannot_send_credentials_or_tokens() {
         let page = embed_page("abc123", "", "/w.js");
         assert!(page.contains("var PARENT = \"*\";"), "{page}");
-        assert!(page.contains("PARENT || \"*\""));
+        assert!(page.contains("if (!handshake || !PARENT || PARENT === \"*\") return;"));
+        assert!(!page.contains("PARENT || \"*\""));
+        assert!(page.contains("customElements.whenDefined(\"cap-widget\")"));
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub struct ServerSection {
     /// auto-discover.
     pub dashboard_dir: String,
     pub demo: bool,
+    /// Trusted demo embedding domains, independent of the IP listen address.
+    /// None disables demo credential issuance; an explicit invalid list is fatal.
+    pub demo_allowed_domains: Option<Vec<String>>,
     /// Require the redeem to come from the same signed embed session that
     /// fetched the challenge (`CAP_REQUIRE_VSESS`, default on). Set `false`
     /// for clients that call the API directly without the embed iframe.
@@ -51,6 +54,7 @@ impl Default for ServerSection {
             port: 3000,
             dashboard_dir: String::new(),
             demo: false,
+            demo_allowed_domains: None,
             verify_session: None,
         }
     }
@@ -128,6 +132,7 @@ pub struct Settings {
     pub rsw_bits: usize,
     pub admin_key: String,
     pub demo: bool,
+    pub demo_allowed_domains: Option<Vec<String>>,
     pub redis_url: String,
     pub dashboard_dir: Option<PathBuf>,
     pub cdn_fallback: bool,
@@ -423,8 +428,13 @@ pub fn init() -> Result<Settings, String> {
         proxy.trusted_peer_cidrs = parse_proxy_cidrs("CAP_TRUSTED_PEER_CIDRS", &value)?;
     }
     validate_proxy(&proxy)?;
+    let demo_allowed_domains = resolve_demo_domains(
+        strict_env("CAP_DEMO_ALLOWED_DOMAINS")?.as_deref(),
+        file.server.demo_allowed_domains.as_deref(),
+    )?;
 
     Ok(Settings {
+        demo_allowed_domains,
         hostname: env_str("SERVER_HOSTNAME").unwrap_or(file.server.hostname),
         port: env_str("SERVER_PORT")
             .and_then(|p| match p.trim().parse() {
@@ -466,8 +476,89 @@ pub fn init() -> Result<Settings, String> {
     })
 }
 
+/// Comma-separated environment override, or TOML array; missing is deliberately
+/// distinct from an explicitly empty/invalid value. Never infer this from Host,
+/// Origin, or the server's IP listen address.
+fn resolve_demo_domains(
+    env: Option<&str>,
+    file: Option<&[String]>,
+) -> Result<Option<Vec<String>>, String> {
+    let override_domains;
+    let domains = if let Some(raw) = env {
+        if raw.len() > 12_750 {
+            return Err("CAP_DEMO_ALLOWED_DOMAINS exceeds bounded domain list size".into());
+        }
+        override_domains = raw
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .collect::<Vec<_>>();
+        Some(override_domains.as_slice())
+    } else {
+        file
+    };
+    domains.map(|domains| {
+        // Demo authorization intentionally permits exact domains only.
+        if domains.iter().any(|s| s.contains('*')) {
+            return Err("CAP_DEMO_ALLOWED_DOMAINS / server.demo_allowed_domains requires exact domains, no wildcards".into());
+        }
+        let mut domains = cap_embed::normalize_domains(domains).map_err(|e|
+            format!("CAP_DEMO_ALLOWED_DOMAINS / server.demo_allowed_domains: {e}"))?;
+        domains.sort();
+        domains.dedup();
+        Ok(domains)
+    }).transpose()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn demo_domains_are_explicit_bounded_and_independent_of_listen_ip() {
+        use super::*;
+        assert_eq!(resolve_demo_domains(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_demo_domains(Some("Demo.Example.test,other.example.test"), None).unwrap(),
+            Some(vec![
+                "demo.example.test".into(),
+                "other.example.test".into()
+            ])
+        );
+        for raw in [
+            "",
+            " ",
+            "*",
+            "*.example.test",
+            "127.0.0.1",
+            "0.0.0.0",
+            "https://example.test",
+            "example.test:443",
+            "example.test,",
+            "a.test,,b.test",
+        ] {
+            assert!(resolve_demo_domains(Some(raw), None).is_err(), "{raw}");
+        }
+        assert!(resolve_demo_domains(None, Some(&[])).is_err());
+        assert!(resolve_demo_domains(None, Some(&vec!["example.test".into(); 51])).is_err());
+        let file: FileConfig =
+            toml::from_str("[server]\nhostname='127.0.0.1'\ndemo_allowed_domains=['example.test']")
+                .unwrap();
+        assert_eq!(file.server.hostname, "127.0.0.1");
+        assert_eq!(
+            resolve_demo_domains(None, file.server.demo_allowed_domains.as_deref()).unwrap(),
+            Some(vec!["example.test".into()])
+        );
+        assert!(
+            resolve_demo_domains(Some(""), file.server.demo_allowed_domains.as_deref()).is_err()
+        );
+        assert_eq!(
+            resolve_demo_domains(
+                Some("override.test"),
+                file.server.demo_allowed_domains.as_deref()
+            )
+            .unwrap(),
+            Some(vec!["override.test".into()])
+        );
+    }
+
     use super::*;
 
     #[test]

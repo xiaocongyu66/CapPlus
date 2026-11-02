@@ -39,12 +39,14 @@ if (!SHOULD_RUN_E2E) {
 <html><head>${wasmInjection}</head><body>
 <div id="container"></div>
 <script src="/widget.js"></script>
+<script>document.querySelectorAll('cap-widget').forEach(w => w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 }));</script>
 <script>
   const c = document.getElementById("container");
   for (let i = 0; i < 3; i++) {
     const w = document.createElement("cap-widget");
     w.setAttribute("data-cap-api-endpoint", "/cap/");
     c.appendChild(w);
+    w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 });
     if (i < 2) c.removeChild(w);
   }
   document.title = "OK";
@@ -58,6 +60,7 @@ if (!SHOULD_RUN_E2E) {
 <html><head>${wasmInjection}</head><body>
 <div id="container"></div>
 <script src="/widget.js"></script>
+<script>document.querySelectorAll('cap-widget').forEach(w => w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 }));</script>
 <script>
   window.__errors = [];
   window.addEventListener("unhandledrejection", (e) => {
@@ -68,6 +71,7 @@ if (!SHOULD_RUN_E2E) {
   w.id = "cap";
   w.setAttribute("data-cap-api-endpoint", "/cap-slow/");
   c.appendChild(w);
+    w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 });
   window.__startAndDetach = async () => {
     window.dispatchEvent(new MouseEvent("mousemove"));
     w.solve();
@@ -86,6 +90,7 @@ if (!SHOULD_RUN_E2E) {
 <html><head>${wasmInjection}</head><body>
 <div id="container"></div>
 <script src="/widget.js"></script>
+<script>document.querySelectorAll('cap-widget').forEach(w => w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 }));</script>
 <script>
   window.__errors = [];
   window.addEventListener("unhandledrejection", (e) => {
@@ -96,6 +101,7 @@ if (!SHOULD_RUN_E2E) {
     const w = document.createElement("cap-widget");
     w.setAttribute("data-cap-api-endpoint", "/cap-many/");
     c.appendChild(w);
+    w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 });
     window.dispatchEvent(new MouseEvent("mousemove"));
     await new Promise((r) => setTimeout(r, 2800));
     c.removeChild(w);
@@ -116,6 +122,7 @@ if (!SHOULD_RUN_E2E) {
 </form>
 <div id="formResult"></div>
 <script src="/widget.js"></script>
+<script>document.querySelectorAll('cap-widget').forEach(w => w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 }));</script>
 <script>
   document.getElementById("form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -134,6 +141,7 @@ if (!SHOULD_RUN_E2E) {
 </form>
 <div id="solveResult"></div>
 <script src="/widget.js"></script>
+<script>document.querySelectorAll('cap-widget').forEach(w => w.setBusinessToken({ businessToken: 'e2e-business-fixture', expires: Date.now() + 600000 }));</script>
 <script>
   document.getElementById("cap").addEventListener("solve", (e) => {
     document.getElementById("solveResult").textContent = e.detail.token;
@@ -147,6 +155,10 @@ if (!SHOULD_RUN_E2E) {
       hostname: "127.0.0.1",
       fetch: async (req) => {
         const url = new URL(req.url);
+        if (req.method === "POST" && /\/(challenge|redeem)$/.test(url.pathname)) {
+          const body = await req.clone().json();
+          if (body.businessToken !== "e2e-business-fixture") return Response.json({ error: "invalid business fixture" }, { status: 403 });
+        }
         if (url.pathname === "/widget.js") {
           return new Response(widgetMin, {
             headers: { "Content-Type": "application/javascript" },

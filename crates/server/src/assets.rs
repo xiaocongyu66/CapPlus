@@ -126,9 +126,10 @@ pub(crate) async fn embed_page(
         )
             .into_response();
     }
-    let key = match st.cache.key(&st.store, &site_key).await {
-        Some(k) => Arc::unwrap_or_clone(k),
-        None => return (StatusCode::NOT_FOUND, "unknown site key").into_response(),
+    let key = match st.cache.key_checked(&st.store, &site_key).await {
+        Ok(Some(k)) => Arc::unwrap_or_clone(k),
+        Ok(None) => return (StatusCode::NOT_FOUND, "unknown site key").into_response(),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "Temporarily unavailable").into_response(),
     };
     let query = query.unwrap_or_default();
     let parent = query

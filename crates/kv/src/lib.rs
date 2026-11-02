@@ -6,6 +6,9 @@
 
 pub mod cpu;
 
+#[cfg(test)]
+mod business_tests;
+
 use std::collections::HashMap;
 
 use redis::aio::ConnectionManager;
@@ -41,6 +44,23 @@ impl Kv {
     pub async fn connect_redis(url: &str) -> KvResult<Self> {
         let client = redis::Client::open(url)?;
         Ok(Self { conn: ConnectionManager::new(client).await? })
+    }
+
+    /// Internal business state machine; Redis TIME is the commit clock.
+    /// Storage errors include unknown commit outcomes: never reset on error.
+    pub async fn business_transition(&self, keys: &[String], args: &[String]) -> KvResult<Vec<String>> {
+        if !matches!(keys.len(), 1 | 5) || args.len() != 10
+            || keys.iter().any(|k| k.len() > 512 || k.is_empty())
+            || args.iter().any(|a| a.len() > 16384)
+            || keys.iter().enumerate().any(|(i,k)| keys[..i].contains(k))
+        {
+            return Err(KvError("invalid business command budget".into()));
+        }
+        let script = redis::Script::new(include_str!("business.lua"));
+        let mut invocation = script.prepare_invoke();
+        invocation.key(keys).arg(args);
+        let mut conn = self.conn.clone();
+        invocation.invoke_async(&mut conn).await.map_err(Into::into)
     }
 
     pub fn backend_name(&self) -> &'static str {

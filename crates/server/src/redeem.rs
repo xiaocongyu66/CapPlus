@@ -22,6 +22,46 @@ use crate::{
     REDEEM_RL_MAX, REDEEM_RL_WINDOW_MS, TOKEN_TTL_MS,
 };
 
+fn parse_redeem_body(body: &[u8]) -> Result<Value, ()> {
+    if body.len() > 1024 * 1024 { return Err(()); }
+    struct StrictValue(Value);
+    impl<'de> serde::Deserialize<'de> for StrictValue {
+        fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+            de.deserialize_any(UniqueObject).map(Self)
+        }
+    }
+    struct UniqueObject;
+    impl<'de> serde::de::Visitor<'de> for UniqueObject {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("unique request fields") }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut input: A) -> Result<Value, A::Error> {
+            let mut map = serde_json::Map::new();
+            while let Some((key, StrictValue(value))) = input.next_entry::<String, StrictValue>()? {
+                if map.insert(key, value).is_some() { return Err(serde::de::Error::custom("duplicate field")); }
+            }
+            Ok(Value::Object(map))
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut input: A) -> Result<Value, A::Error> {
+            let mut values = Vec::new();
+            while let Some(StrictValue(value)) = input.next_element::<StrictValue>()? { values.push(value); }
+            Ok(Value::Array(values))
+        }
+        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> { Ok(Value::Bool(value)) }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> { Ok(value.into()) }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> { Ok(value.into()) }
+        fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+            serde_json::Number::from_f64(value).map(Value::Number).ok_or_else(|| E::custom("invalid number"))
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> { Ok(Value::String(value.into())) }
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Value, E> { Ok(Value::String(value)) }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> { Ok(Value::Null) }
+    }
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let value = serde::Deserializer::deserialize_map(&mut de, UniqueObject).map_err(|_| ())?;
+    de.end().map_err(|_| ())?;
+    Ok(value)
+}
+
 pub(crate) async fn redeem(
     State(st): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -52,11 +92,27 @@ pub(crate) async fn redeem(
             .into_response();
     }
 
-    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+    if body.len() > 1024 * 1024 {
+        return crate::business::failure(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large");
+    }
+    // Typed credential extraction rejects duplicate credential fields rather
+    // than letting a JSON map silently choose the last value.
+    #[derive(serde::Deserialize)]
+    struct CredentialInput {
+        #[serde(rename = "businessToken")]
+        business_token: String,
+    }
+    let Ok(credential_input) = serde_json::from_slice::<CredentialInput>(&body) else {
+        return crate::business::failure(StatusCode::BAD_REQUEST, "business_token_required");
+    };
+    if credential_input.business_token.len() > cap_core::business::MAX_BUSINESS_TOKEN_BYTES {
+        return crate::business::failure(StatusCode::BAD_REQUEST, "invalid_business_token");
+    }
+    let Ok(payload) = parse_redeem_body(&body) else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_body"}))).into_response();
     };
     let token = payload.get("token").and_then(Value::as_str).unwrap_or("");
-    if token.is_empty() {
+    if token.is_empty() || token.len() > 512 * 1024 {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing_token"}))).into_response();
     }
     let Some(sols) = payload.get("solutions").and_then(Value::as_array) else {
@@ -76,9 +132,10 @@ pub(crate) async fn redeem(
     }
     let solutions_raw: Vec<Value> = sols.clone();
 
-    let key = match st.cache.key(&st.store, &site_key).await {
-        Some(k) => Arc::unwrap_or_clone(k),
-        None => {
+    let key = match st.cache.key_checked(&st.store, &site_key).await {
+        Err(_) => return crate::business::failure(StatusCode::SERVICE_UNAVAILABLE, "store_unavailable"),
+        Ok(Some(k)) => Arc::unwrap_or_clone(k),
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "Invalid site key or secret"})),
@@ -97,6 +154,17 @@ pub(crate) async fn redeem(
         || claims.get("typ").and_then(Value::as_str) != Some("chal")
     {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "scope_mismatch"}))).into_response();
+    }
+    let Some(credential) = payload.get("businessToken").and_then(Value::as_str) else {
+        return crate::business::failure(StatusCode::BAD_REQUEST, "business_token_required");
+    };
+    let business = match crate::business::checked_credential(&st, &site_key, &key.jwt_secret, credential).await {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    if claims.get("businessHash").and_then(Value::as_str) != Some(cap_core::sha256_hex(credential).as_str())
+        || claims.get("businessBinding") != Some(&json!(business.binding)) {
+        return crate::business::failure(StatusCode::BAD_REQUEST, "business_mismatch");
     }
     // 验证前原子预占次数，确保并发请求也不能突破计算预算。
     let attempt_key = format!("redeem-attempt:{}", jwt_sig_hex(token).unwrap_or_default());
@@ -183,9 +251,12 @@ pub(crate) async fn redeem(
         let token_cpu = token.to_owned();
         let claims_cpu = claims.clone();
         let solutions_cpu = solutions_raw.clone();
-        let verdict = match cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General, move || {
-            verify_v1_pow(&token_cpu, &claims_cpu, &solutions_cpu)
-        }).await {
+        let work = move || verify_v1_pow(&token_cpu, &claims_cpu, &solutions_cpu);
+        #[cfg(test)]
+        let result = interleaving_tests::run(work).await;
+        #[cfg(not(test))]
+        let result = cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General, work).await;
+        let verdict = match result {
             Ok(verdict) => verdict,
             Err(error) => return crate::cpu_error_response(error),
         };
@@ -433,23 +504,36 @@ pub(crate) async fn redeem(
     let Some(nonce_ttl) = remaining_nonce_ttl(exp, now_ms()) else {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "expired"}))).into_response();
     };
-    let nonce_consumed = match st.store.consume_nonce(&sig, nonce_ttl).await {
-        Ok(true) => true,
-        Ok(false) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Challenge already redeemed"})),
-            )
-                .into_response()
+    if business.validate_at(now_ms()).is_err() {
+        return crate::business::failure(StatusCode::BAD_REQUEST, "business_expired");
+    }
+    let denied = v2_trust.as_ref().is_some_and(|(_, action)| matches!(action, cap_detect::Action::Deny)) && key.config.block_on_deny;
+    let redeem_token = format!("{site_key}:{}:{}", random_hex(8), random_hex(15));
+    let ua = header_str(&headers, "user-agent");
+    let mut bind = SessionBind::new(if ip.is_empty() { None } else { Some(ip) }, &ua, now);
+    bind.host = parent.as_deref().and_then(cap_embed::origin_hostname);
+    let token_expires = if denied {
+        // Preserve existing deny replay policy: burn only challenge, never solve business.
+        match st.store.consume_nonce(&sig, nonce_ttl).await {
+            Ok(true) => {},
+            Ok(false) => return crate::business::failure(StatusCode::FORBIDDEN, "Challenge already redeemed"),
+            Err(_) => return crate::business::failure(StatusCode::SERVICE_UNAVAILABLE, "store_unavailable"),
         }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                { eprintln!("[redeem] nonce_store_error: {e}"); Json(json!({"error": "nonce_store_error"})) },
-            )
-                .into_response()
+        0
+    } else {
+        #[cfg(test)]
+        interleaving_tests::checkpoint("before_commit").await;
+        match st.store.complete_business(&business, credential, cap_store::CompleteBusiness {
+            challenge_nonce: &sig, challenge_expires_ms: exp,
+            token: &redeem_token, bind_json: &bind.to_json(), token_ttl_ms: TOKEN_TTL_MS,
+        }).await {
+            Ok(expires) => expires,
+            Err(error) => return crate::business::store_failure(error),
         }
     };
+    #[cfg(test)]
+    interleaving_tests::checkpoint("after_commit").await;
+    let nonce_consumed = true;
 
     // This point is reachable only after successful atomic nonce consumption.
     // training_client can exist only when MAC verification actually succeeded.
@@ -482,22 +566,7 @@ pub(crate) async fn redeem(
         }
     }
 
-    let redeem_token = format!("{site_key}:{}:{}", random_hex(8), random_hex(15));
-    let ua = header_str(&headers, "user-agent");
-    let mut bind = SessionBind::new(if ip.is_empty() { None } else { Some(ip) }, &ua, now);
-    bind.host = parent.as_deref().and_then(cap_embed::origin_hostname);
-    let token_expires = now + TOKEN_TTL_MS;
-    if let Err(e) = st
-        .store
-        .issue(&redeem_token, &bind.to_json(), token_expires, TOKEN_TTL_MS)
-        .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            { eprintln!("[redeem] bind_failed: {e}"); Json(json!({"error": "bind_failed"})) },
-        )
-            .into_response();
-    }
+    // complete_business above committed the result and challenge atomically.
     // An allowed policy decision is recorded only after issue succeeds. Thus an
     // issue-store failure never masquerades as successful redemption. This is
     // still an observation, not evidence of a later siteverify or of humanity.
@@ -557,7 +626,44 @@ fn session_matches(bound: Option<&str>, sent: Option<&str>, require_bound: bool)
 }
 
 #[cfg(test)]
+#[path = "redeem_interleaving_tests.rs"]
+mod interleaving_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn rejects_ambiguous_or_oversized_redeem_json() {
+        for field in ["token", "businessToken", "businessBinding", "solutions", "context"] {
+            let body = format!(r#"{{"{field}":"a","{field}":"b"}}"#);
+            assert!(super::parse_redeem_body(body.as_bytes()).is_err());
+        }
+        for body in [b"[]".as_slice(), b"{}{}", b"{\"a\":\"\xff\"}"] {
+            assert!(super::parse_redeem_body(body).is_err());
+        }
+        assert!(super::parse_redeem_body(&vec![b' '; 1024 * 1024 + 1]).is_err());
+        assert!(super::parse_redeem_body(br#"{"businessToken":"abc","solutions":[]}"#).is_ok());
+    }
+    #[test]
+    fn recursively_rejects_duplicates_even_when_last_value_is_valid() {
+        for body in [
+            r#"{"solutions":[{"nonce":null,"nonce":42}]}"#,
+            r#"{"solutions":[{"instr":{"mac":null,"mac":"valid"}}]}"#,
+            r#"{"instr":{"p":{"webdriver":true,"webdriver":false}}}"#,
+            r#"{"solutions":[[{"x":0,"x":1}]]}"#,
+            r#"{"context":{"nested":{"a":null,"\u0061":true}}}"#,
+        ] {
+            // The old Value parser would silently retain the final value.
+            assert!(serde_json::from_str::<serde_json::Value>(body).is_ok());
+            assert!(super::parse_redeem_body(body.as_bytes()).is_err(), "{body}");
+        }
+        let valid = br#"{"solutions":[{"n":42,"instr":{"p":[true,false,null,-1,1.25,"text",{"x":1}]}}]}"#;
+        assert_eq!(super::parse_redeem_body(valid).unwrap(), serde_json::from_slice::<serde_json::Value>(valid).unwrap());
+        let deep = format!("{{\"x\":{}0{}}}", "[".repeat(130), "]".repeat(130));
+        assert!(super::parse_redeem_body(deep.as_bytes()).is_err());
+        let shallow = format!("{{\"x\":{}0{}}}", "[".repeat(16), "]".repeat(16));
+        assert!(super::parse_redeem_body(shallow.as_bytes()).is_ok());
+    }
+
     #[tokio::test]
     async fn expiry_is_rechecked_after_cpu_wait_before_consumption() {
         use cap_kv::cpu::{CpuClass, CpuConfig, CpuScheduler};

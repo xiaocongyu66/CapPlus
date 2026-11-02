@@ -905,6 +905,52 @@
     #interactionHandler = null;
     #i18n = null;
     #abort = null;
+    #business = null;
+    #generation = 0;
+
+    // Credentials stay in private memory. reset/disconnect consume this binding;
+    // callers must explicitly provide a fresh credential before another round.
+    setBusinessToken(credential) {
+      const { businessToken, expires } = credential || {};
+      if (typeof businessToken !== "string" || !businessToken.length || businessToken.length > 8192 ||
+          !Number.isSafeInteger(expires) || expires <= Date.now()) {
+        throw _err("invalid_business_token", "Invalid or expired business credential");
+      }
+      this.reset();
+      this.#business = Object.freeze({ businessToken, expires });
+    }
+
+    #requireBusiness() {
+      if (!this.#business || this.#business.expires <= Date.now()) {
+        throw _err("missing_business_token", "A valid business credential is required");
+      }
+      return this.#business;
+    }
+
+    async #roundFetch(round, url, init = {}) {
+      if (round.generation !== this.#generation || round.signal.aborted) {
+        throw _err("aborted", "aborted");
+      }
+      if (round.credential.expires <= Date.now()) {
+        throw _err("expired_business_token", "Business credential expired");
+      }
+      try {
+        return await capFetch(url, {
+          ...init,
+          signal: round.signal,
+          headers: { ...init.headers, "Content-Type": "application/json" },
+          body: JSON.stringify({ ...JSON.parse(init.body || "{}"), businessToken: round.credential.businessToken }),
+        });
+      } catch (_) {
+        // Fetch/provider errors may echo request bodies; never log credentials.
+        throw _err("network_error", "CAP request failed");
+      }
+    }
+
+    #round() {
+      const credential = this.#requireBusiness();
+      return { generation: this.#generation, signal: this.#abort.signal, credential };
+    }
 
     get #hasHaptics() {
       return (
@@ -994,6 +1040,14 @@
 
     async #beginSpeculativeSolve() {
       if (this.#speculative.state !== "waiting") return;
+      let round;
+      try { round = this.#round(); } catch (err) {
+        this.#speculative.state = "error";
+        this.#speculative.notify();
+        this.error(err.message, err.code);
+        return;
+      }
+      const speculative = this.#speculative;
       this.#speculative.state = "fetching";
       this.#speculative._t0 = performance.now();
 
@@ -1008,7 +1062,7 @@
       if (!apiEndpoint.endsWith("/")) apiEndpoint += "/";
 
       try {
-        const raw = await capFetch(`${apiEndpoint}challenge`, {
+        const raw = await this.#roundFetch(round, `${apiEndpoint}challenge`, {
           method: "POST",
           signal: this.#abort?.signal,
         });
@@ -1018,8 +1072,9 @@
         } catch {
           throw new Error("Failed to parse speculative challenge response");
         }
+        if (round.generation !== this.#generation) return;
         if (resp.error) throw new Error(resp.error);
-        if (!this.#speculative) return;
+        if (round.generation !== this.#generation || !this.#speculative) return;
 
         resp._apiEndpoint = apiEndpoint;
         this.#speculative.challengeResp = resp;
@@ -1053,20 +1108,21 @@
         this.#speculative.state = "solving";
 
         this.#speculative.solvePromise = this.#speculativeSolveAll(
-          challenges,
+          challenges, round, speculative,
         ).catch(() => {
-          if (!this.#speculative) return;
+          if (round.generation !== this.#generation) return;
+          if (round.generation !== this.#generation || !this.#speculative) return;
           this.#speculative.state = "error";
           this.#speculative.notify();
         });
       } catch {
-        if (!this.#speculative) return;
+        if (round.generation !== this.#generation || !this.#speculative) return;
         this.#speculative.state = "error";
         this.#speculative.notify();
       }
     }
 
-    async #speculativeSolveAll(challenges) {
+    async #speculativeSolveAll(challenges, round, speculative) {
       _getSharedWorkerUrl();
 
       let wasmModule = null;
@@ -1074,7 +1130,7 @@
         wasmModule = await getWasmModule();
       } catch {}
 
-      if (!this.#speculative) return [];
+      if (round.generation !== this.#generation || !this.#speculative) return [];
       if (!this.#speculativePool) {
         this.#speculativePool = new WorkerPool(1);
         this.#speculativePool._spawn();
@@ -1103,7 +1159,7 @@
       let nextIndex = 0;
 
       while (nextIndex < total) {
-        if (!this.#speculative || !this.#speculativePool) return results;
+        if (round.generation !== this.#generation || !this.#speculativePool) return results;
         const batchSize = concurrency;
         const batch = [];
         const batchIndices = [];
@@ -1121,7 +1177,7 @@
             this.#speculativePool
               .run(challenge[0], challenge[1])
               .then((nonce) => {
-                if (this.#speculative) this.#speculative.completedCount++;
+                if (round.generation === this.#generation) speculative.completedCount++;
                 return nonce;
               }),
           ),
@@ -1138,16 +1194,16 @@
         }
       }
 
-      if (!this.#speculative) return results;
+      if (round.generation !== this.#generation || !this.#speculative) return results;
       this.#speculative.results = results;
       this.#speculative.state = "redeeming";
-      this.#speculativeRedeem(results);
+      this.#speculativeRedeem(results, round);
       return results;
     }
 
-    async #speculativeRedeem(solutions) {
+    async #speculativeRedeem(solutions, round) {
       try {
-        if (!this.#speculative) return;
+        if (round.generation !== this.#generation || !this.#speculative) return;
         const challengeResp = this.#speculative.challengeResp;
         const apiEndpoint = challengeResp._apiEndpoint;
         if (!apiEndpoint)
@@ -1158,7 +1214,7 @@
           instrOut = await runInstrumentationChallenge(
             challengeResp.instrumentation,
           );
-          if (!this.#speculative) return;
+          if (round.generation !== this.#generation || !this.#speculative) return;
           if (instrOut?.__timeout || instrOut?.__blocked) {
             this.#speculative.state = "done";
             this.#speculative.notify();
@@ -1178,7 +1234,7 @@
           this.#selfOkNow(),
         );
 
-        const redeemRaw = await capFetch(`${apiEndpoint}redeem`, {
+        const redeemRaw = await this.#roundFetch(round, `${apiEndpoint}redeem`, {
           method: "POST",
           body: JSON.stringify({
             token: challengeResp.token,
@@ -1197,7 +1253,8 @@
           throw new Error("Failed to parse speculative redeem response");
         }
 
-        if (!this.#speculative) return;
+        if (round.generation !== this.#generation || !this.#speculative) return;
+        if (round.credential.expires <= Date.now()) throw _err("expired_business_token", "Business credential expired");
         if (!resp.success)
           throw new Error(resp.error || "Speculative redeem failed");
 
@@ -1207,7 +1264,7 @@
         this.#speculative._invisibleElapsed = this.#speculative._t0 ? since(this.#speculative._t0) : "?";
         this.#speculative.notify();
       } catch {
-        if (!this.#speculative) return;
+        if (round.generation !== this.#generation || !this.#speculative) return;
         this.#speculative.state = "done";
         this.#speculative.notify();
       }
@@ -1233,13 +1290,17 @@
     }
 
     #commitSpeculativeToken() {
+      const generation = this.#generation;
       log.debug(T("solve"), `served from speculative cache (saved ${this.#speculative._invisibleElapsed || "?"})`);
       this.dispatchEvent("progress", { progress: 100 });
+      if (generation !== this.#generation) return;
 
       this.#setToken(this.#speculative.token);
 
-      this.dispatchEvent("solve", { token: this.#speculative.token });
       this.token = this.#speculative.token;
+      this.#business = null;
+      this.dispatchEvent("solve", { token: this.token });
+      if (generation !== this.#generation) return;
 
       const expiresIn = this.#speculative.tokenExpires - Date.now();
       if (this.#resetTimer) clearTimeout(this.#resetTimer);
@@ -1256,6 +1317,7 @@
 
       this.#logInvisible();
       this.#resetSpeculativeState();
+      this.#detachInteractionListeners();
       this.#solving = false;
       return { success: true, token: this.token };
     }
@@ -1459,6 +1521,11 @@
         return;
       }
 
+      let round;
+      try { round = this.#round(); } catch (err) {
+        this.error(err.message, err.code);
+        throw err;
+      }
       this.#enforceCredits();
       const _solveT0 = performance.now();
       const signal = this.#abort?.signal;
@@ -1479,6 +1546,7 @@
           ),
         );
         this.dispatchEvent("progress", { progress: 0 });
+        if (signal.aborted) return;
 
         try {
           let apiEndpoint = this.getAttribute("data-cap-api-endpoint");
@@ -1591,16 +1659,17 @@
               challengeResp = cached;
               this.#speculative.challengeResp = null;
             } else {
-              const challengeRaw = await capFetch(`${apiEndpoint}challenge`, {
+              const challengeRaw = await this.#roundFetch(round, `${apiEndpoint}challenge`, {
                 method: "POST",
                 signal,
               });
               try {
                 challengeResp = await challengeRaw.json();
+                if (signal.aborted) return;
               } catch {
                 throw _err("challenge_parse_error", "Failed to parse challenge response from server");
               }
-              if (challengeResp.error) throw _err("network_error", challengeResp.error);
+              if (challengeResp.error) throw _err("network_error", "Challenge request failed");
             }
 
             if (
@@ -1632,6 +1701,7 @@
             }
           }
 
+          if (signal.aborted) return;
           const instrPromise = challengeResp.instrumentation
             ? runInstrumentationChallenge(challengeResp.instrumentation)
             : Promise.resolve(null);
@@ -1640,7 +1710,7 @@
           if (signal?.aborted || !this.#speculative) return;
 
           if (instrOut?.__timeout || instrOut?.__blocked) {
-            capFetch(`${apiEndpoint}redeem`, {
+            this.#roundFetch(round, `${apiEndpoint}redeem`, {
               method: "POST",
               body: JSON.stringify({
                 token: challengeResp.token,
@@ -1675,7 +1745,9 @@
             });
             super.dispatchEvent(errEvent);
             this.addEventListener("error", this.boundHandleError);
+            if (signal.aborted) return;
             this.executeAttributeCode("onerror", errEvent);
+            if (signal.aborted) return;
             log.error(T("instr"), `[${instrCode}] ${instrMsg}`);
             this.#solving = false;
             return;
@@ -1695,7 +1767,7 @@
             this.#selfOkNow(),
           );
 
-          const redeemResponse = await capFetch(`${apiEndpoint}redeem`, {
+          const redeemResponse = await this.#roundFetch(round, `${apiEndpoint}redeem`, {
             method: "POST",
             body: JSON.stringify({
               token,
@@ -1717,14 +1789,19 @@
           if (signal?.aborted || !this.#speculative) return;
 
           this.dispatchEvent("progress", { progress: 100 });
-          if (!resp.success) throw _err("invalid_solution", resp.error || "Invalid solution");
+          if (signal.aborted) return;
+          if (round.credential.expires <= Date.now()) throw _err("expired_business_token", "Business credential expired");
+          if (!resp.success) throw _err("invalid_solution", "Invalid solution");
 
           this.#setToken(resp.token);
 
-          this.dispatchEvent("solve", { token: resp.token });
           this.token = resp.token;
+          this.#business = null;
+          this.dispatchEvent("solve", { token: resp.token });
+          if (signal.aborted) return;
 
           this.#resetSpeculativeState();
+          this.#detachInteractionListeners();
 
           if (this.#resetTimer) clearTimeout(this.#resetTimer);
           const expiresIn = new Date(resp.expires).getTime() - Date.now();
@@ -1759,7 +1836,7 @@
           throw err;
         }
       } finally {
-        this.#solving = false;
+        if (round.generation === this.#generation) this.#solving = false;
       }
     }
 
@@ -1826,6 +1903,7 @@
       }
 
       const poolSize = Math.max(1, Math.min(this.#workersCount, challenges.length));
+      if (signal?.aborted) throw _err("aborted", "aborted");
       const pool = new WorkerPool(poolSize);
       pool.setWasm(wasmModule);
       pool._ensureSize(poolSize);
@@ -1869,6 +1947,7 @@
 
       const inFlight = new Array(challenges.length).fill(0);
       const emit = () => {
+        if (signal?.aborted) return;
         const sum = inFlight.reduce((a, b) => a + b, 0) + completed;
         const visual = Math.min(99, Math.round((sum / total) * 100));
         this.dispatchEvent("progress", { progress: visual });
@@ -2016,6 +2095,7 @@
         }
       }
 
+      if (signal?.aborted) throw _err("aborted", "aborted");
       if (!wasmSupported) {
         log.warn(T("wasm"), "WebAssembly disabled in this browser, solver will be ~10x slower");
         if (!this.#shadow.querySelector(".warning")) {
@@ -2053,7 +2133,7 @@
                   99,
                   Math.round(((speculativeHead + completed) / total) * 100),
                 );
-                this.dispatchEvent("progress", { progress: visual });
+                if (!signal?.aborted) this.dispatchEvent("progress", { progress: visual });
                 return nonce;
               }),
             ),
@@ -2390,6 +2470,19 @@
     }
 
     reset() {
+      this.#generation++;
+      this.#business = null;
+      this.#abort?.abort();
+      this.#abort = new AbortController();
+      this.#solving = false;
+      if (this.#speculative) {
+        this.#speculative.state = "error";
+        this.#speculative.notify();
+      }
+      if (this.#speculativePool) {
+        this.#speculativePool.terminate();
+        this.#speculativePool = null;
+      }
       if (this.#resetTimer) {
         clearTimeout(this.#resetTimer);
         this.#resetTimer = null;
@@ -2400,8 +2493,8 @@
       }
       if (this.#speculative) this.#resetSpeculativeState();
       this.token = null;
-      this.dispatchEvent("reset");
       this.#setToken("");
+      this.dispatchEvent("reset");
     }
 
     get tokenValue() {

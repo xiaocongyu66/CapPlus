@@ -30,6 +30,7 @@ mod integrity;
 mod admin_routes;
 mod assets;
 mod challenge;
+mod business;
 mod demo;
 mod pages;
 mod redeem;
@@ -841,6 +842,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/public/*rest", get(public_asset))
         .route("/demo", get(demo_page))
         .route(
+            "/demo/credential",
+            post(demo::demo_credential).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/demo/verify",
             post(demo_verify).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
@@ -895,6 +900,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/turnstile/v0/siteverify",
             post(siteverify_alias).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/:siteKey/business-credential",
+            post(business::issue).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/:siteKey/challenge",

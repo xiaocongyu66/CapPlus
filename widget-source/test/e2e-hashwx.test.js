@@ -41,6 +41,10 @@ if (!SHOULD_RUN_E2E) {
       hostname: "127.0.0.1",
       fetch: async (req) => {
         const url = new URL(req.url);
+        if (req.method === "POST" && /\/(challenge|redeem)$/.test(url.pathname)) {
+          const body = await req.clone().json();
+          if (body.businessToken !== "e2e-business-fixture") return Response.json({ error: "invalid business fixture" }, { status: 403 });
+        }
         if (url.pathname === "/widget.js") {
           return new Response(widgetMin, {
             headers: { "Content-Type": "application/javascript" },
@@ -106,6 +110,7 @@ if (!SHOULD_RUN_E2E) {
     page.evaluate(async () => {
       const w = document.getElementById("cap");
       w.reset();
+      w.setBusinessToken({ businessToken: "e2e-business-fixture", expires: Date.now() + 600000 });
       await new Promise((r) => setTimeout(r, 40));
       const started = performance.now();
       try {
