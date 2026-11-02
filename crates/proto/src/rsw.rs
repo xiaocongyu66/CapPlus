@@ -144,7 +144,7 @@ fn random_prime(bits: usize) -> BigUint {
 /// Generate a keypair. Matches `generateRswKeypair` (two `bits/2` primes whose
 /// product has `2*(bits/2)` bits because both have their top two bits set).
 pub fn generate_keypair(bits: usize) -> RswKeypair {
-    assert!(bits % 2 == 0, "rsw bits must be even");
+    assert!(bits.is_multiple_of(2), "rsw bits must be even");
     let p = random_prime(bits >> 1);
     let mut q = random_prime(bits >> 1);
     while q == p {
@@ -210,7 +210,7 @@ impl RswMinter {
         let p = kp.p.clone();
         let q = kp.q.clone();
         let n = kp.n.clone();
-        let modulus_bytes = (n.bits() as usize + 7) / 8;
+        let modulus_bytes = (n.bits() as usize).div_ceil(8);
         let g = match g {
             Some(g) => g,
             None => {
@@ -355,7 +355,7 @@ mod tests {
         let kp = generate_keypair(256);
         let v = serialize_keypair(&kp);
         let back = deserialize_keypair(&v).unwrap();
-        assert_eq!(kp.user_eq(&back), true);
+        assert!(kp.user_eq(&back));
     }
 
     impl RswKeypair {

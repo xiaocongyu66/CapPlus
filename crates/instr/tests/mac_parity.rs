@@ -77,7 +77,14 @@ fn js_parity_of_stringify_and_mac() {
         bad_mac.push(if last == '0' { '1' } else { '0' });
         assert!(!verify_result_mac(key, id, ts, &state, &p, &bad_mac));
         assert!(!verify_result_mac(key, id, ts + 1, &state, &p, mac));
-        assert!(!verify_result_mac(key, &format!("{id}x"), ts, &state, &p, mac));
+        assert!(!verify_result_mac(
+            key,
+            &format!("{id}x"),
+            ts,
+            &state,
+            &p,
+            mac
+        ));
         assert!(!verify_result_mac(
             key,
             id,
@@ -108,7 +115,14 @@ fn rejects_malformed_mac_and_missing_key() {
 
     // Sanity: the good one verifies, and case-insensitive hex is accepted.
     assert!(verify_result_mac(key, id, ts, &state, &p, mac));
-    assert!(verify_result_mac(key, id, ts, &state, &p, &mac.to_uppercase()));
+    assert!(verify_result_mac(
+        key,
+        id,
+        ts,
+        &state,
+        &p,
+        &mac.to_uppercase()
+    ));
 
     // Empty key can never verify.
     assert!(!verify_result_mac("", id, ts, &state, &p, mac));
@@ -207,13 +221,16 @@ fn string_escaping() {
 #[test]
 fn key_order_is_preserved() {
     let v: Value = serde_json::from_str(r#"{"z":1,"y":2,"x":3,"__":4,"Aa":5,"aA":6}"#).unwrap();
-    assert_eq!(js_stringify(&v), r#"{"z":1,"y":2,"x":3,"__":4,"Aa":5,"aA":6}"#);
+    assert_eq!(
+        js_stringify(&v),
+        r#"{"z":1,"y":2,"x":3,"__":4,"Aa":5,"aA":6}"#
+    );
 }
 
 /// Property: stringify output re-parses to an equal value and is idempotent.
 #[test]
 fn property_roundtrip_and_idempotent() {
-    let mut rng = StdRng::seed_from_u64(0xC0FFEE_1234_5678);
+    let mut rng = StdRng::seed_from_u64(0x00C0_FFEE_1234_5678);
     for _ in 0..2000 {
         let v = gen_value(&mut rng, 4);
         let s = js_stringify(&v);
@@ -264,9 +281,9 @@ fn gen_string(rng: &mut StdRng, tag: usize) -> String {
 fn random_float(rng: &mut StdRng) -> f64 {
     loop {
         let f = match rng.gen_range(0..4) {
-            0 => rng.gen::<f64>().mul_add(2.0, -1.0), // [-1, 1)
-            1 => rng.gen::<f64>() * 10f64.powi(rng.gen_range(-320..=308)),
-            _ => f64::from_bits(rng.gen()),
+            0 => rng.r#gen::<f64>().mul_add(2.0, -1.0), // [-1, 1)
+            1 => rng.r#gen::<f64>() * 10f64.powi(rng.gen_range(-320..=308)),
+            _ => f64::from_bits(rng.r#gen()),
         };
         if f.is_finite() && f != 0.0 {
             return f;
@@ -278,8 +295,8 @@ fn random_float(rng: &mut StdRng) -> f64 {
 /// serde_json's `Float` variant (an integral float would re-parse as `PosInt`).
 fn random_nonintegral(rng: &mut StdRng) -> f64 {
     loop {
-        let mag = rng.gen::<f64>() * 10f64.powi(rng.gen_range(-300..=14));
-        let f = if rng.gen::<bool>() { mag } else { -mag };
+        let mag = rng.r#gen::<f64>() * 10f64.powi(rng.gen_range(-300..=14));
+        let f = if rng.r#gen::<bool>() { mag } else { -mag };
         if f.is_finite() && f.fract() != 0.0 {
             return f;
         }
@@ -298,7 +315,7 @@ fn gen_number(rng: &mut StdRng) -> Number {
 fn gen_value(rng: &mut StdRng, depth: u32) -> Value {
     match rng.gen_range(0..6) {
         0 => Value::Null,
-        1 => Value::Bool(rng.gen()),
+        1 => Value::Bool(rng.r#gen()),
         2 | 3 => Value::Number(gen_number(rng)),
         4 if depth > 0 => {
             let n = rng.gen_range(0..4);

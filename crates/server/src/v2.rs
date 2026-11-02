@@ -171,6 +171,7 @@ pub fn expected_entries(expected: &Value) -> Result<&[Value], String> {
 }
 
 /// Verify a v2 solution list; unknown protocols fail closed.
+#[cfg(test)]
 pub fn verify_solutions(expected: &Value, solutions: &[Value]) -> Result<(), String> {
     verify_solutions_observation(expected, solutions).map(|_| ())
 }
@@ -230,6 +231,7 @@ pub(crate) fn verify_solutions_observation(expected: &Value, solutions: &[Value]
 
 /// Verify one instrumentation solution against its sealed meta. Shared by the
 /// v2 challenge list and the v1 `ei` path.
+#[cfg(test)]
 pub fn verify_instr(meta: &Value, instr: &Value) -> Result<(), String> {
     verify_instr_observation(meta, instr).map(|_| ())
 }
@@ -272,17 +274,17 @@ pub(crate) fn verify_instr_observation(meta: &Value, instr: &Value) -> Result<Ve
     // Tamper-evidence: the client HMACs id|ts|JSON(state)|JSON(p) with the
     // per-session key. Canonical JSON must reproduce the client's
     // `JSON.stringify` (see cap_instr::js_stringify).
-    if let Some(mac_key) = meta.get("macKey").and_then(Value::as_str) {
-        if !mac_key.is_empty() {
-            let mac = instr.get("mac").and_then(Value::as_str).unwrap_or("");
-            let ts_mac = instr.get("ts").and_then(Value::as_i64).unwrap_or(0);
-            let id_str = meta.get("id").and_then(Value::as_str).unwrap_or("");
-            let p_val = instr.get("p").cloned().unwrap_or(Value::Null);
-            if !cap_instr::mac::verify_result_mac(mac_key, id_str, ts_mac, state, &p_val, mac) {
-                return Err("instr_mac_mismatch".into());
-            }
-            mac_verified = true;
+    if let Some(mac_key) = meta.get("macKey").and_then(Value::as_str)
+        && !mac_key.is_empty()
+    {
+        let mac = instr.get("mac").and_then(Value::as_str).unwrap_or("");
+        let ts_mac = instr.get("ts").and_then(Value::as_i64).unwrap_or(0);
+        let id_str = meta.get("id").and_then(Value::as_str).unwrap_or("");
+        let p_val = instr.get("p").cloned().unwrap_or(Value::Null);
+        if !cap_instr::mac::verify_result_mac(mac_key, id_str, ts_mac, state, &p_val, mac) {
+            return Err("instr_mac_mismatch".into());
         }
+        mac_verified = true;
     }
     // Replay window.
     let ts = instr.get("ts").and_then(Value::as_i64).unwrap_or(0);

@@ -279,7 +279,7 @@ pub(crate) async fn list_for_key(store: &AdminStore, site_key: &str) -> crate::A
             }),
         ));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.0));
     ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
 }
 
@@ -488,7 +488,7 @@ pub(crate) async fn list(store: &AdminStore, scope: &Option<Scope>) -> crate::Ad
         let _ = store.srem("shares", id).await;
     }
 
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.0));
     ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
 }
 

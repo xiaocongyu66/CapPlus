@@ -203,10 +203,10 @@ pub async fn handle(
     }
 
     let body = parse_body(req.body);
-    if cfg.demo {
-        if let Some(resp) = demo_dispatch(req, &method, &body) {
-            return add_security_headers(resp);
-        }
+    if cfg.demo
+        && let Some(resp) = demo_dispatch(req, &method, &body)
+    {
+        return add_security_headers(resp);
     }
     let resp = dispatch(store, cfg, req, &method, &scope, &body).await;
     add_security_headers(resp)

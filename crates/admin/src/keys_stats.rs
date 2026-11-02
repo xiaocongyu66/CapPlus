@@ -8,10 +8,10 @@ use crate::keys::DAY;
 pub(crate) fn sum_range(h: &HashMap<String, String>, start: i64, end: Option<i64>) -> i64 {
     let mut sum = 0;
     for (k, v) in h {
-        if let (Ok(bucket), Ok(count)) = (k.parse::<i64>(), v.parse::<i64>()) {
-            if bucket >= start && end.map_or(true, |e| bucket < e) {
-                sum += count;
-            }
+        if let (Ok(bucket), Ok(count)) = (k.parse::<i64>(), v.parse::<i64>())
+            && bucket >= start && end.is_none_or(|e| bucket < e)
+        {
+            sum += count;
         }
     }
     sum
@@ -20,11 +20,11 @@ pub(crate) fn sum_range(h: &HashMap<String, String>, start: i64, end: Option<i64
 pub(crate) fn aggregate_daily(h: &HashMap<String, String>, start: i64, end: i64) -> BTreeMap<i64, i64> {
     let mut m: BTreeMap<i64, i64> = BTreeMap::new();
     for (k, v) in h {
-        if let (Ok(bucket), Ok(count)) = (k.parse::<i64>(), v.parse::<i64>()) {
-            if bucket >= start && bucket < end {
-                let day_bucket = (bucket / DAY) * DAY;
-                *m.entry(day_bucket).or_insert(0) += count;
-            }
+        if let (Ok(bucket), Ok(count)) = (k.parse::<i64>(), v.parse::<i64>())
+            && bucket >= start && bucket < end
+        {
+            let day_bucket = (bucket / DAY) * DAY;
+            *m.entry(day_bucket).or_insert(0) += count;
         }
     }
     m

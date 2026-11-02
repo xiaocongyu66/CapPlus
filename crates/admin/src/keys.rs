@@ -358,10 +358,10 @@ pub(crate) async fn list(store: &AdminStore, scope: &Option<Scope>) -> crate::Ad
         Ok(v) => v,
         Err(_) => return internal(),
     };
-    if let Some(s) = scope {
-        if let Some(allowed) = &s.site_keys {
-            site_keys.retain(|k| allowed.contains(k));
-        }
+    if let Some(s) = scope
+        && let Some(allowed) = &s.site_keys
+    {
+        site_keys.retain(|k| allowed.contains(k));
     }
 
     let now = util::now_secs();
@@ -389,7 +389,7 @@ pub(crate) async fn list(store: &AdminStore, scope: &Option<Scope>) -> crate::Ad
             created,
         ));
     }
-    keys.sort_by(|a, b| b.3.cmp(&a.3));
+    keys.sort_by_key(|a| std::cmp::Reverse(a.3));
 
     let mut out = Vec::with_capacity(keys.len());
     for (site_key, name, config, created) in keys {

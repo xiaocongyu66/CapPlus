@@ -3,6 +3,9 @@ name = "cap_wasm"
 version = "0.1.0"
 edition = "2024"
 
+# This standalone Wasm crate is built separately from the server workspace.
+[workspace]
+
 [lib]
 crate-type = ["cdylib"]
 

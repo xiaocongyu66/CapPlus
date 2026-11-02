@@ -14,7 +14,7 @@ use crate::AppState;
 
 pub(crate) async fn ipdb_status(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     let stored = st
         .kv
@@ -69,7 +69,7 @@ pub(crate) async fn ipdb_status(State(st): State<AppState>, headers: HeaderMap) 
 
 pub(crate) async fn ipdb_put(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
         return json_resp(
@@ -93,10 +93,10 @@ pub(crate) async fn ipdb_put(State(st): State<AppState>, headers: HeaderMap, bod
     doc.insert("provider".into(), json!(mode.as_str()));
     doc.insert("mode".into(), json!(mode.as_str()));
     for field in ["maxmindAccountId", "maxmindKey", "ipinfoToken"] {
-        if let Some(v) = payload.get(field) {
-            if let Some(s) = v.as_str() {
-                doc.insert(field.into(), json!(s));
-            }
+        if let Some(v) = payload.get(field)
+            && let Some(s) = v.as_str()
+        {
+            doc.insert(field.into(), json!(s));
         }
     }
     doc.insert(
@@ -115,7 +115,7 @@ pub(crate) async fn ipdb_put(State(st): State<AppState>, headers: HeaderMap, bod
 
 pub(crate) async fn ipdb_download(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let stored = st
@@ -190,7 +190,7 @@ pub(crate) async fn ipdb_download(State(st): State<AppState>, headers: HeaderMap
 
 pub(crate) async fn ipdb_progress(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     let p = st.ipdb.progress();
     json_resp(
@@ -207,7 +207,7 @@ pub(crate) async fn ipdb_progress(State(st): State<AppState>, headers: HeaderMap
 
 pub(crate) async fn ipdb_delete(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     let _ = st.kv.del("settings:ipdb").await;
     let _ = std::fs::remove_file(st.ipdb.country_path());
@@ -228,26 +228,26 @@ pub(crate) fn admin_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-pub(crate) async fn require_admin(st: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+pub(crate) async fn require_admin(st: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     let Some(admin) = st.admin.as_ref() else {
-        return Err(json_resp(
+        return Err(Box::new(json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "success": false, "error": "Admin API is not configured" }),
-        ));
+        )));
     };
     match cap_admin::require_session(admin, &admin_headers(headers)).await {
         Ok(()) => Ok(()),
-        Err(r) => Err(json_resp(
+        Err(r) => Err(Box::new(json_resp(
             StatusCode::from_u16(r.status).unwrap_or(StatusCode::UNAUTHORIZED),
             r.body,
-        )),
+        ))),
     }
 }
 
 /// `GET /server/releases` — published bundles, newest first.
 pub(crate) async fn releases_list(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     json_resp(
         StatusCode::OK,
@@ -266,7 +266,7 @@ pub(crate) async fn release_upload(
     body: Bytes,
 ) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     if body.is_empty() {
         return json_resp(
@@ -295,7 +295,7 @@ pub(crate) async fn release_activate(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     let store = Arc::clone(&st.releases);
     let id_for_task = id.clone();
@@ -316,7 +316,7 @@ pub(crate) async fn release_delete(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     let store = Arc::clone(&st.releases);
     let id_for_task = id.clone();
@@ -337,7 +337,7 @@ pub(crate) async fn release_archive(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = require_admin(&st, &headers).await {
-        return r;
+        return *r;
     }
     match st.releases.source_zip(&id) {
         Some(bytes) => {

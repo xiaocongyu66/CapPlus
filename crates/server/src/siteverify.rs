@@ -223,43 +223,6 @@ fn bound_hostname(bind: Option<&SessionBind>) -> &str {
     bind.and_then(|b| b.host.as_deref()).unwrap_or_default()
 }
 
-#[cfg(test)]
-mod hostname_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn business_error_semantics_fail_closed() {
-        use cap_store::BusinessStoreError::*;
-        for (error, status, code) in [
-            (Storage(cap_kv::KvError("private diagnostic".into())), StatusCode::SERVICE_UNAVAILABLE, "bad-request"),
-            (Busy, StatusCode::SERVICE_UNAVAILABLE, "bad-request"),
-            (Expired, StatusCode::OK, "timeout-or-duplicate"),
-            (Used, StatusCode::OK, "timeout-or-duplicate"),
-            (Mismatch, StatusCode::OK, "invalid-input-response"),
-        ] {
-            let response = business_verify_error(error);
-            assert_eq!(response.status(), status);
-            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(value["success"], false);
-            assert_eq!(value["error-codes"][0], code);
-            assert!(!String::from_utf8_lossy(&body).contains("private diagnostic"));
-        }
-    }
-
-    #[test]
-    fn response_hostname_uses_only_server_binding() {
-        let mut bind = SessionBind::new(None, "UA", 1);
-        assert_eq!(ok_response(1, bound_hostname(None))["hostname"], "");
-        assert_eq!(ok_response(1, bound_hostname(Some(&bind)))["hostname"], "");
-        bind.host = Some("app.example".into());
-        assert_eq!(ok_response(1, bound_hostname(Some(&bind)))["hostname"], "app.example");
-        // A caller cannot replace the output hostname, even in non-strict mode.
-        assert!(!bind.matches(false, "", "UA", "forged.example"));
-        assert!(bind.matches(false, "", "UA", ""));
-        assert_eq!(bound_hostname(Some(&bind)), "app.example");
-    }
-}
 
 pub(crate) fn error_message(code: ErrorCode) -> &'static str {
     match code {
@@ -331,4 +294,42 @@ pub(crate) async fn validate(
         return r;
     }
     verify_common(&st, &headers, &body, Some(&site_key)).await
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn business_error_semantics_fail_closed() {
+        use cap_store::BusinessStoreError::*;
+        for (error, status, code) in [
+            (Storage(cap_kv::KvError("private diagnostic".into())), StatusCode::SERVICE_UNAVAILABLE, "bad-request"),
+            (Busy, StatusCode::SERVICE_UNAVAILABLE, "bad-request"),
+            (Expired, StatusCode::OK, "timeout-or-duplicate"),
+            (Used, StatusCode::OK, "timeout-or-duplicate"),
+            (Mismatch, StatusCode::OK, "invalid-input-response"),
+        ] {
+            let response = business_verify_error(error);
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["success"], false);
+            assert_eq!(value["error-codes"][0], code);
+            assert!(!String::from_utf8_lossy(&body).contains("private diagnostic"));
+        }
+    }
+
+    #[test]
+    fn response_hostname_uses_only_server_binding() {
+        let mut bind = SessionBind::new(None, "UA", 1);
+        assert_eq!(ok_response(1, bound_hostname(None))["hostname"], "");
+        assert_eq!(ok_response(1, bound_hostname(Some(&bind)))["hostname"], "");
+        bind.host = Some("app.example".into());
+        assert_eq!(ok_response(1, bound_hostname(Some(&bind)))["hostname"], "app.example");
+        // A caller cannot replace the output hostname, even in non-strict mode.
+        assert!(!bind.matches(false, "", "UA", "forged.example"));
+        assert!(bind.matches(false, "", "UA", ""));
+        assert_eq!(bound_hostname(Some(&bind)), "app.example");
+    }
 }

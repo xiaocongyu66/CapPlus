@@ -51,10 +51,10 @@ pub(crate) fn store_failure(error: BusinessStoreError) -> Response {
     failure(status, code)
 }
 
-pub(crate) async fn authenticate(stored: &str, provided: &str) -> Result<(), Response> {
+pub(crate) async fn authenticate(stored: &str, provided: &str) -> Result<(), Box<Response>> {
     let valid = if stored.starts_with("$argon2") {
         if cap_verify::validate_argon2_phc(stored).is_err() {
-            return Err(failure(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"));
+            return Err(Box::new(failure(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")));
         }
         let (stored, provided) = (stored.to_owned(), provided.to_owned());
         match cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::Argon, move || {
@@ -64,9 +64,9 @@ pub(crate) async fn authenticate(stored: &str, provided: &str) -> Result<(), Res
         {
             Ok(Ok(valid)) => valid,
             Err(cap_kv::cpu::CpuError::Busy) => {
-                return Err(failure(StatusCode::SERVICE_UNAVAILABLE, "server_busy"));
+                return Err(Box::new(failure(StatusCode::SERVICE_UNAVAILABLE, "server_busy")));
             }
-            _ => return Err(failure(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")),
+            _ => return Err(Box::new(failure(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))),
         }
     } else {
         matches!(
@@ -77,7 +77,7 @@ pub(crate) async fn authenticate(stored: &str, provided: &str) -> Result<(), Res
     if valid {
         Ok(())
     } else {
-        Err(failure(StatusCode::UNAUTHORIZED, "invalid_secret"))
+        Err(Box::new(failure(StatusCode::UNAUTHORIZED, "invalid_secret")))
     }
 }
 
@@ -86,16 +86,16 @@ pub(crate) async fn checked_credential(
     site: &str,
     secret: &str,
     token: &str,
-) -> Result<BusinessClaims, Response> {
+) -> Result<BusinessClaims, Box<Response>> {
     let claims = verify_business_token(token, secret, now_ms())
-        .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid_business_token"))?;
+        .map_err(|_| Box::new(failure(StatusCode::BAD_REQUEST, "invalid_business_token")))?;
     if claims.binding.site != site {
-        return Err(failure(StatusCode::BAD_REQUEST, "business_mismatch"));
+        return Err(Box::new(failure(StatusCode::BAD_REQUEST, "business_mismatch")));
     }
     st.store
         .check_business(&claims, token)
         .await
-        .map_err(store_failure)?;
+        .map_err(|error| Box::new(store_failure(error)))?;
     Ok(claims)
 }
 
@@ -159,7 +159,7 @@ pub(crate) async fn issue(
         return failure(StatusCode::BAD_REQUEST, "invalid_request");
     };
     if let Err(response) = authenticate(&key.secret_hash, &secret).await {
-        return response;
+        return *response;
     }
     let now = now_ms();
     let Ok(token) = sign_business_token(binding, &key.jwt_secret, now, None) else {

@@ -98,7 +98,7 @@ pub fn plan_state(rng: &mut Rng, namer: &mut Namer) -> StatePlan {
     while bad_key == correct_key {
         bad_key = rng.inclusive(1000, 9000) as i32;
     }
-    vals[0] = vals[0] ^ correct_key;
+    vals[0] ^= correct_key;
 
     let fn_helper = namer.var(rng, None);
     let dom_helper = namer.var(rng, None);

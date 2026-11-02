@@ -133,10 +133,10 @@ pub fn spawn_refresher(
                         );
                         if updated > 0 {
                             last_refresh_ms = now_ms();
-                            if conn.is_none() {
-                                if let Some(url) = &redis_url {
-                                    conn = connect(url).await;
-                                }
+                            if conn.is_none()
+                                && let Some(url) = &redis_url
+                            {
+                                conn = connect(url).await;
                             }
                             if let Some(c) = conn.as_mut() {
                                 persist_config(c, &cfg).await;

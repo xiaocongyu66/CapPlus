@@ -274,8 +274,7 @@ mod tests {
     }
     #[test]
     fn invalid_config_is_rejected() {
-        let mut c = CpuConfig::default();
-        c.total = 0;
+        let c = CpuConfig { total: 0, ..CpuConfig::default() };
         assert!(CpuScheduler::new(c).is_err());
     }
 }

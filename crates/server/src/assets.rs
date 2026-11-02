@@ -64,33 +64,6 @@ fn release_response(releases: &cap_assets::ReleaseStore, name: &str, req_headers
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn asset_response_uses_one_source_and_fails_closed() {
-        let dir = std::env::temp_dir().join(format!("cap-asset-route-{}", random_hex(16)));
-        let releases = cap_assets::ReleaseStore::open(&dir).unwrap();
-        releases.publish_builtin(crate::config::builtin_widget_zip(), "route-test").unwrap();
-        let headers = HeaderMap::new();
-        for name in ["widget.js", "cap_wasm_bg.wasm", "hashwx.wasm"] {
-            assert_eq!(release_response(&releases, name, &headers).status(), StatusCode::OK, "{name}");
-        }
-        assert_eq!(release_response(&releases, "absent.wasm", &headers).status(), StatusCode::NOT_FOUND);
-        // A configured partial release must not borrow widget.js from builtin.
-        std::fs::create_dir_all(dir.join("releases/test-partial/dist")).unwrap();
-        std::fs::write(dir.join("releases/test-partial/dist/only.txt"), b"only").unwrap();
-        releases.activate("test-partial").unwrap();
-        assert_eq!(release_response(&releases, "widget.js", &headers).status(), StatusCode::NOT_FOUND);
-        assert_eq!(release_response(&releases, "only.txt", &headers).status(), StatusCode::OK);
-        std::fs::write(dir.join("releases/active"), "missing-release").unwrap();
-        let broken = cap_assets::ReleaseStore::open(&dir).unwrap();
-        broken.publish_builtin(crate::config::builtin_widget_zip(), "route-test").unwrap();
-        assert_eq!(release_response(&broken, "widget.js", &headers).status(), StatusCode::SERVICE_UNAVAILABLE);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-}
 
 pub(crate) async fn embed_js() -> Response {
     let mut headers = HeaderMap::new();
@@ -199,4 +172,32 @@ pub(crate) async fn embed_page(
         Some(&format!("frame-ancestors {frame_ancestors}")),
         html,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asset_response_uses_one_source_and_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("cap-asset-route-{}", random_hex(16)));
+        let releases = cap_assets::ReleaseStore::open(&dir).unwrap();
+        releases.publish_builtin(crate::config::builtin_widget_zip(), "route-test").unwrap();
+        let headers = HeaderMap::new();
+        for name in ["widget.js", "cap_wasm_bg.wasm", "hashwx.wasm"] {
+            assert_eq!(release_response(&releases, name, &headers).status(), StatusCode::OK, "{name}");
+        }
+        assert_eq!(release_response(&releases, "absent.wasm", &headers).status(), StatusCode::NOT_FOUND);
+        // A configured partial release must not borrow widget.js from builtin.
+        std::fs::create_dir_all(dir.join("releases/test-partial/dist")).unwrap();
+        std::fs::write(dir.join("releases/test-partial/dist/only.txt"), b"only").unwrap();
+        releases.activate("test-partial").unwrap();
+        assert_eq!(release_response(&releases, "widget.js", &headers).status(), StatusCode::NOT_FOUND);
+        assert_eq!(release_response(&releases, "only.txt", &headers).status(), StatusCode::OK);
+        std::fs::write(dir.join("releases/active"), "missing-release").unwrap();
+        let broken = cap_assets::ReleaseStore::open(&dir).unwrap();
+        broken.publish_builtin(crate::config::builtin_widget_zip(), "route-test").unwrap();
+        assert_eq!(release_response(&broken, "widget.js", &headers).status(), StatusCode::SERVICE_UNAVAILABLE);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

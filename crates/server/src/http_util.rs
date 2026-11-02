@@ -12,6 +12,7 @@ pub(crate) fn hourly_bucket(now_ms: i64) -> i64 {
     (now_ms / 1000 / 3600) * 3600
 }
 
+#[cfg(test)]
 pub(crate) fn is_loopback_or_private(addr: &str) -> bool {
     use std::net::IpAddr;
     let ip = match addr.parse::<IpAddr>() {
@@ -230,7 +231,7 @@ fn forwarded_tls(headers: &HeaderMap) -> Option<bool> {
     let proto = headers
         .get_all("x-forwarded-proto")
         .iter()
-        .last()?
+        .next_back()?
         .to_str()
         .ok()?;
     match proto
@@ -384,10 +385,10 @@ pub(crate) fn html_response(status: StatusCode, csp: Option<&str>, body: String)
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    if let Some(csp) = csp {
-        if let Ok(v) = HeaderValue::from_str(csp) {
-            headers.insert("content-security-policy", v);
-        }
+    if let Some(csp) = csp
+        && let Ok(v) = HeaderValue::from_str(csp)
+    {
+        headers.insert("content-security-policy", v);
     }
     (status, headers, body).into_response()
 }

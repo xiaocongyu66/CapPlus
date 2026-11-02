@@ -62,7 +62,7 @@ pub(crate) fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map_or(false, |x| x != 0.0),
+        Value::Number(n) => n.as_f64().is_some_and(|x| x != 0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
     }
@@ -277,53 +277,50 @@ pub(crate) fn is_software_gpu(s: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn clip_field(obj: &mut Value, key: &str, n: usize) {
-    if let Value::Object(m) = obj {
-        if let Some(Value::String(s)) = m.get_mut(key) {
-            if s.chars().count() > n {
-                *s = s.chars().take(n).collect();
-            }
-        }
+    if let Value::Object(m) = obj
+        && let Some(Value::String(s)) = m.get_mut(key)
+        && s.chars().count() > n
+    {
+        *s = s.chars().take(n).collect();
     }
 }
 
 pub(crate) fn truncate_array(obj: &mut Value, key: &str, n: usize) {
-    if let Value::Object(m) = obj {
-        if let Some(Value::Array(a)) = m.get_mut(key) {
-            a.truncate(n);
-        }
+    if let Value::Object(m) = obj
+        && let Some(Value::Array(a)) = m.get_mut(key)
+    {
+        a.truncate(n);
     }
 }
 
 pub(crate) fn truncate_nested_array(obj: &mut Value, parent: &str, key: &str, n: usize) {
-    if let Value::Object(m) = obj {
-        if let Some(child) = m.get_mut(parent) {
-            truncate_array(child, key, n);
-        }
+    if let Value::Object(m) = obj
+        && let Some(child) = m.get_mut(parent)
+    {
+        truncate_array(child, key, n);
     }
 }
 
 pub(crate) fn clip_nested(obj: &mut Value, parent: &str, key: &str, n: usize) {
-    if let Value::Object(m) = obj {
-        if let Some(child) = m.get_mut(parent) {
-            if child.is_object() {
-                clip_field(child, key, n);
-            }
-        }
+    if let Value::Object(m) = obj
+        && let Some(child) = m.get_mut(parent)
+        && child.is_object()
+    {
+        clip_field(child, key, n);
     }
 }
 
 pub(crate) fn truncate_plugins(obj: &mut Value) {
-    if let Value::Object(m) = obj {
-        if let Some(Value::Object(p)) = m.get_mut("plugins") {
-            if p.len() > 64 {
-                let kept: Vec<(String, Value)> = p
-                    .iter()
-                    .take(64)
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                *p = kept.into_iter().collect();
-            }
-        }
+    if let Value::Object(m) = obj
+        && let Some(Value::Object(p)) = m.get_mut("plugins")
+        && p.len() > 64
+    {
+        let kept: Vec<(String, Value)> = p
+            .iter()
+            .take(64)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        *p = kept.into_iter().collect();
     }
 }
 
@@ -342,10 +339,10 @@ pub fn sanitize_vector(v: &mut Value) {
     truncate_array(v, "fontWidths", 64);
     truncate_array(v, "automationGlobals", 32);
     truncate_plugins(v);
-    if let Value::Object(m) = v {
-        if let Some(top) = m.get_mut("top") {
-            truncate_plugins(top);
-        }
+    if let Value::Object(m) = v
+        && let Some(top) = m.get_mut("top")
+    {
+        truncate_plugins(top);
     }
 }
 
@@ -394,10 +391,10 @@ pub fn probe_completeness(
             }
         }
     }
-    if let (Some(Value::Array(fw)), Some(count)) = (obj.get("fontWidths"), font_stack_count) {
-        if fw.len() != count {
-            bad.push("fontWidths.length".to_string());
-        }
+    if let (Some(Value::Array(fw)), Some(count)) = (obj.get("fontWidths"), font_stack_count)
+        && fw.len() != count
+    {
+        bad.push("fontWidths.length".to_string());
     }
     bad
 }
@@ -462,7 +459,7 @@ pub fn collect_signals(
     for c in checks.iter().filter(|c| !c.passed) {
         if let Some(dep) = dep_field(&c.id) {
             let requested = optional_fields.iter().any(|f| f == dep);
-            let returned = field(vector, dep).map_or(false, |v| !v.is_null());
+            let returned = field(vector, dep).is_some_and(|v| !v.is_null());
             if !requested && !returned {
                 continue;
             }

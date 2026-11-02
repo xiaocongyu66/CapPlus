@@ -66,20 +66,12 @@ pub struct AdminSection {
     pub admin_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageSection {
     /// Redis connection string. Empty falls back to `REDIS_URL`, then
     /// `redis://127.0.0.1:6379`.
     pub redis_url: String,
-}
-
-impl Default for StorageSection {
-    fn default() -> Self {
-        Self {
-            redis_url: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,9 +128,6 @@ pub struct Settings {
     pub redis_url: String,
     pub dashboard_dir: Option<PathBuf>,
     pub cdn_fallback: bool,
-    pub cache_host: String,
-    pub widget_version: String,
-    pub wasm_version: String,
     pub embed_widget_url: String,
     pub trust_proxy: bool,
     pub proxy_secret: String,
@@ -455,9 +444,6 @@ pub fn init() -> Result<Settings, String> {
             .unwrap_or_else(|| "redis://127.0.0.1:6379".to_string()),
         dashboard_dir: dashboard.map(PathBuf::from),
         cdn_fallback: env_bool("ENABLE_ASSETS_SERVER").unwrap_or(file.assets.cdn_fallback),
-        cache_host: env_str("CACHE_HOST").unwrap_or(file.assets.cache_host),
-        widget_version: env_str("WIDGET_VERSION").unwrap_or(file.assets.widget_version),
-        wasm_version: env_str("WASM_VERSION").unwrap_or(file.assets.wasm_version),
         embed_widget_url: env_str("EMBED_WIDGET_URL").unwrap_or(file.assets.embed_widget_url),
         ip_header: proxy.ip_header,
         rsw_bits: env_str("RSW_BITS")
@@ -511,6 +497,19 @@ fn resolve_demo_domains(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_assets_fields_remain_readable() {
+        let assets: super::AssetsSection = serde_json::from_value(serde_json::json!({
+            "cache_host": "https://legacy.example.test",
+            "widget_version": "1.2.3",
+            "wasm_version": "4.5.6"
+        })).unwrap();
+        assert_eq!(assets.cache_host, "https://legacy.example.test");
+        assert_eq!(assets.widget_version, "1.2.3");
+        assert_eq!(assets.wasm_version, "4.5.6");
+        assert!(assets.cdn_fallback);
+    }
+
     #[test]
     fn demo_domains_are_explicit_bounded_and_independent_of_listen_ip() {
         use super::*;

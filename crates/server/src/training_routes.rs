@@ -69,12 +69,12 @@ pub(crate) async fn authorize(
     st: &AppState,
     headers: &HeaderMap,
     site: &str,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     if st.admin_cfg.demo {
-        return Err(failure(
+        return Err(Box::new(failure(
             StatusCode::FORBIDDEN,
             "Training management is unavailable in demo mode",
-        ));
+        )));
     }
     if headers.get_all(header::AUTHORIZATION).iter().count() != 1
         || !headers
@@ -82,10 +82,10 @@ pub(crate) async fn authorize(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("Bearer ") && !v[7..].trim().is_empty())
     {
-        return Err(failure(
+        return Err(Box::new(failure(
             StatusCode::UNAUTHORIZED,
             "An administrator Bearer session is required",
-        ));
+        )));
     }
     crate::admin_routes::require_admin(st, headers).await?;
     let admin = st
@@ -94,11 +94,11 @@ pub(crate) async fn authorize(
         .expect("require_admin checked admin store");
     match admin.kv_exists(&format!("key:{site}")).await {
         Ok(true) => Ok(()),
-        Ok(false) => Err(failure(StatusCode::NOT_FOUND, "Site not found")),
-        Err(_) => Err(failure(
+        Ok(false) => Err(Box::new(failure(StatusCode::NOT_FOUND, "Site not found"))),
+        Err(_) => Err(Box::new(failure(
             StatusCode::SERVICE_UNAVAILABLE,
             "Site storage unavailable",
-        )),
+        ))),
     }
 }
 
@@ -120,7 +120,7 @@ async fn handle(
         return failure(StatusCode::METHOD_NOT_ALLOWED, "HEAD is not supported");
     }
     if let Err(response) = authorize(&st, req.headers(), &site).await {
-        return response;
+        return *response;
     }
     let Some(service) = st.training.as_ref() else {
         return service_error(Error::Unavailable);
@@ -224,8 +224,7 @@ mod tests {
             data_dir: root.clone(), hostname: "127.0.0.1".into(), port: 0,
             ip_header: String::new(), rsw_bits: 2048, admin_key: String::new(),
             demo: false, demo_allowed_domains: None, redis_url: redis.clone(), dashboard_dir: None,
-            cdn_fallback: false, cache_host: String::new(), widget_version: String::new(),
-            wasm_version: String::new(), embed_widget_url: String::new(),
+            cdn_fallback: false, embed_widget_url: String::new(),
             trust_proxy: false, proxy_secret: String::new(), require_network_fingerprint: false,
             trusted_proxy_cidrs: vec![], trusted_peer_cidrs: vec![], require_verify_session: false,
         });

@@ -215,14 +215,13 @@ async fn check_second_factor_at(
     }
 
     if let Some(code) = body.get("code").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        if let Some(secret) = h.get("totpSecret") {
-            if let Some(counter) = matching_counter(secret, code) {
-                // Recheck the current enabled flag and verified secret in the
-                // same script that claims the existing replay marker.
-                if confirm_totp(store, name, secret, counter).await? {
-                    return Ok(true);
-                }
-            }
+        if let Some(secret) = h.get("totpSecret")
+            && let Some(counter) = matching_counter(secret, code)
+            // Recheck the current enabled flag and verified secret in the
+            // same script that claims the existing replay marker.
+            && confirm_totp(store, name, secret, counter).await?
+        {
+            return Ok(true);
         }
         return Err(resp(
             401,

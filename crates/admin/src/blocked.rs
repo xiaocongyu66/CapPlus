@@ -154,6 +154,42 @@ pub(crate) async fn list(store: &AdminStore, site_key: &str) -> crate::AdminResp
     ok(Value::Array(out))
 }
 
+
+/// `GET /keys/:sk/geo-stats` — country / ASN / platform / OS tallies.
+pub(crate) async fn geo_stats(store: &AdminStore, site_key: &str) -> crate::AdminResponse {
+    let mut groups = Vec::new();
+    for (store_key, field, total_key) in [
+        ("metrics:country", "countries", "totalCountry"),
+        ("metrics:asn", "asns", "totalAsn"),
+        ("metrics:platform", "platforms", "totalPlatform"),
+        ("metrics:os", "oses", "totalOs"),
+    ] {
+        let hash = store
+            .hgetall(&format!("{store_key}:{site_key}"))
+            .await
+            .unwrap_or_default();
+        let mut entries: Vec<(String, i64)> = hash
+            .into_iter()
+            .map(|(k, v)| (k, v.parse::<i64>().unwrap_or(0)))
+            .collect();
+        entries.sort_by_key(|a| std::cmp::Reverse(a.1));
+        groups.push((field, total_key, entries));
+    }
+
+    let mut doc = serde_json::Map::new();
+    for (field, total_key, entries) in groups {
+        let total: i64 = entries.iter().map(|(_, c)| c).sum();
+        let key = if field == "countries" { "code" } else { "name" };
+        let list: Vec<Value> = entries
+            .into_iter()
+            .map(|(name, count)| json!({ key: name, "count": count }))
+            .collect();
+        doc.insert(field.to_string(), Value::Array(list));
+        doc.insert(total_key.to_string(), json!(total));
+    }
+    ok(Value::Object(doc))
+}
+
 #[cfg(test)]
 mod expiry_tests {
     use super::*;
@@ -177,39 +213,4 @@ mod expiry_tests {
         assert_eq!(list(&store, &site).await.status, 500);
         store.del(&name).await.unwrap();
     }
-}
-
-/// `GET /keys/:sk/geo-stats` — country / ASN / platform / OS tallies.
-pub(crate) async fn geo_stats(store: &AdminStore, site_key: &str) -> crate::AdminResponse {
-    let mut groups = Vec::new();
-    for (store_key, field, total_key) in [
-        ("metrics:country", "countries", "totalCountry"),
-        ("metrics:asn", "asns", "totalAsn"),
-        ("metrics:platform", "platforms", "totalPlatform"),
-        ("metrics:os", "oses", "totalOs"),
-    ] {
-        let hash = store
-            .hgetall(&format!("{store_key}:{site_key}"))
-            .await
-            .unwrap_or_default();
-        let mut entries: Vec<(String, i64)> = hash
-            .into_iter()
-            .map(|(k, v)| (k, v.parse::<i64>().unwrap_or(0)))
-            .collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
-        groups.push((field, total_key, entries));
-    }
-
-    let mut doc = serde_json::Map::new();
-    for (field, total_key, entries) in groups {
-        let total: i64 = entries.iter().map(|(_, c)| c).sum();
-        let key = if field == "countries" { "code" } else { "name" };
-        let list: Vec<Value> = entries
-            .into_iter()
-            .map(|(name, count)| json!({ key: name, "count": count }))
-            .collect();
-        doc.insert(field.to_string(), Value::Array(list));
-        doc.insert(total_key.to_string(), json!(total));
-    }
-    ok(Value::Object(doc))
 }

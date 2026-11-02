@@ -201,7 +201,7 @@ async def live(browser):
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(executable_path='/bin/chromium', args=['--no-sandbox'])
+        browser = await p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH', '/bin/chromium'), args=['--no-sandbox'])
         try:
             await fixtures(browser)
             if '--live' in sys.argv: await live(browser)

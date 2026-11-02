@@ -175,12 +175,8 @@ fn build(rng: &mut Rng, opts: &InstrOptions<'_>, now: i64) -> InstrChallenge {
 fn clamp01(x: f64) -> f64 {
     if x.is_nan() {
         0.0
-    } else if x < 0.0 {
-        0.0
-    } else if x > 1.0 {
-        1.0
     } else {
-        x
+        x.clamp(0.0, 1.0)
     }
 }
 
@@ -190,6 +186,23 @@ mod tests {
 
     fn is_hex(s: &str, len: usize) -> bool {
         s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    #[test]
+    fn clamp01_preserves_non_finite_and_boundary_values() {
+        for (input, expected) in [
+            (f64::NAN, 0.0_f64),
+            (f64::NEG_INFINITY, 0.0),
+            (f64::INFINITY, 1.0),
+            (-1.0, 0.0),
+            (-0.0, -0.0),
+            (0.0, 0.0),
+            (0.5, 0.5),
+            (1.0, 1.0),
+            (2.0, 1.0),
+        ] {
+            assert_eq!(clamp01(input).to_bits(), expected.to_bits());
+        }
     }
 
     #[test]

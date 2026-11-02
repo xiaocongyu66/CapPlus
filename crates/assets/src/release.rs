@@ -292,7 +292,7 @@ impl ReleaseStore {
     /// new release becomes active unless another one was activated first.
     pub fn publish(&self, archive: &[u8]) -> Result<ReleaseMeta, String> {
         let entries = read_zip(archive).map_err(|e: ZipError| e.0)?;
-        let id = format!("{}-{}", now_ms(), &crate::random_suffix());
+        let id = format!("{}-{}", now_ms(), crate::random_suffix());
         let dir = self.release_dir(&id);
         let (raw_dir, dist_dir) = (dir.join("raw"), dir.join("dist"));
         std::fs::create_dir_all(&raw_dir).map_err(|e| e.to_string())?;
@@ -480,7 +480,7 @@ impl ReleaseStore {
             meta.active = active.as_deref() == Some(id.as_str());
             out.push(meta);
         }
-        out.sort_by(|a, b| b.created.cmp(&a.created));
+        out.sort_by_key(|a| std::cmp::Reverse(a.created));
         out
     }
 

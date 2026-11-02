@@ -469,12 +469,10 @@ pub fn build_script(rng: &mut Rng, namer: &mut Namer, inp: &ScriptInput<'_>) -> 
     }
     let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-    let body = tmpl(
+    tmpl(
         "(function(){async function %GO%(){try {%HELPERS%const %DV%=await (async function(){%ENV%%BLOCK%var %V0%=%I0%;var %V1%=%I1%;var %V2%=%I2%;var %V3%=%I3%;%CLIENTEQ%var %OUT%={};%OUT%[\"%V0%\"]=%V0%;%OUT%[\"%V1%\"]=%V1%;%OUT%[\"%V2%\"]=%V2%;%OUT%[\"%V3%\"]=%V3%;return %OUT%;})();if (!%DV% || typeof %DV% !== 'object') return;%PROBE%%AWAIT%%POST%} catch {}}if(document.readyState==='complete'){%GO%()}else{window.addEventListener('load',%GO%)};})();",
         &refs,
-    );
-
-    body
+    )
 }
 
 /// Apply the requested obfuscation level.

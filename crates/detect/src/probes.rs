@@ -28,7 +28,7 @@ const MAX_DETAIL_FIELDS: usize = 6;
 const OUTER_HEIGHT_SLACK: f64 = 16.0;
 
 /// Options for [`detect_automation`] (the JS `opts` bag).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DetectOpts<'a> {
     /// Expected length of `fontWidths` (the challenge's font stack count).
     pub font_stack_count: Option<usize>,
@@ -37,16 +37,6 @@ pub struct DetectOpts<'a> {
     pub optional_fields: &'a [String],
     /// Raw `Accept-Language` request header, when known to the server.
     pub accept_language: Option<&'a str>,
-}
-
-impl Default for DetectOpts<'_> {
-    fn default() -> Self {
-        DetectOpts {
-            font_stack_count: None,
-            optional_fields: &[],
-            accept_language: None,
-        }
-    }
 }
 
 impl<'a> DetectOpts<'a> {
@@ -207,8 +197,6 @@ const ALLOW_TOP: &[&str] = &[
 // ---------------------------------------------------------------------------
 // small JS-semantics helpers
 // ---------------------------------------------------------------------------
-
-/// `v[k]` (or `undefined` when `v` is not an object).
 
 mod detect;
 mod support;

@@ -136,6 +136,7 @@ impl From<&cap_detect::NetworkSignals> for Proxy {
 /// omitted, not copied; no details or arbitrary strings can enter the queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg(test)]
 pub(crate) enum Reason {
     HoneypotTriggered,
     Webdriver,
@@ -147,6 +148,7 @@ pub(crate) enum Reason {
     Http2NonBrowser,
     UaJaMismatch,
 }
+#[cfg(test)]
 pub(crate) fn reasons(trust: &cap_detect::Trust) -> Vec<Reason> {
     let mut out = Vec::with_capacity(9);
     for r in trust.reasons.iter().take(64) {

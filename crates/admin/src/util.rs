@@ -71,9 +71,7 @@ pub fn b64url_nopad(bytes: &[u8]) -> String {
 pub fn b64_strip(bytes: &[u8]) -> String {
     STANDARD
         .encode(bytes)
-        .replace('+', "")
-        .replace('/', "")
-        .replace('=', "")
+        .replace(['+', '/', '='], "")
 }
 
 pub fn sha256_hex(input: &str) -> String {
@@ -140,6 +138,29 @@ pub async fn argon2_hash_async(password: &str) -> Result<String, ArgonError> {
         .map_err(ArgonError::Cpu)?
 }
 
+
+/// Normalize an integrity hash the way `integrity.js#norm` does: trim, lower,
+/// drop a leading `sha256-`, and require 64 hex chars. Returns `None` otherwise.
+pub fn norm_hash(v: &Value) -> Option<String> {
+    let s = v.as_str()?;
+    let cleaned = s
+        .trim()
+        .to_lowercase()
+        .strip_prefix("sha256-")
+        .map(|x| x.to_string())
+        .unwrap_or_else(|| s.trim().to_lowercase());
+    if cleaned.len() == 64 && cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
+pub fn last_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    s.chars().skip(count.saturating_sub(n)).collect()
+}
+
 #[cfg(test)]
 mod cpu_tests {
     use super::*;
@@ -183,26 +204,4 @@ mod cpu_tests {
             ));
         }
     }
-}
-
-/// Normalize an integrity hash the way `integrity.js#norm` does: trim, lower,
-/// drop a leading `sha256-`, and require 64 hex chars. Returns `None` otherwise.
-pub fn norm_hash(v: &Value) -> Option<String> {
-    let s = v.as_str()?;
-    let cleaned = s
-        .trim()
-        .to_lowercase()
-        .strip_prefix("sha256-")
-        .map(|x| x.to_string())
-        .unwrap_or_else(|| s.trim().to_lowercase());
-    if cleaned.len() == 64 && cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some(cleaned)
-    } else {
-        None
-    }
-}
-
-pub fn last_chars(s: &str, n: usize) -> String {
-    let count = s.chars().count();
-    s.chars().skip(count.saturating_sub(n)).collect()
 }

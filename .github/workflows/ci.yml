@@ -1,0 +1,182 @@
+name: Linux CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Explicit released toolchain; no claim that the minimum supported Rust was tested.
+  RUST_VERSION: 1.99.1
+  RUSTUP_TOOLCHAIN: 1.99.1
+
+jobs:
+  rust-test:
+    name: Rust / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.16.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - name: Native dependencies (no shared Redis service)
+        run: |
+          sudo systemctl mask --now redis-server.service
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config redis-server redis-tools openssl python3-venv xvfb
+      - name: Fixed Rust toolchain
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt --target "$BUILD_TARGET"
+          rustc --version
+          cargo --version
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$BUILD_TARGET"
+      - name: Rebuild widget from frozen dependencies
+        working-directory: widget-source
+        run: |
+          bun install --frozen-lockfile
+          bun _build_only.mjs
+      - name: Genuine upstream JS reference (Apache-2.0 core)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: tiagozip/cap
+          ref: 278796641bc82972b272c5d16dc6f479aeadc753
+          path: .ci-reference
+          persist-credentials: false
+      - name: Reference preflight before Rust compilation
+        run: python3 test/ci_runner.py reference-rust --reference-core .ci-reference/core
+      - name: Check, lint, and serial isolated tests
+        run: |
+          cargo fetch --locked
+          cargo check --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --locked
+          python3 -m unittest discover -s test -p 'ci_test_*.py' -v
+          python3 test/ci_runner.py rust --reference-core .ci-reference/core
+
+  browser-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.16.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - name: Native dependencies
+        run: |
+          sudo systemctl mask --now redis-server.service
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config redis-server redis-tools openssl python3-venv xvfb
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+      - name: Frozen widget and locked Playwright Chromium
+        working-directory: widget-source
+        run: |
+          bun install --frozen-lockfile
+          bun _build_only.mjs
+          node node_modules/playwright/cli.js install --with-deps chromium
+          node -e 'const fs=require("node:fs");const {chromium}=require("playwright");fs.appendFileSync(process.env.GITHUB_ENV,`CHROMIUM_PATH=${chromium.executablePath()}\n`);'
+      - name: Genuine upstream JS reference (Apache-2.0 core)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: tiagozip/cap
+          ref: 278796641bc82972b272c5d16dc6f479aeadc753
+          path: .ci-reference
+          persist-credentials: false
+      - name: Frozen upstream browser reference dependencies
+        working-directory: .ci-reference/core
+        run: bun install --frozen-lockfile
+      - name: Reference API preflight before compilation
+        run: python3 test/ci_runner.py reference-browser --reference-core .ci-reference/core
+      - name: Python Playwright in CI-only venv
+        run: |
+          python3 -m venv "$RUNNER_TEMP/cap-ci-venv"
+          "$RUNNER_TEMP/cap-ci-venv/bin/python" -m pip install playwright==1.64.1
+      - name: Tracked WASM security regressions (Node and Chromium)
+        timeout-minutes: 6
+        # Test the actual checked-in Node/web distributions; no publishing or toolchain downloads.
+        run: |
+          test -x "$CHROMIUM_PATH"
+          timeout --kill-after=10s 300s "$RUNNER_TEMP/cap-ci-venv/bin/python" -u wasm-source/test/generated_security.py
+      - name: Real debug main, browser fixtures and owned Redis regressions
+        run: |
+          cargo fetch --locked
+          cargo build --locked -p cap-server
+          "$RUNNER_TEMP/cap-ci-venv/bin/python" test/ci_runner.py preflight
+          "$RUNNER_TEMP/cap-ci-venv/bin/python" test/ci_runner.py browser --reference-core .ci-reference/core
+
+  build:
+    name: Package / ${{ matrix.target }}
+    needs: [rust-test, browser-test]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.16.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - name: Native release dependencies
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config openssl
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt --target "$BUILD_TARGET"
+      - name: Rebuild widget (never silently use old dist)
+        working-directory: widget-source
+        run: |
+          bun install --frozen-lockfile
+          bun _build_only.mjs
+      - name: Locked release and minimal package
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          cargo fetch --locked --target "$BUILD_TARGET"
+          cargo build --release --locked --target "$BUILD_TARGET" -p cap-server
+          python3 test/ci_package.py "$BUILD_TARGET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cap-server-${{ matrix.target }}
+          path: |
+            ci-artifacts/cap-server-${{ matrix.target }}.tar.gz
+            ci-artifacts/cap-server-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

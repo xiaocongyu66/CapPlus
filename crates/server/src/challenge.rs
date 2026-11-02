@@ -131,18 +131,6 @@ fn parse_business_body(body: &[u8]) -> Result<String, ()> {
     Ok(request.business_token)
 }
 
-#[cfg(test)]
-mod business_body_tests {
-    use super::*;
-    #[test]
-    fn requires_bounded_body_credential() {
-        assert_eq!(parse_business_body(br#"{"businessToken":"abc"}"#), Ok("abc".into()));
-        for bad in [b"".as_slice(), b"{}", br#"{"businessToken":null}"#, br#"{"businessToken":""}"#, br#"{"businessToken":"abc","ttl":300}"#, br#"{"businessToken":"a","businessToken":"b"}"#] {
-            assert!(parse_business_body(bad).is_err());
-        }
-        assert!(parse_business_body(&serde_json::to_vec(&json!({"businessToken":"x".repeat(8193)})).unwrap()).is_err());
-    }
-}
 
 pub(crate) async fn challenge(
     State(st): State<AppState>,
@@ -263,7 +251,7 @@ pub(crate) async fn challenge_inner(
     };
     let business = match crate::business::checked_credential(&st, &site_key, &key.jwt_secret, &credential).await {
         Ok(claims) => claims,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let business_hash = cap_core::sha256_hex(&credential);
 
@@ -508,4 +496,17 @@ pub(crate) async fn challenge_inner(
         body["instrumentation"] = json!(script);
     }
     Json(body).into_response()
+}
+
+#[cfg(test)]
+mod business_body_tests {
+    use super::*;
+    #[test]
+    fn requires_bounded_body_credential() {
+        assert_eq!(parse_business_body(br#"{"businessToken":"abc"}"#), Ok("abc".into()));
+        for bad in [b"".as_slice(), b"{}", br#"{"businessToken":null}"#, br#"{"businessToken":""}"#, br#"{"businessToken":"abc","ttl":300}"#, br#"{"businessToken":"a","businessToken":"b"}"#] {
+            assert!(parse_business_body(bad).is_err());
+        }
+        assert!(parse_business_body(&serde_json::to_vec(&json!({"businessToken":"x".repeat(8193)})).unwrap()).is_err());
+    }
 }

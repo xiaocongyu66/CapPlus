@@ -451,10 +451,10 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 fn file(path: &Path, create: bool) -> Result<File> {
-    if let Ok(m) = fs::symlink_metadata(path) {
-        if !m.is_file() || m.file_type().is_symlink() {
-            return Err(Error::Storage);
-        }
+    if let Ok(m) = fs::symlink_metadata(path)
+        && (!m.is_file() || m.file_type().is_symlink())
+    {
+        return Err(Error::Storage);
     }
     // O_NOFOLLOW is Linux-specific; the server targets Linux. Prevent final-path
     // symlink following even if another same-uid process races the metadata check.
@@ -521,16 +521,15 @@ impl TrainingService {
             {
                 return Err(Error::Storage);
             }
-            if let Some(op) = &m.pending_operation {
-                if op.id == 0
+            if let Some(op) = &m.pending_operation
+                && (op.id == 0
                     || op.id >= m.next_sequence
                     || !matches!(op.action.as_str(), "site_data_delete" | "site_retire")
                     || !m.sites.get(&op.site).is_some_and(|s| {
                         s.epoch == op.epoch && (op.action != "site_retire" || s.tombstoned)
-                    })
-                {
-                    return Err(Error::Storage);
-                }
+                    }))
+            {
+                return Err(Error::Storage);
             }
             for (key, meta) in &mut m.sites {
                 if meta.configuring {
@@ -867,9 +866,7 @@ mod tests {
                 sample: s.clone()
             })
             .unwrap()
-            .len()
-                + 1
-                <= MAX_SAMPLE_BYTES
+            .len() < MAX_SAMPLE_BYTES
         );
         s.reasons = vec![ReasonId::ProofInvalid; 16];
         assert!(s.valid());

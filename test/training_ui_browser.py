@@ -3,6 +3,7 @@ Run: python test/training_ui_browser.py (requires Python Playwright + Chromium).
 """
 import asyncio
 import json
+import os
 from pathlib import Path
 from playwright.async_api import async_playwright, expect
 
@@ -15,7 +16,7 @@ GOOD = dict(config=dict(enabled=False, sample_rate_ppm=10000, retention_secs=864
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(executable_path='/bin/chromium', args=['--no-sandbox'])
+        browser = await p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH', '/bin/chromium'), args=['--no-sandbox'])
         context = await browser.new_context(accept_downloads=True)
         page = await context.new_page()
         state = {'status': GOOD.copy(), 'fail': False, 'write_fail': False, 'delay': None}

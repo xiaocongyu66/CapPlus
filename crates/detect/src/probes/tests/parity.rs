@@ -6,10 +6,10 @@ use super::*;
     fn js_reference_path() -> Option<std::path::PathBuf> {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let vendored = manifest.join("testdata").join("js").join("detect.js");
-        if vendored.is_file() {
-            if let Ok(p) = vendored.canonicalize() {
-                return Some(p);
-            }
+        if vendored.is_file()
+            && let Ok(p) = vendored.canonicalize()
+        {
+            return Some(p);
         }
         std::path::PathBuf::from(std::env::var_os("CAP_JS_CORE_DIR")?)
             .join("src")

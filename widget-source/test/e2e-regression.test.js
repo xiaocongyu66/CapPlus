@@ -243,7 +243,7 @@ if (!SHOULD_RUN_E2E) {
     });
     baseUrl = `http://127.0.0.1:${server.port}`;
 
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined });
   }, 120_000);
 
   afterAll(async () => {

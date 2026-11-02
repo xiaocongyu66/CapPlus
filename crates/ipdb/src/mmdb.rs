@@ -117,7 +117,7 @@ impl Mmdb {
         for byte in bits {
             for shift in (0..8).rev() {
                 let bit = (byte >> shift) & 1;
-                let record = self.record(node, bit as u8)? as usize;
+                let record = self.record(node, bit)? as usize;
                 if record == self.node_count {
                     return None; // empty record
                 }
@@ -360,7 +360,7 @@ mod tests {
             }
             _ => unreachable!(),
         }
-        out.extend(std::iter::repeat(0u8).take(DATA_SEPARATOR));
+        out.extend(std::iter::repeat_n(0u8, DATA_SEPARATOR));
         out.extend_from_slice(payload);
 
         // Metadata: a map with node_count, record_size, ip_version.

@@ -471,7 +471,7 @@ use super::*;
             "chrome_shape_hollow",
             "canvas_unstable",
         ] {
-            assert!(find(&r, id).map_or(true, |c| c.passed), "{id}");
+            assert!(find(&r, id).is_none_or(|c| c.passed), "{id}");
         }
     }
 
@@ -515,7 +515,7 @@ use super::*;
         s.as_object_mut().unwrap().remove("deviceMemory");
         s["active"] = json!({ "devices": { "audioin": 0, "videoin": 0, "audioout": 0 } });
         let r = detect_automation(&s, &opts(None));
-        assert!(find(&r, "active_no_media_devices").map_or(true, |c| c.passed));
+        assert!(find(&r, "active_no_media_devices").is_none_or(|c| c.passed));
     }
 
 
@@ -733,7 +733,7 @@ use super::*;
             "renderer": "ANGLE (AMD, AMD Radeon RX 6800 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"
         });
         let r = detect_automation(&s, &opts(None));
-        assert!(find(&r, "platform_gpu_mismatch").map_or(true, |c| c.passed));
+        assert!(find(&r, "platform_gpu_mismatch").is_none_or(|c| c.passed));
 
         let mut s = chrome_human();
         s["platform"] = json!("MacIntel");
@@ -743,7 +743,7 @@ use super::*;
             "renderer": "ANGLE (Intel, Intel(R) Iris(TM) Plus Graphics OpenGL Engine, OpenGL 4.1)"
         });
         let r = detect_automation(&s, &opts(None));
-        assert!(find(&r, "platform_gpu_mismatch").map_or(true, |c| c.passed));
+        assert!(find(&r, "platform_gpu_mismatch").is_none_or(|c| c.passed));
     }
 
     // ---- sanitize_vector -------------------------------------------------
@@ -843,7 +843,7 @@ use super::*;
         };
         // Completeness now handles absence structurally; an emitted failure
         // must not be discarded by parsing a truncated human-readable detail.
-        assert_eq!(collect_signals(&[check.clone()], &[], &json!({})).len(), 1);
+        assert_eq!(collect_signals(std::slice::from_ref(&check), &[], &json!({})).len(), 1);
         let check2 = Check {
             detail: "missing or malformed: ua, webgl".into(),
             ..check

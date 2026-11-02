@@ -101,7 +101,7 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<ZipEntry>, ZipError> {
     if eocd >= 20 && u32_at(bytes, eocd - 20) == Some(SIG_EOCD64) {
         return err("ZIP64 archives are not supported");
     }
-    if cd_offset.checked_add(cd_size).map_or(true, |end| end > bytes.len()) {
+    if cd_offset.checked_add(cd_size).is_none_or(|end| end > bytes.len()) {
         return err("central directory out of bounds");
     }
 

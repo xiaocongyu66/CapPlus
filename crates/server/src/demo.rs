@@ -104,9 +104,9 @@ fn no_store(mut response: Response) -> Response {
 
 /// Exactly one real session authentication; no demo-mode authenticate shortcut,
 /// query token or cookie fallback. Hash the authenticated bearer for ownership.
-async fn demo_owner(st: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+async fn demo_owner(st: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
     if !st.admin_cfg.demo {
-        return Err(failure(StatusCode::NOT_FOUND, "not_found"));
+        return Err(Box::new(failure(StatusCode::NOT_FOUND, "not_found")));
     }
     let bearer = headers
         .get(header::AUTHORIZATION)
@@ -114,24 +114,24 @@ async fn demo_owner(st: &AppState, headers: &HeaderMap) -> Result<String, Respon
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|v| !v.is_empty() && v.len() <= 4096)
-        .ok_or_else(|| failure(StatusCode::UNAUTHORIZED, "admin_session_required"))?;
+        .ok_or_else(|| Box::new(failure(StatusCode::UNAUTHORIZED, "admin_session_required")))?;
     crate::admin_routes::require_admin(st, headers)
         .await
-        .map_err(no_store)?;
+        .map_err(|response| Box::new(no_store(*response)))?;
     Ok(cap_core::sha256_hex(bearer))
 }
 
-async fn demo_body(request: Request) -> Result<Bytes, Response> {
+async fn demo_body(request: Request) -> Result<Bytes, Box<Response>> {
     if !header_str(request.headers(), "content-type")
         .split(';')
         .next()
         .is_some_and(|s| s.trim().eq_ignore_ascii_case("application/json"))
     {
-        return Err(failure(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_required"));
+        return Err(Box::new(failure(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_required")));
     }
     axum::body::to_bytes(request.into_body(), DEMO_BODY_LIMIT)
         .await
-        .map_err(|_| failure(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"))
+        .map_err(|_| Box::new(failure(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large")))
 }
 
 fn demo_digest() -> String {
@@ -143,11 +143,11 @@ fn demo_digest() -> String {
 pub(crate) async fn demo_credential(State(st): State<AppState>, request: Request) -> Response {
     let owner = match demo_owner(&st, request.headers()).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let body = match demo_body(request).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if serde_json::from_slice::<Value>(&body).ok() != Some(json!({})) {
         return failure(StatusCode::BAD_REQUEST, "empty_object_required");
@@ -227,12 +227,12 @@ fn context_matches(context: &DemoContext, owner: &str, now: i64) -> bool {
 pub(crate) async fn demo_verify(State(st): State<AppState>, request: Request) -> Response {
     let owner = match demo_owner(&st, request.headers()).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let headers = request.headers().clone();
     let body = match demo_body(request).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let req: DemoVerifyRequest = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -365,28 +365,28 @@ pub(crate) async fn demo_widget_credentials(st: &AppState) -> Result<(String, St
     // Always answer with the authoritative pointer: a request that lost the
     // race must not render its own (now deleted) key, or its token would be
     // rejected by /demo/verify.
-    if let Ok(Some(existing)) = st.kv.get("demo:widget-key").await {
-        if let Some((sk, secret)) = existing.split_once(':') {
-            if sk != site_key {
-                let _ = st.kv.del(&format!("key:{site_key}")).await;
-                let _ = st.kv.srem("keys", &site_key).await;
-            } else {
-                eprintln!("[cap] demo page created site key {site_key}");
-            }
-            if !cap_embed::validate_site_key(sk) || secret.is_empty() {
-                return Err("invalid demo pointer".into());
-            }
-            let key = st
-                .store
-                .key(sk)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("missing demo key")?;
-            if !matching_demo_domains(key.config.cors_origins.as_deref().unwrap_or(&[]), &domains) {
-                return Err("demo domains require operator migration".into());
-            }
-            return Ok((sk.to_string(), secret.to_string()));
+    if let Ok(Some(existing)) = st.kv.get("demo:widget-key").await
+        && let Some((sk, secret)) = existing.split_once(':')
+    {
+        if sk != site_key {
+            let _ = st.kv.del(&format!("key:{site_key}")).await;
+            let _ = st.kv.srem("keys", &site_key).await;
+        } else {
+            eprintln!("[cap] demo page created site key {site_key}");
         }
+        if !cap_embed::validate_site_key(sk) || secret.is_empty() {
+            return Err("invalid demo pointer".into());
+        }
+        let key = st
+            .store
+            .key(sk)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("missing demo key")?;
+        if !matching_demo_domains(key.config.cors_origins.as_deref().unwrap_or(&[]), &domains) {
+            return Err("demo domains require operator migration".into());
+        }
+        return Ok((sk.to_string(), secret.to_string()));
     }
     Err("demo key could not be stored".into())
 }

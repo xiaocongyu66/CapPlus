@@ -30,23 +30,19 @@ impl Rng {
 
     /// Uniform integer in `0..n` (0 when `n == 0`).
     pub fn below(&mut self, n: u64) -> u64 {
-        if n == 0 {
-            0
-        } else {
-            self.0.gen_range(0..n)
-        }
+        if n == 0 { 0 } else { self.0.gen_range(0..n) }
     }
 
     /// Uniform float in `[0, 1)`.
     pub fn unit(&mut self) -> f64 {
-        self.0.gen::<f64>()
+        self.0.r#gen::<f64>()
     }
 
     /// Random lowercase hex string of `bytes * 2` chars.
     pub fn hex(&mut self, bytes: usize) -> String {
         let mut v = Vec::with_capacity(bytes);
         for _ in 0..bytes {
-            v.push(self.0.gen::<u8>());
+            v.push(self.0.r#gen::<u8>());
         }
         crate::crypto::hex(&v)
     }
@@ -205,10 +201,22 @@ mod tests {
             let v = namer.var(&mut r, None);
             assert!(v.len() >= 4 && v.len() <= 10);
             assert!(v.chars().next().unwrap().is_ascii_lowercase());
-            assert!(v
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+            assert!(
+                v.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            );
             assert!(seen.insert(v));
+        }
+    }
+
+    #[test]
+    fn edition_2024_draws_preserve_seeded_sequence() {
+        let mut wrapped = Rng::from_seed(2024);
+        let mut reference = StdRng::seed_from_u64(2024);
+        for bytes in [0, 1, 16, 32] {
+            assert_eq!(wrapped.unit().to_bits(), reference.r#gen::<f64>().to_bits());
+            let expected: Vec<u8> = (0..bytes).map(|_| reference.r#gen::<u8>()).collect();
+            assert_eq!(wrapped.hex(bytes), crate::crypto::hex(&expected));
         }
     }
 

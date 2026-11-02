@@ -160,7 +160,7 @@ pub(crate) async fn redeem(
     };
     let business = match crate::business::checked_credential(&st, &site_key, &key.jwt_secret, credential).await {
         Ok(claims) => claims,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if claims.get("businessHash").and_then(Value::as_str) != Some(cap_core::sha256_hex(credential).as_str())
         || claims.get("businessBinding") != Some(&json!(business.binding)) {
@@ -308,10 +308,10 @@ pub(crate) async fn redeem(
             };
             // Only compact whitelist features survive the capture lifetime;
             // do not queue or retain a second raw probe for observation.
-            if training_enabled && verified.mac_verified {
-                if let Some(probe) = instr.get("p") {
-                    training_client = Some(crate::training_capture::extract(probe, None));
-                }
+            if training_enabled && verified.mac_verified
+                && let Some(probe) = instr.get("p")
+            {
+                training_client = Some(crate::training_capture::extract(probe, None));
             }
             // The challenge asked for instrumentation; a result without a
             // probe would skip detection entirely, so refuse it.
@@ -351,12 +351,12 @@ pub(crate) async fn redeem(
         }
         // No instrumentation to judge (or none installed): the protocol-layer
         // findings still produce a verdict on their own.
-        if !judged {
-            if let Some(net) = net.as_ref() {
-                let trust = cap_detect::compute_trust_signals(&[], Some(net), None);
-                let action = cap_detect::trust_action(&trust);
-                v2_trust = Some((trust, action));
-            }
+        if !judged
+            && let Some(net) = net.as_ref()
+        {
+            let trust = cap_detect::compute_trust_signals(&[], Some(net), None);
+            let action = cap_detect::trust_action(&trust);
+            v2_trust = Some((trust, action));
         }
     }
     if is_v2 {
@@ -382,16 +382,15 @@ pub(crate) async fn redeem(
                     .find(|c| c.get("protocol").and_then(Value::as_str) == Some("instrumentation"))
             })
             .and_then(|c| c.get("instrMeta"));
-        if let Some(meta) = instr_meta {
-            if let Some(sealed_exp) = meta.get("expires").and_then(Value::as_i64) {
-                if sealed_exp <= now {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({"error": "instr_expired"})),
-                    )
-                        .into_response();
-                }
-            }
+        if let Some(meta) = instr_meta
+            && let Some(sealed_exp) = meta.get("expires").and_then(Value::as_i64)
+            && sealed_exp <= now
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "instr_expired"})),
+            )
+                .into_response();
         }
         if blocked_flag {
             let automated = instr_meta
@@ -586,18 +585,18 @@ pub(crate) async fn redeem(
 
     // Detection details are a probe oracle: only the demo mode exposes them.
     let demo = st.admin_cfg.demo;
-    if demo {
-        if let Some((trust, action)) = &v2_trust {
-            let _ = st
-                .kv
-                .set_ex(
-                    &format!("demo:last-trust:{site_key}"),
-                    &json!({ "trust": trust_json(trust), "action": action_str(*action) })
-                        .to_string(),
-                    120,
-                )
-                .await;
-        }
+    if demo
+        && let Some((trust, action)) = &v2_trust
+    {
+        let _ = st
+            .kv
+            .set_ex(
+                &format!("demo:last-trust:{site_key}"),
+                &json!({ "trust": trust_json(trust), "action": action_str(*action) })
+                    .to_string(),
+                120,
+            )
+            .await;
     }
     let mut doc = json!({
         "success": true,
@@ -607,11 +606,11 @@ pub(crate) async fn redeem(
     });
     // Detection details are a probe oracle: the fields do not exist at all
     // outside demo mode.
-    if demo {
-        if let Some((trust, action)) = &v2_trust {
-            doc["trust"] = trust_json(trust);
-            doc["action"] = json!(action_str(*action));
-        }
+    if demo
+        && let Some((trust, action)) = &v2_trust
+    {
+        doc["trust"] = trust_json(trust);
+        doc["action"] = json!(action_str(*action));
     }
     Json(doc).into_response()
 }
@@ -628,6 +627,58 @@ fn session_matches(bound: Option<&str>, sent: Option<&str>, require_bound: bool)
 #[cfg(test)]
 #[path = "redeem_interleaving_tests.rs"]
 mod interleaving_tests;
+
+
+fn remaining_nonce_ttl(exp: i64, now: i64) -> Option<i64> {
+    exp.checked_sub(now).filter(|ttl| *ttl > 0)
+}
+
+fn verify_v1_pow(token: &str, claims: &Value, raw: &[Value]) -> Result<(), &'static str> {
+    let solutions: Vec<u64> = raw.iter().map(|v| v.as_u64().ok_or("invalid_solutions"))
+        .collect::<Result<_, _>>()?;
+    let params = PowParams {
+        c: claims.get("c").and_then(Value::as_u64).unwrap_or(0) as u32,
+        s: claims.get("s").and_then(Value::as_u64).unwrap_or(0) as u32,
+        d: claims.get("d").and_then(Value::as_u64).unwrap_or(0) as u32,
+    };
+    if !params.valid() {
+        return Err("invalid_token");
+    }
+    if !verify_pow(token, params, &solutions) {
+        return Err("Invalid solution");
+    }
+    Ok(())
+}
+
+/// Trust result in the shape the dashboard/test page expects
+/// (`{score, level, reasons, gatingFailure}`), with the JS level names.
+pub(crate) fn trust_json(trust: &cap_detect::Trust) -> Value {
+    let level = match trust.level {
+        cap_detect::Level::Clean => "trusted",
+        cap_detect::Level::Restricted => {
+            // trust.js:levelFor splits neutral/suspicious at 55.
+            if trust.score >= 55 {
+                "neutral"
+            } else {
+                "suspicious"
+            }
+        }
+        cap_detect::Level::Hostile => "hostile",
+    };
+    json!({
+        "score": trust.score,
+        "level": level,
+        "reasons": trust.reasons,
+        "gatingFailure": trust.gating_failure,
+    })
+}
+
+pub(crate) fn action_str(action: cap_detect::Action) -> &'static str {
+    match action {
+        cap_detect::Action::Allow => "allow",
+        cap_detect::Action::Deny => "deny",
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -710,56 +761,5 @@ mod tests {
             assert!(session_matches(None, sent, false));
             assert!(!session_matches(None, sent, true));
         }
-    }
-}
-
-fn remaining_nonce_ttl(exp: i64, now: i64) -> Option<i64> {
-    exp.checked_sub(now).filter(|ttl| *ttl > 0)
-}
-
-fn verify_v1_pow(token: &str, claims: &Value, raw: &[Value]) -> Result<(), &'static str> {
-    let solutions: Vec<u64> = raw.iter().map(|v| v.as_u64().ok_or("invalid_solutions"))
-        .collect::<Result<_, _>>()?;
-    let params = PowParams {
-        c: claims.get("c").and_then(Value::as_u64).unwrap_or(0) as u32,
-        s: claims.get("s").and_then(Value::as_u64).unwrap_or(0) as u32,
-        d: claims.get("d").and_then(Value::as_u64).unwrap_or(0) as u32,
-    };
-    if !params.valid() {
-        return Err("invalid_token");
-    }
-    if !verify_pow(token, params, &solutions) {
-        return Err("Invalid solution");
-    }
-    Ok(())
-}
-
-/// Trust result in the shape the dashboard/test page expects
-/// (`{score, level, reasons, gatingFailure}`), with the JS level names.
-pub(crate) fn trust_json(trust: &cap_detect::Trust) -> Value {
-    let level = match trust.level {
-        cap_detect::Level::Clean => "trusted",
-        cap_detect::Level::Restricted => {
-            // trust.js:levelFor splits neutral/suspicious at 55.
-            if trust.score >= 55 {
-                "neutral"
-            } else {
-                "suspicious"
-            }
-        }
-        cap_detect::Level::Hostile => "hostile",
-    };
-    json!({
-        "score": trust.score,
-        "level": level,
-        "reasons": trust.reasons,
-        "gatingFailure": trust.gating_failure,
-    })
-}
-
-pub(crate) fn action_str(action: cap_detect::Action) -> &'static str {
-    match action {
-        cap_detect::Action::Allow => "allow",
-        cap_detect::Action::Deny => "deny",
     }
 }

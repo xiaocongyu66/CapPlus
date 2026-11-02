@@ -136,18 +136,28 @@ struct Target {
 }
 
 fn parse_target(target: &str) -> Target {
-    let bits = target.len() * 4;
     assert!(
-        bits <= 64,
+        target.len() <= 16,
         "Cap target longer than 64 bits is impractical to solve"
     );
-    // right-pad with zeros to 16 hex chars then parse as two u32s.
-    let mut padded = [b'0'; 16];
-    padded[..target.len()].copy_from_slice(target.as_bytes());
-    let hi =
-        u32::from_str_radix(unsafe { core::str::from_utf8_unchecked(&padded[..8]) }, 16).unwrap();
-    let lo =
-        u32::from_str_radix(unsafe { core::str::from_utf8_unchecked(&padded[8..]) }, 16).unwrap();
+    assert!(
+        target.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Cap target must contain only ASCII hexadecimal digits"
+    );
+    let bits = target.len() * 4;
+    // Decode bytes directly, right-padding to 16 nibbles without slicing UTF-8.
+    // An empty target intentionally keeps both values and masks zero.
+    let mut words = [0u32; 2];
+    for (i, byte) in target.bytes().enumerate() {
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => unreachable!("validated ASCII hexadecimal digit"),
+        };
+        words[i / 8] |= u32::from(nibble) << (28 - (i % 8) * 4);
+    }
+    let [hi, lo] = words;
     let mask_hi = if bits >= 32 {
         0xffff_ffffu32
     } else {
@@ -270,9 +280,9 @@ fn try_batch_simd(salt: &[u8], nonces: [u64; 4], t: &Target) -> Option<u64> {
     let mut msgs: [[u8; 55]; 4] = [[0; 55]; 4];
     let total_len = salt.len() + dlen;
     if total_len >= 56 {
-        for k in 0..4 {
-            if check_full_match_scalar(salt, nonces[k], t) {
-                return Some(nonces[k]);
+        for nonce in nonces {
+            if check_full_match_scalar(salt, nonce, t) {
+                return Some(nonce);
             }
         }
         return None;
@@ -297,6 +307,9 @@ fn try_batch_simd(salt: &[u8], nonces: [u64; 4], t: &Target) -> Option<u64> {
     None
 }
 
+/// Solve an ASCII hexadecimal hash prefix of at most 16 digits (case-insensitive).
+/// An empty prefix matches any hash. Invalid targets panic (trap in Wasm)
+/// before searching; they never return a nonce that looks like a solution.
 #[wasm_bindgen]
 pub fn solve_pow(salt: String, target: String) -> u64 {
     let salt_bytes = salt.as_bytes();
@@ -340,4 +353,74 @@ pub fn solve_pow(salt: String, target: String) -> u64 {
         }
     }
     unreachable!("solver exhausted u64::MAX")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_values_and_masks_for_every_length() {
+        for text in ["0123456789abcdef", "0123456789ABCDEF", "fEdCbA9876543210"] {
+            let full = u64::from_str_radix(text, 16).unwrap();
+            for len in 1..=16 {
+                let target = parse_target(&text[..len]);
+                let mask = u64::MAX << (64 - len * 4);
+                let value = full & mask;
+                assert_eq!(target.hi, (value >> 32) as u32);
+                assert_eq!(target.lo, value as u32);
+                assert_eq!(target.mask_hi, (mask >> 32) as u32);
+                assert_eq!(target.mask_lo, mask as u32);
+                assert!(target_matches((full >> 32) as u32, full as u32, &target));
+                let mismatch = full ^ (1u64 << (64 - len * 4));
+                assert!(!target_matches(
+                    (mismatch >> 32) as u32,
+                    mismatch as u32,
+                    &target
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_target_matches_any_hash() {
+        let target = parse_target("");
+        assert_eq!(
+            (target.hi, target.lo, target.mask_hi, target.mask_lo),
+            (0, 0, 0, 0)
+        );
+        assert!(target_matches(0, 0, &target));
+        assert!(target_matches(u32::MAX, u32::MAX, &target));
+        assert_eq!(solve_pow("salt".into(), "".into()), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ASCII hexadecimal")]
+    fn unicode_across_word_boundary_traps_at_public_entry() {
+        solve_pow("salt".into(), "aaaaaaaé".into());
+    }
+
+    #[test]
+    #[should_panic(expected = "ASCII hexadecimal")]
+    fn unicode_at_start_is_rejected() {
+        parse_target("é");
+    }
+
+    #[test]
+    #[should_panic(expected = "ASCII hexadecimal")]
+    fn non_hex_is_rejected() {
+        parse_target("0123456789abcdeg");
+    }
+
+    #[test]
+    #[should_panic(expected = "ASCII hexadecimal")]
+    fn plus_sign_is_not_a_hex_digit() {
+        parse_target("+1");
+    }
+
+    #[test]
+    #[should_panic(expected = "longer than 64 bits")]
+    fn oversized_target_traps_at_public_entry() {
+        solve_pow("salt".into(), "0123456789abcdef0".into());
+    }
 }

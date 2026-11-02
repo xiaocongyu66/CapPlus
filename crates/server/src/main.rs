@@ -224,35 +224,35 @@ async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Next) -
     if req.method() == axum::http::Method::OPTIONS {
         let mut resp = Response::new(axum::body::Body::empty());
         *resp.status_mut() = StatusCode::NO_CONTENT;
-        if let Some(origin) = &origin {
-            if let Ok(v) = HeaderValue::from_str(origin) {
-                let h = resp.headers_mut();
-                h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
-                h.insert(
-                    header::ACCESS_CONTROL_ALLOW_METHODS,
-                    HeaderValue::from_static("GET, POST, OPTIONS"),
-                );
-                h.insert(
-                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    HeaderValue::from_static(
-                        "content-type, authorization, x-requested-with, x-cap-client-ua, x-cap-client-host",
-                    ),
-                );
-                h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("3600"));
-                h.insert(header::VARY, HeaderValue::from_static("Origin"));
-            }
+        if let Some(origin) = &origin
+            && let Ok(v) = HeaderValue::from_str(origin)
+        {
+            let h = resp.headers_mut();
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("GET, POST, OPTIONS"),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static(
+                    "content-type, authorization, x-requested-with, x-cap-client-ua, x-cap-client-host",
+                ),
+            );
+            h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("3600"));
+            h.insert(header::VARY, HeaderValue::from_static("Origin"));
         }
         return resp;
     }
 
     let mut resp = next.run(req).await;
-    if let Some(origin) = origin {
-        if let Ok(v) = HeaderValue::from_str(&origin) {
-            resp.headers_mut()
-                .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
-            resp.headers_mut()
-                .insert(header::VARY, HeaderValue::from_static("Origin"));
-        }
+    if let Some(origin) = origin
+        && let Ok(v) = HeaderValue::from_str(&origin)
+    {
+        resp.headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        resp.headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Origin"));
     }
     resp
 }
@@ -311,15 +311,15 @@ async fn is_blocked(
     let country = country.or(db_country);
     let asn = asn.or(db_asn.map(|n| n.to_string()));
 
-    if let Some(c) = country {
-        if list.countries.contains(&c) {
-            return Ok(true);
-        }
+    if let Some(c) = country
+        && list.countries.contains(&c)
+    {
+        return Ok(true);
     }
-    if let Some(a) = asn {
-        if list.asns.contains(&a) {
-            return Ok(true);
-        }
+    if let Some(a) = asn
+        && list.asns.contains(&a)
+    {
+        return Ok(true);
     }
     Ok(false)
 }
@@ -406,117 +406,6 @@ async fn bounded_cache_get<T: Send + Sync + 'static>(
     cache.try_get_with(key, build).await
 }
 
-#[cfg(test)]
-mod cpu_wiring_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn cpu_overload_is_not_an_invalid_proof() {
-        assert_eq!(cpu_error_code(cap_kv::cpu::CpuError::Busy), "cpu_busy");
-        assert_eq!(cpu_error_response(cap_kv::cpu::CpuError::Busy).status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(cpu_error_response(cap_kv::cpu::CpuError::WorkerFailed).status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[test]
-    fn cache_key_covers_all_parameters_and_canonicalizes() {
-        let fields: std::collections::HashMap<String, String> =
-            [("N", "15"), ("p", "3"), ("q", "5"), ("bits", "4"), ("created", "1")]
-                .into_iter().map(|(k,v)| (k.into(), v.into())).collect();
-        let key = rsw_cache_key(&fields, 10).unwrap();
-        for name in ["N", "p", "q", "bits", "created"] {
-            let mut changed = fields.clone();
-            changed.insert(name.into(), "99".into());
-            assert_ne!(key, rsw_cache_key(&changed, 10).unwrap());
-            changed.insert(name.into(), format!("00{}", fields[name]));
-            assert_eq!(key, rsw_cache_key(&changed, 10).unwrap());
-        }
-        assert_ne!(key, rsw_cache_key(&fields, 11).unwrap());
-    }
-
-    #[tokio::test]
-    async fn cache_singleflight_failure_retry_and_capacity() {
-        let cache = moka::future::Cache::new(32);
-        let builds = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let mut jobs = Vec::new();
-        for _ in 0..8 {
-            let (cache, builds, gate) = (cache.clone(), builds.clone(), gate.clone());
-            jobs.push(tokio::spawn(async move {
-                bounded_cache_get(&cache, "same".into(), async {
-                    builds.fetch_add(1, Ordering::SeqCst);
-                    gate.notified().await;
-                    Ok(Arc::new(7usize))
-                }).await.unwrap()
-            }));
-        }
-        while builds.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
-        gate.notify_one();
-        for job in jobs { assert_eq!(*job.await.unwrap(), 7); }
-        assert_eq!(builds.load(Ordering::SeqCst), 1);
-        for _ in 0..2 {
-            assert!(bounded_cache_get(&cache, "bad".into(), async {
-                builds.fetch_add(1, Ordering::SeqCst);
-                Err("failure".into())
-            }).await.is_err());
-        }
-        assert_eq!(builds.load(Ordering::SeqCst), 3);
-        assert!(cache.get(&"bad".to_string()).await.is_none());
-        for i in 0..100 {
-            bounded_cache_get(&cache, i.to_string(), async { Ok(Arc::new(i)) }).await.unwrap();
-        }
-        cache.run_pending_tasks().await;
-        assert!(cache.entry_count() <= 32);
-    }
-
-    #[tokio::test]
-    async fn old_cache_completion_does_not_remove_new_generation() {
-        use std::{future::Future, task::Poll};
-        let cache = moka::future::Cache::new(32);
-        let (release, wait) = tokio::sync::oneshot::channel();
-        let mut old = Box::pin(bounded_cache_get(&cache, "old".into(), async {
-            wait.await.unwrap();
-            Ok(Arc::new(1usize))
-        }));
-        std::future::poll_fn(|cx| {
-            assert!(old.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        }).await;
-        bounded_cache_get(&cache, "new".into(), async { Ok(Arc::new(2)) }).await.unwrap();
-        release.send(()).unwrap();
-        assert_eq!(*old.await.unwrap(), 1);
-        assert_eq!(*cache.get(&"new".to_string()).await.unwrap(), 2);
-    }
-
-    #[tokio::test]
-    async fn cancelled_keygen_keeps_lock_and_cpu_budget_until_worker_finishes() {
-        let scheduler = Arc::new(cap_kv::cpu::CpuScheduler::new(cap_kv::cpu::CpuConfig {
-            total: 1, argon: 1, waiters: 0, ..Default::default()
-        }).unwrap());
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = lock.clone().try_lock_owned().unwrap();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let worker_scheduler = scheduler.clone();
-        let job = tokio::spawn(async move {
-            worker_scheduler.run(cap_kv::cpu::CpuClass::General, move || {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                guard
-            }).await
-        });
-        started_rx.await.unwrap();
-        job.abort();
-        let _ = job.await;
-        assert!(lock.clone().try_lock_owned().is_err());
-        assert_eq!(scheduler.run(cap_kv::cpu::CpuClass::General, || ()).await,
-            Err(cap_kv::cpu::CpuError::Busy));
-        release_tx.send(()).unwrap();
-        let _done = lock.lock().await;
-    }
-}
 
 fn cpu_error_code(error: cap_kv::cpu::CpuError) -> &'static str {
     match error {
@@ -544,7 +433,7 @@ fn rsw_cache_key(fields: &std::collections::HashMap<String, String>, t: u64) -> 
         parts.push(if canonical.is_empty() { "0" } else { canonical }.to_string());
     }
     parts.push(t.to_string());
-    Ok(cap_core::sha256_hex(&serde_json::to_string(&parts).expect("string serialization")))
+    Ok(cap_core::sha256_hex(serde_json::to_string(&parts).expect("string serialization")))
 }
 
 /// Attribute a successful solve to a country / ASN. Explicit proxy headers
@@ -617,10 +506,10 @@ async fn record_geo(st: &AppState, site_key: &str, headers: &HeaderMap, addr: &S
 /// Fixed-window limiter in whichever mode is configured. A Redis error falls
 /// back to the in-process limiter instead of letting the request through.
 async fn rate_allowed(st: &AppState, scope: &str, ip: &str, window_ms: i64, max: i64) -> bool {
-    if st.redis_ratelimit {
-        if let Ok(ok) = st.store.rate_hit(scope, ip, window_ms, max).await {
-            return ok;
-        }
+    if st.redis_ratelimit
+        && let Ok(ok) = st.store.rate_hit(scope, ip, window_ms, max).await
+    {
+        return ok;
     }
     st.limiter.hit(scope, ip, window_ms, max)
 }
@@ -763,16 +652,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cap_ipdb::IpDb::open(&cfg.data_dir.join("ipdb"), &cfg.tmp_dir())
             .map_err(|e| format!("cannot open ip database directory: {e}"))?,
     );
-    if let Ok(Some(raw)) = kv.get("settings:ipdb").await {
-        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let provider = doc
-                .get("provider")
-                .or_else(|| doc.get("mode"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("none");
-            if let Some(mode) = cap_ipdb::Mode::parse(provider) {
-                ipdb.set_mode(mode);
-            }
+    if let Ok(Some(raw)) = kv.get("settings:ipdb").await
+        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        let provider = doc
+            .get("provider")
+            .or_else(|| doc.get("mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        if let Some(mode) = cap_ipdb::Mode::parse(provider) {
+            ipdb.set_mode(mode);
         }
     }
     eprintln!(
@@ -978,4 +867,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cpu_wiring_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn cpu_overload_is_not_an_invalid_proof() {
+        assert_eq!(cpu_error_code(cap_kv::cpu::CpuError::Busy), "cpu_busy");
+        assert_eq!(cpu_error_response(cap_kv::cpu::CpuError::Busy).status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(cpu_error_response(cap_kv::cpu::CpuError::WorkerFailed).status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn cache_key_covers_all_parameters_and_canonicalizes() {
+        let fields: std::collections::HashMap<String, String> =
+            [("N", "15"), ("p", "3"), ("q", "5"), ("bits", "4"), ("created", "1")]
+                .into_iter().map(|(k,v)| (k.into(), v.into())).collect();
+        let key = rsw_cache_key(&fields, 10).unwrap();
+        for name in ["N", "p", "q", "bits", "created"] {
+            let mut changed = fields.clone();
+            changed.insert(name.into(), "99".into());
+            assert_ne!(key, rsw_cache_key(&changed, 10).unwrap());
+            changed.insert(name.into(), format!("00{}", fields[name]));
+            assert_eq!(key, rsw_cache_key(&changed, 10).unwrap());
+        }
+        assert_ne!(key, rsw_cache_key(&fields, 11).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cache_singleflight_failure_retry_and_capacity() {
+        let cache = moka::future::Cache::new(32);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut jobs = Vec::new();
+        for _ in 0..8 {
+            let (cache, builds, gate) = (cache.clone(), builds.clone(), gate.clone());
+            jobs.push(tokio::spawn(async move {
+                bounded_cache_get(&cache, "same".into(), async {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    gate.notified().await;
+                    Ok(Arc::new(7usize))
+                }).await.unwrap()
+            }));
+        }
+        while builds.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+        gate.notify_one();
+        for job in jobs { assert_eq!(*job.await.unwrap(), 7); }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        for _ in 0..2 {
+            assert!(bounded_cache_get(&cache, "bad".into(), async {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Err("failure".into())
+            }).await.is_err());
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        assert!(cache.get(&"bad".to_string()).await.is_none());
+        for i in 0..100 {
+            bounded_cache_get(&cache, i.to_string(), async { Ok(Arc::new(i)) }).await.unwrap();
+        }
+        cache.run_pending_tasks().await;
+        assert!(cache.entry_count() <= 32);
+    }
+
+    #[tokio::test]
+    async fn old_cache_completion_does_not_remove_new_generation() {
+        use std::{future::Future, task::Poll};
+        let cache = moka::future::Cache::new(32);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut old = Box::pin(bounded_cache_get(&cache, "old".into(), async {
+            wait.await.unwrap();
+            Ok(Arc::new(1usize))
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(old.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+        bounded_cache_get(&cache, "new".into(), async { Ok(Arc::new(2)) }).await.unwrap();
+        release.send(()).unwrap();
+        assert_eq!(*old.await.unwrap(), 1);
+        assert_eq!(*cache.get(&"new".to_string()).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_keygen_keeps_lock_and_cpu_budget_until_worker_finishes() {
+        let scheduler = Arc::new(cap_kv::cpu::CpuScheduler::new(cap_kv::cpu::CpuConfig {
+            total: 1, argon: 1, waiters: 0, ..Default::default()
+        }).unwrap());
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lock.clone().try_lock_owned().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_scheduler = scheduler.clone();
+        let job = tokio::spawn(async move {
+            worker_scheduler.run(cap_kv::cpu::CpuClass::General, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                guard
+            }).await
+        });
+        started_rx.await.unwrap();
+        job.abort();
+        let _ = job.await;
+        assert!(lock.clone().try_lock_owned().is_err());
+        assert_eq!(scheduler.run(cap_kv::cpu::CpuClass::General, || ()).await,
+            Err(cap_kv::cpu::CpuError::Busy));
+        release_tx.send(()).unwrap();
+        let _done = lock.lock().await;
+    }
 }

@@ -93,17 +93,17 @@ pub(crate) async fn check_challenge_env(
     let env = parse_challenge_env(raw)?;
     let ua = header_str(headers, "user-agent");
     let ua_now = cap_core::sha256_hex(&ua)[..32].to_string();
-    if let Some(want) = env.get("ua").and_then(Value::as_str) {
-        if !want.is_empty() && want != ua_now {
-            return Err("session_env_changed".into());
-        }
+    if let Some(want) = env.get("ua").and_then(Value::as_str)
+        && !want.is_empty() && want != ua_now
+    {
+        return Err("session_env_changed".into());
     }
     if require_ip {
         let ip_now = client_ip(headers, &addr.ip().to_string());
-        if let Some(want) = env.get("ip").and_then(Value::as_str) {
-            if !want.is_empty() && !ip_now.is_empty() && want != ip_now {
-                return Err("session_env_changed".into());
-            }
+        if let Some(want) = env.get("ip").and_then(Value::as_str)
+            && !want.is_empty() && !ip_now.is_empty() && want != ip_now
+        {
+            return Err("session_env_changed".into());
         }
     }
     Ok(ChallengeEnv {
@@ -371,7 +371,7 @@ pub(crate) fn check_integrity(claims: &Value, body: &Value, secret: &str) -> Res
         return Err("proof_no_nonce".into());
     };
     let solutions = body.get("solutions").cloned().unwrap_or(Value::Null);
-    let sol_digest = cap_core::sha256_hex(&serde_json::to_string(&solutions).unwrap_or_default());
+    let sol_digest = cap_core::sha256_hex(serde_json::to_string(&solutions).unwrap_or_default());
     let mut pairs: Vec<String> = ["capWasm", "hashwxWasm", "widget", "scriptHash"]
         .iter()
         .filter_map(|k| {
@@ -383,7 +383,7 @@ pub(crate) fn check_integrity(claims: &Value, body: &Value, secret: &str) -> Res
         })
         .collect();
     pairs.sort();
-    let expected_proof = cap_core::sha256_hex(&format!(
+    let expected_proof = cap_core::sha256_hex(format!(
         "{nonce}|{ts}|{sol_digest}|{}",
         pairs.join(",")
     ));

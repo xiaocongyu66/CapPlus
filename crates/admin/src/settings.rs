@@ -158,7 +158,8 @@ pub(crate) async fn apikeys_list(store: &AdminStore) -> AdminResponse {
         Err(_) => return internal(),
     };
 
-    let mut rows: Vec<(String, Option<String>, i64, Option<String>, bool)> = Vec::new();
+    type ApiKeyRow = (String, Option<String>, i64, Option<String>, bool);
+    let mut rows: Vec<ApiKeyRow> = Vec::new();
     for id in ids {
         let fields = match store
             .hmget(
@@ -180,7 +181,7 @@ pub(crate) async fn apikeys_list(store: &AdminStore) -> AdminResponse {
         let readonly = fields.get(3).and_then(|v| v.as_deref()) == Some("true");
         rows.push((id, name, created, site_keys, readonly));
     }
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.2));
 
     let out: Vec<Value> = rows
         .into_iter()
@@ -211,18 +212,18 @@ pub(crate) async fn apikeys_create(store: &AdminStore, body: &Value) -> AdminRes
 
     // Unique site keys (JS: [...new Set(body.siteKeys || [])]).
     let mut site_keys: Vec<String> = Vec::new();
-    if let Some(v) = obj.get("siteKeys") {
-        if !v.is_null() {
-            let arr = match v.as_array() {
-                Some(a) => a,
-                None => return bad_request("siteKeys must be an array"),
-            };
-            for item in arr {
-                if let Some(s) = item.as_str() {
-                    if !site_keys.iter().any(|k| k == s) {
-                        site_keys.push(s.to_string());
-                    }
-                }
+    if let Some(v) = obj.get("siteKeys")
+        && !v.is_null()
+    {
+        let arr = match v.as_array() {
+            Some(a) => a,
+            None => return bad_request("siteKeys must be an array"),
+        };
+        for item in arr {
+            if let Some(s) = item.as_str()
+                && !site_keys.iter().any(|k| k == s)
+            {
+                site_keys.push(s.to_string());
             }
         }
     }

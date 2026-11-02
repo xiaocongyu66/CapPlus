@@ -16,10 +16,10 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
         let path = entry.path();
         if path.is_dir() {
             collect(root, &path, out);
-        } else if let Ok(rel) = path.strip_prefix(root) {
-            if let Ok(bytes) = std::fs::read(&path) {
-                out.push((rel.to_string_lossy().replace('\\', "/"), bytes));
-            }
+        } else if let Ok(rel) = path.strip_prefix(root)
+            && let Ok(bytes) = std::fs::read(&path)
+        {
+            out.push((rel.to_string_lossy().replace('\\', "/"), bytes));
         }
     }
 }

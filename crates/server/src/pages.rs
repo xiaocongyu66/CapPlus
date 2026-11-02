@@ -17,10 +17,10 @@ pub(crate) fn dashboard_root() -> std::path::PathBuf {
         // Inside the data directory, for self-contained deployments.
         settings().data_dir.join("dashboard"),
     ];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("dashboard"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("dashboard"));
     }
     // Repository frontend for development builds.
     candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../frontend"));

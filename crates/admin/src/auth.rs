@@ -172,10 +172,10 @@ pub(crate) async fn authenticate(
 ) -> Result<Option<Scope>, AdminResponse> {
     let authorization = header(req.headers, "authorization");
 
-    if let Some(auth) = authorization.as_deref() {
-        if let Some(rest) = auth.strip_prefix("Bot ") {
-            return authenticate_bot(store, rest.trim()).await;
-        }
+    if let Some(auth) = authorization.as_deref()
+        && let Some(rest) = auth.strip_prefix("Bot ")
+    {
+        return authenticate_bot(store, rest.trim()).await;
     }
 
     // Bearer session

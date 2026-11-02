@@ -290,11 +290,11 @@ pub fn verify_result_mac(
 /// Strict hex decoder; returns `None` on any non-hex byte or odd length.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = hex_val(pair[0])?;
         let lo = hex_val(pair[1])?;
         out.push((hi << 4) | lo);

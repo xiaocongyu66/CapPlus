@@ -73,7 +73,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
     let mobile = is_mobile_vector(s);
 
     let geo = geometry_stats(field(s, "fontWidths"));
-    let quantized = geo.map_or(false, |g| g.count >= 5 && g.distinct >= 3);
+    let quantized = geo.is_some_and(|g| g.count >= 5 && g.distinct >= 3);
     add(
         &mut checks,
         "geometry_quantized",
@@ -222,7 +222,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
             .and_then(|v| as_arr(Some(v)))
             .map(|a| a.as_slice())
             .unwrap_or(&[]);
-        let lang_truthy = lang_v.map_or(false, truthy);
+        let lang_truthy = lang_v.is_some_and(truthy);
         if lang_truthy && !langs.is_empty() {
             let ok = langs.iter().any(|x| Some(x) == lang_v);
             add(
@@ -275,24 +275,24 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
             }
         }
     }
-    if chromium_ua {
-        if let Some(cs) = as_obj(field(s, "chromeShape")) {
-            let any = ["runtime", "loadTimes", "csi", "app"]
-                .iter()
-                .filter_map(|k| cs.get(*k))
-                .any(truthy);
-            add(
-                &mut checks,
-                "chrome_shape_hollow",
-                any,
-                if any {
-                    "ok".to_string()
-                } else {
-                    "window.chrome is hollow".to_string()
-                },
-                false,
-            );
-        }
+    if chromium_ua
+        && let Some(cs) = as_obj(field(s, "chromeShape"))
+    {
+        let any = ["runtime", "loadTimes", "csi", "app"]
+            .iter()
+            .filter_map(|k| cs.get(*k))
+            .any(truthy);
+        add(
+            &mut checks,
+            "chrome_shape_hollow",
+            any,
+            if any {
+                "ok".to_string()
+            } else {
+                "window.chrome is hollow".to_string()
+            },
+            false,
+        );
     }
 
     // --- cross-realm (worker) consistency --------------------------------
@@ -303,41 +303,37 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
         if let (Some(a), Some(b)) = (
             as_num(wi.get("hardwareConcurrency")),
             as_num(field(s, "hardwareConcurrency")),
-        ) {
-            if a != b {
-                add(
-                    &mut checks,
-                    "worker_hw_mismatch",
-                    false,
-                    format!("main={} worker={}", dnum(b), dnum(a)),
-                    false,
-                );
-            }
+        ) && a != b {
+            add(
+                &mut checks,
+                "worker_hw_mismatch",
+                false,
+                format!("main={} worker={}", dnum(b), dnum(a)),
+                false,
+            );
         }
-        if let (Some(a), Some(b)) = (as_num(wi.get("deviceMemory")), as_num(field(s, "deviceMemory"))) {
-            if a != b {
-                add(
-                    &mut checks,
-                    "worker_mem_mismatch",
-                    false,
-                    format!("main={} worker={}", dnum(b), dnum(a)),
-                    false,
-                );
-            }
+        if let (Some(a), Some(b)) = (as_num(wi.get("deviceMemory")), as_num(field(s, "deviceMemory")))
+            && a != b
+        {
+            add(
+                &mut checks,
+                "worker_mem_mismatch",
+                false,
+                format!("main={} worker={}", dnum(b), dnum(a)),
+                false,
+            );
         }
         if let (Some(a), Some(b)) = (
             as_str(wi.get("platform")).filter(|p| !p.is_empty()),
             as_str(field(s, "platform")).filter(|p| !p.is_empty()),
-        ) {
-            if a != b {
-                add(
-                    &mut checks,
-                    "worker_platform_mismatch",
-                    false,
-                    "main≠worker platform",
-                    false,
-                );
-            }
+        ) && a != b {
+            add(
+                &mut checks,
+                "worker_platform_mismatch",
+                false,
+                "main≠worker platform",
+                false,
+            );
         }
         if let (Some(a), Some(b)) = (
             as_bool(wi.get("evalShape").and_then(|e| field(e, "nl"))),
@@ -417,15 +413,14 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
 
     // innerWH is an unsigned supplement: drop it unless it is consistent with
     // the signed outer/screen dimensions.
-    if let (Some(x), Some(y)) = (iw0, iw1) {
-        if ow0.map_or(false, |o| x > o + OUTER_HEIGHT_SLACK)
-            || ow1.map_or(false, |o| y > o + OUTER_HEIGHT_SLACK)
-            || scw.map_or(false, |w| x > w + OUTER_HEIGHT_SLACK)
-            || sch.map_or(false, |h| y > h + OUTER_HEIGHT_SLACK)
-        {
-            iw0 = None;
-            iw1 = None;
-        }
+    if let (Some(x), Some(y)) = (iw0, iw1)
+        && (ow0.is_some_and(|o| x > o + OUTER_HEIGHT_SLACK)
+            || ow1.is_some_and(|o| y > o + OUTER_HEIGHT_SLACK)
+            || scw.is_some_and(|w| x > w + OUTER_HEIGHT_SLACK)
+            || sch.is_some_and(|h| y > h + OUTER_HEIGHT_SLACK))
+    {
+        iw0 = None;
+        iw1 = None;
     }
 
     let single_monitor = is_false(field(s, "isExtended"));
@@ -573,7 +568,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
         add(&mut checks, "cdp_probe_missing", false, "cdp probe missing or malformed", true);
     }
     if let Some(cdp) = cdp {
-        let tapped = as_num(cdp.get("tap")).map_or(false, |x| x > 0.0);
+        let tapped = as_num(cdp.get("tap")).is_some_and(|x| x > 0.0);
         add(
             &mut checks,
             "cdp_console_trap",
@@ -624,7 +619,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
             },
             false,
         );
-        let obj_tap = as_num(cdp.get("objTap")).map_or(false, |x| x > 0.0);
+        let obj_tap = as_num(cdp.get("objTap")).is_some_and(|x| x > 0.0);
         add(
             &mut checks,
             "cdp_console_object_trap",
@@ -639,7 +634,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
             },
             false,
         );
-        let stack_tap = as_num(cdp.get("stackTap")).map_or(false, |x| x > 0.0);
+        let stack_tap = as_num(cdp.get("stackTap")).is_some_and(|x| x > 0.0);
         add(
             &mut checks,
             "cdp_stack_getter",
@@ -654,7 +649,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
             },
             false,
         );
-        let proto_tap = as_num(cdp.get("protoTap")).map_or(false, |x| x > 0.0);
+        let proto_tap = as_num(cdp.get("protoTap")).is_some_and(|x| x > 0.0);
         add(
             &mut checks,
             "cdp_proto_getter",
@@ -693,7 +688,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
             if let Some(codecs) = as_obj(act.get("codecs")) {
                 let has = ["mp4", "webm"]
                     .iter()
-                    .any(|k| codecs.get(*k).map_or(false, truthy));
+                    .any(|k| codecs.get(*k).is_some_and(truthy));
                 add(
                     &mut checks,
                     "active_no_video_codecs",
@@ -707,38 +702,36 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
                 );
             }
             let desktop_ua = !any_ci(&ua_str, &["mobi", "android", "iphone", "ipad"]);
-            if let Some(media) = as_obj(act.get("media")) {
-                if is_false(media.get("pointerFine"))
-                    && is_false(media.get("hoverHover"))
-                    && desktop_ua
-                {
-                    add(
-                        &mut checks,
-                        "active_no_fine_pointer",
-                        false,
-                        "desktop UA but no fine pointer/hover",
-                        false,
-                    );
-                }
+            if let Some(media) = as_obj(act.get("media"))
+                && is_false(media.get("pointerFine"))
+                && is_false(media.get("hoverHover"))
+                && desktop_ua
+            {
+                add(
+                    &mut checks,
+                    "active_no_fine_pointer",
+                    false,
+                    "desktop UA but no fine pointer/hover",
+                    false,
+                );
             }
         }
-        if firefox_ua {
-            if let Some(api) = as_obj(act.get("mediaApi")) {
-                if as_str(api.get("md")) == Some("object") {
-                    let ok = as_str(api.get("ed")) == Some("function");
-                    add(
-                        &mut checks,
-                        "active_media_api_missing",
-                        ok,
-                        if ok {
-                            "ok".to_string()
-                        } else {
-                            "enumerateDevices missing".to_string()
-                        },
-                        false,
-                    );
-                }
-            }
+        if firefox_ua
+            && let Some(api) = as_obj(act.get("mediaApi"))
+            && as_str(api.get("md")) == Some("object")
+        {
+            let ok = as_str(api.get("ed")) == Some("function");
+            add(
+                &mut checks,
+                "active_media_api_missing",
+                ok,
+                if ok {
+                    "ok".to_string()
+                } else {
+                    "enumerateDevices missing".to_string()
+                },
+                false,
+            );
         }
         if is_false(act.get("rtc")) {
             add(
@@ -802,21 +795,21 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
     // --- extended consistency checks -------------------------------------
     let os = declared_os(s);
 
-    if let (Some(wua), Some(ua)) = (as_str(field(s, "workerUA")), as_str(field(s, "ua"))) {
-        if !ua.is_empty() {
-            let mismatch = wua != ua;
-            add(
-                &mut checks,
-                "worker_ua_mismatch",
-                !mismatch,
-                if mismatch {
-                    format!("main≠worker ({}:{})", MAX_DETAIL_FIELDS, clip_str(wua, 48))
-                } else {
-                    "consistent".to_string()
-                },
-                true,
-            );
-        }
+    if let (Some(wua), Some(ua)) = (as_str(field(s, "workerUA")), as_str(field(s, "ua")))
+        && !ua.is_empty()
+    {
+        let mismatch = wua != ua;
+        add(
+            &mut checks,
+            "worker_ua_mismatch",
+            !mismatch,
+            if mismatch {
+                format!("main≠worker ({}:{})", MAX_DETAIL_FIELDS, clip_str(wua, 48))
+            } else {
+                "consistent".to_string()
+            },
+            true,
+        );
     }
 
     // WebGL renderer sanity.
@@ -847,7 +840,7 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
             false,
         );
 
-        let hash_ok = as_str(gl.get("hash")).map_or(false, |h| h.chars().count() >= 8 && h != "0");
+        let hash_ok = as_str(gl.get("hash")).is_some_and(|h| h.chars().count() >= 8 && h != "0");
         let no_context = is_false(gl.get("ok"));
         add(
             &mut checks,
@@ -911,11 +904,11 @@ pub fn detect_automation(vector: &Value, opts: &DetectOpts<'_>) -> DetectOutcome
                     pg_detail = "windows declared, Linux GL stack";
                 }
             }
-            Some("macos") | Some("linux") => {
-                if gpu_windows && !gpu_apple && os == Some("macos") {
-                    platform_gpu_mismatch = true;
-                    pg_detail = "macos declared, D3D backend";
-                }
+            Some("macos") | Some("linux")
+                if gpu_windows && !gpu_apple && os == Some("macos") =>
+            {
+                platform_gpu_mismatch = true;
+                pg_detail = "macos declared, D3D backend";
             }
             _ => {}
         }

@@ -157,11 +157,6 @@ impl ConfigCache {
         Self::default()
     }
 
-    /// Compatibility read; security handlers must use `key_checked`.
-    pub async fn key(&self, store: &Store, site_key: &str) -> Option<Arc<KeyInfo>> {
-        self.key_checked(store, site_key).await.unwrap_or(None)
-    }
-
     /// Bounded single-flight lookup. Only genuine absence is negatively cached;
     /// Redis and persisted-config failures remain errors, without diagnostics.
     pub async fn key_checked(&self, store: &Store, site_key: &str) -> Result<Option<Arc<KeyInfo>>, &'static str> {
