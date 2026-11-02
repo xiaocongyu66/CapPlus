@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 cap-core = { path = "../core" }
+cap-verify = { path = "../verify" }
+cap-embed = { path = "../embed" }
 cap-store = { path = "../store" }
 cap-proto = { path = "../proto" }
 cap-kv = { path = "../kv" }

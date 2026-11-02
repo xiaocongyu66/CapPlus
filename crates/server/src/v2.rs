@@ -172,6 +172,11 @@ pub fn expected_entries(expected: &Value) -> Result<&[Value], String> {
 
 /// Verify a v2 solution list; unknown protocols fail closed.
 pub fn verify_solutions(expected: &Value, solutions: &[Value]) -> Result<(), String> {
+    verify_solutions_observation(expected, solutions).map(|_| ())
+}
+
+pub(crate) fn verify_solutions_observation(expected: &Value, solutions: &[Value]) -> Result<VerifiedObservation, String> {
+    let mut observation = None;
     let expected = expected_entries(expected)?;
     if expected.len() != solutions.len() {
         return Err("invalid_solutions".into());
@@ -209,21 +214,35 @@ pub fn verify_solutions(expected: &Value, solutions: &[Value]) -> Result<(), Str
                 }
             }
             "instrumentation" => {
-                verify_instr(
+                let verified = verify_instr_observation(
                     exp.get("instrMeta")
                         .ok_or_else(|| "invalid_expected".to_string())?,
                     sol.get("instr").ok_or_else(|| "instr_missing".to_string())?,
                 )?;
+                // take_probe selects the first instrumentation entry too.
+                if observation.is_none() { observation = Some(verified); }
             }
             other => return Err(format!("protocol_not_supported:{other}")),
         }
     }
-    Ok(())
+    Ok(observation.unwrap_or_default())
 }
 
 /// Verify one instrumentation solution against its sealed meta. Shared by the
 /// v2 challenge list and the v1 `ei` path.
 pub fn verify_instr(meta: &Value, instr: &Value) -> Result<(), String> {
+    verify_instr_observation(meta, instr).map(|_| ())
+}
+
+/// Evidence about protocol verification only; a valid client MAC does not prove
+/// humanity. Constructed only after all existing instrumentation checks pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct VerifiedObservation {
+    pub(crate) mac_verified: bool,
+}
+
+pub(crate) fn verify_instr_observation(meta: &Value, instr: &Value) -> Result<VerifiedObservation, String> {
+    let mut mac_verified = false;
     let id_ok = instr.get("i").and_then(Value::as_str) == meta.get("id").and_then(Value::as_str);
     if !id_ok {
         return Err("instr_id_mismatch".into());
@@ -262,13 +281,14 @@ pub fn verify_instr(meta: &Value, instr: &Value) -> Result<(), String> {
             if !cap_instr::mac::verify_result_mac(mac_key, id_str, ts_mac, state, &p_val, mac) {
                 return Err("instr_mac_mismatch".into());
             }
+            mac_verified = true;
         }
     }
     // Replay window.
     let ts = instr.get("ts").and_then(Value::as_i64).unwrap_or(0);
     let iat = meta.get("iat").and_then(Value::as_i64).unwrap_or(0);
     let now = now_ms();
-    if ts < iat - 5_000 || ts > now + 120_000 {
+    if ts < iat.saturating_sub(5_000) || ts > now.saturating_add(120_000) {
         return Err("instr_ts_invalid".into());
     }
     // Structure is a protocol requirement, not a trust-score penalty. Check
@@ -278,7 +298,7 @@ pub fn verify_instr(meta: &Value, instr: &Value) -> Result<(), String> {
     if !cap_detect::probe_completeness(p, Some(cap_detect::PROBE_FONT_STACK_COUNT), &[]).is_empty() {
         return Err("instr_probe_invalid".into());
     }
-    Ok(())
+    Ok(VerifiedObservation { mac_verified })
 }
 
 /// Extract the probe payload from an instrumentation solution (for detection).
@@ -464,6 +484,43 @@ mod tests {
             assert!(trapped.blocked_by.iter().any(|s| s == "automation_globals_main"));
             assert_eq!(action(&trapped), cap_detect::Action::Deny);
             assert_eq!(top["p"], instr["p"]); // capture never mutates MAC input
+        }
+    }
+
+    #[test]
+    fn observation_requires_real_mac_for_both_signed_protocol_fixtures() {
+        let meta = json!({"id":"test", "vars":["a"], "expectedVals":[7], "iat":now_ms(),
+            "macKey":"0123456789abcdef0123456789abcdef"});
+        for is_v2 in [false, true] {
+            let instr = signed_instr(&meta, valid_probe());
+            let verify = |meta: &Value, instr: &Value| {
+                // Exercise the actual sealed v1 metadata and v2 expectation paths.
+                if is_v2 {
+                    let sealed = encrypt_gcm(&json!({"expected":[{"protocol":"instrumentation","instrMeta":meta}]}), "secret", INFO_FMT2).unwrap();
+                    let expected = decrypt_gcm(&sealed, "secret", INFO_FMT2).unwrap();
+                    verify_solutions_observation(&expected, &[json!({"instr":instr})])
+                } else {
+                    let sealed = encrypt_gcm(meta, "secret", INFO_FMT2).unwrap();
+                    verify_instr_observation(&decrypt_gcm(&sealed, "secret", INFO_FMT2).unwrap(), instr)
+                }
+            };
+            let verified = verify(&meta, &instr).unwrap();
+            assert!(verified.mac_verified);
+            assert!(crate::training_capture::eligible(true, verified.mac_verified, true));
+            assert!(!crate::training_capture::eligible(true, verified.mac_verified, false));
+            assert!(!crate::training_capture::eligible(false, verified.mac_verified, true));
+            let mut tampered = instr.clone();
+            tampered["p"]["ua"] = json!("tampered");
+            assert!(verify(&meta, &tampered).is_err());
+            let mut legacy = meta.clone();
+            legacy.as_object_mut().unwrap().remove("macKey");
+            let legacy_verified = verify(&legacy, &instr).unwrap();
+            assert!(!legacy_verified.mac_verified);
+            assert!(!crate::training_capture::eligible(true, legacy_verified.mac_verified, true));
+            legacy["macKey"] = json!("");
+            assert!(!verify(&legacy, &instr).unwrap().mac_verified);
+            legacy["iat"] = json!(i64::MIN);
+            assert!(!verify(&legacy, &instr).unwrap().mac_verified);
         }
     }
 

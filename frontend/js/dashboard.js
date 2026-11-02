@@ -1,5 +1,6 @@
 let keys = [];
 let selectedKey;
+let selectionEpoch = 0;
 let chart;
 let currentTab = "activity";
 let headerSettings = null;
@@ -41,11 +42,43 @@ function normalizeOrigin(val) {
 const url = (p) =>
   new URL(String(p).replace(/^\/+/, ""), document.baseURI).toString();
 
-const api = async (method, path, body) => {
+let managementGetQueue = Promise.resolve();
+let siteRequests = new AbortController();
+const pageRequests = new AbortController();
+window.addEventListener("pagehide", () => pageRequests.abort());
+
+// Serialize authenticated reads: each one performs password verification on
+// the server. Only GET may retry, at most three attempts within eight seconds.
+const api = (method, path, body) => {
+  const session = localStorage.getItem("cap_auth");
+  const epoch = selectionEpoch;
+  const siteScoped = path.startsWith("/keys/");
+  const siteSignal = siteRequests.signal;
+  const stale = () => pageRequests.signal.aborted ||
+    localStorage.getItem("cap_auth") !== session ||
+    (siteScoped && (epoch !== selectionEpoch || siteSignal.aborted));
+  const run = async () => {
+    if (stale()) return { error: "Request cancelled" };
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    pageRequests.signal.addEventListener("abort", abort, { once: true });
+    if (siteScoped) siteSignal.addEventListener("abort", abort, { once: true });
+    const deadline = Date.now() + 8000;
+    const timer = method === "GET" ? setTimeout(abort, 8000) : null;
+    try {
+      return await request(controller.signal, deadline);
+    } finally {
+      clearTimeout(timer);
+      pageRequests.signal.removeEventListener("abort", abort);
+      siteSignal.removeEventListener("abort", abort);
+    }
+  };
+  const request = async (signal, deadline) => {
   try {
     const auth = JSON.parse(localStorage.getItem("cap_auth"));
     if (!auth && !demoMode) throw new Error("Not authenticated");
-    const opts = { method, headers: {} };
+    const opts = { method, headers: {}, signal };
+    if (path.includes("/training/")) opts.cache = "no-store";
     if (auth) {
       opts.headers.Authorization = `Bearer ${btoa(JSON.stringify({ token: auth.token, hash: auth.hash }))}`;
     }
@@ -53,19 +86,60 @@ const api = async (method, path, body) => {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
     }
-    const res = await fetch(url(`server${path}`), opts);
-    // A stale session (or a cookie from another install) means no request can
-    // succeed; drop it and go back to the login page instead of spinning.
-    if (res.status === 401 && !demoMode) {
-      localStorage.removeItem("cap_auth");
-      if (location.pathname !== "/login") location.href = "login";
-      return { error: "unauthorized" };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (stale() || signal.aborted) return { error: "Request cancelled" };
+      const res = await fetch(url(`server${path}`), opts);
+      if (stale()) return { error: "Request cancelled" };
+      if (res.status === 401 && !demoMode) {
+        localStorage.removeItem("cap_auth");
+        document.cookie = "cap_authed=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+        pageRequests.abort();
+        location.href = "login";
+        return { error: "unauthorized", status: 401 };
+      }
+      let data;
+      try { data = await res.json(); } catch { data = null; }
+      if (stale() || signal.aborted) return { error: "Request cancelled" };
+      if (method === "GET" && res.status === 503 && attempt < 2) {
+        const retryAfter = res.headers.get("Retry-After");
+        const seconds = retryAfter === null ? NaN : Number(retryAfter);
+        const delay = retryAfter === null ? 250 : Number.isFinite(seconds)
+          ? Math.max(0, seconds * 1000) : Math.max(0, Date.parse(retryAfter) - Date.now());
+        // Never shorten a server-requested wait to fit our budget.
+        if (Number.isFinite(delay) && Date.now() + delay < deadline) {
+          await new Promise((resolve, reject) => {
+            const cancel = () => { clearTimeout(t); reject(new Error("Request cancelled")); };
+            const t = setTimeout(() => { signal.removeEventListener("abort", cancel); resolve(); }, delay);
+            signal.addEventListener("abort", cancel, { once: true });
+          });
+          continue;
+        }
+      }
+      if (!res.ok) return { error: typeof data?.error === "string" ? data.error : `HTTP ${res.status}`, status: res.status };
+      if (!data || typeof data !== "object") return { error: "Invalid response body", status: res.status };
+      if (data.error || data.success === false) return { error: typeof data.error === "string" ? data.error : "Request failed", status: res.status };
+      if (path === "/keys" && method === "GET" &&
+          (!Array.isArray(data) || !data.every(k => k && typeof k.name === "string" && typeof k.siteKey === "string"))) {
+        return { error: "Invalid keys response", status: res.status };
+      }
+      if (method === "GET" && /^\/keys\/[^/?]+(?:\?.*)?$/.test(path) &&
+          (!data.key || typeof data.key.siteKey !== "string")) {
+        return { error: "Invalid key response", status: res.status };
+      }
+      if (path.startsWith("/settings/") && !["/settings/sessions", "/settings/apikeys"].includes(path) && Array.isArray(data)) {
+        return { error: "Invalid settings response", status: res.status };
+      }
+      return data;
     }
-    return await res.json();
   } catch (e) {
     console.error("standalone:", e);
     return { error: e.message };
   }
+  };
+  if (method !== "GET") return run();
+  const result = managementGetQueue.then(run);
+  managementGetQueue = result.catch(() => {});
+  return result;
 };
 
 const formatCompact = (n) => {
@@ -150,53 +224,78 @@ async function init() {
 
   if (demoMode) hasGeoSource = true;
 
-  api("GET", "/settings/headers").then((res) => {
-    headerSettings = res?.error ? null : res;
-    hasGeoSource = !!(
-      headerSettings?.countryHeader ||
-      (ipdbStatus?.mode && ipdbStatus.mode !== "")
-    );
-  });
-
-  api("GET", "/settings/ratelimit").then((res) => {
-    ratelimitSettings = res?.error ? null : res;
-  });
-
-  api("GET", "/settings/cors").then((res) => {
-    corsSettings = res?.error ? null : res;
-  });
-
-  api("GET", "/settings/filtering").then((res) => {
-    filteringSettings = res?.error ? null : res;
-  });
-
-  api("GET", "/settings/ipdb").then((res) => {
-    ipdbStatus = res;
-    hasGeoSource = !!(
-      headerSettings?.countryHeader ||
-      (ipdbStatus?.mode && ipdbStatus.mode !== "")
-    );
-  });
-
-  loadKeys();
+  await loadKeys();
+  await loadSettings();
 }
 
+let settingsLoad = null;
+let settingsError = false;
+async function loadSettings() {
+  if (settingsLoad) return settingsLoad;
+  settingsLoad = (async () => {
+    settingsError = false;
+    for (const [name, apply] of [
+      ["headers", value => { headerSettings = value; }],
+      ["ratelimit", value => { ratelimitSettings = value; }],
+      ["cors", value => { corsSettings = value; }],
+      ["filtering", value => { filteringSettings = value; }],
+      ["ipdb", value => { ipdbStatus = value; }],
+    ]) {
+      if (pageRequests.signal.aborted) break;
+      const res = await api("GET", `/settings/${name}`);
+      const valid = {
+        headers: () => ["ipHeader", "countryHeader", "asnHeader"].every(k => typeof res[k] === "string"),
+        ratelimit: () => Number.isFinite(res.max) && Number.isFinite(res.duration),
+        cors: () => res.origins === null || (Array.isArray(res.origins) && res.origins.every(v => typeof v === "string")),
+        filtering: () => typeof res.blockNonBrowserUA === "boolean" && Array.isArray(res.requiredHeaders) && res.requiredHeaders.every(v => typeof v === "string"),
+        ipdb: () => typeof res.mode === "string",
+      }[name];
+      if (res.error || !valid()) settingsError = true;
+      else apply(res);
+    }
+    hasGeoSource = demoMode || !!(headerSettings?.countryHeader || ipdbStatus?.mode);
+  })();
+  try { await settingsLoad; } finally { settingsLoad = null; }
+}
+
+let keysLoaded = false;
+let keysError = "";
+let keysLoad = null;
 async function loadKeys() {
-  keys = await api("GET", "/keys");
-  if (keys.error?.includes?.("Unauthorized")) {
-    localStorage.removeItem("cap_auth");
-    document.cookie = "cap_authed=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-    location.reload();
-    return;
-  }
-  if (keys?.error) {
-    keysList.innerHTML = '<div class="keys-empty"><p>Error loading keys</p></div>';
-    return;
-  }
-  renderKeysList();
+  if (keysLoad) return keysLoad;
+  keysLoad = (async () => {
+    const res = await api("GET", "/keys");
+    if (Array.isArray(res)) {
+      keys = res;
+      keysLoaded = true;
+      keysError = "";
+    } else {
+      keysError = res.error || "Invalid keys response";
+    }
+    renderKeysList(searchInput.value);
+  })();
+  try { await keysLoad; } finally { keysLoad = null; }
 }
 
 function renderKeysList(filter = "") {
+  renderLoadedKeys(filter);
+  if (keysError || !keysLoaded) {
+    const notice = document.createElement("div");
+    notice.className = "keys-empty";
+    const message = document.createElement("p");
+    message.textContent = keysError
+      ? `Error loading keys: ${keysError}${keysLoaded ? " (showing previous data)" : " (not loaded)"}`
+      : "Keys not loaded";
+    const retry = document.createElement("button");
+    retry.textContent = "Retry loading keys";
+    retry.onclick = async () => { retry.disabled = true; await loadKeys(); };
+    notice.append(message, retry);
+    keysList.prepend(notice);
+  }
+}
+
+function renderLoadedKeys(filter = "") {
+  if (!keysLoaded) { keysList.innerHTML = ""; return; }
   const filtered = keys.filter((k) => k.name.toLowerCase().includes(filter.toLowerCase()));
   if (filtered.length === 0) {
     keysList.innerHTML = `
@@ -237,6 +336,10 @@ const spinnerSvg =
   '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-loader-2"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M12 3a9 9 0 1 0 9 9" /></svg>';
 
 async function selectKey(siteKey) {
+  siteRequests.abort();
+  siteRequests = new AbortController();
+  const epoch = ++selectionEpoch;
+  document.querySelector("#trainingPanel fieldset")?.setAttribute("disabled", "");
   welcomeScreen.style.display = "none";
   keyDetail.style.display = "flex";
 
@@ -254,6 +357,7 @@ async function selectKey(siteKey) {
   }
 
   const data = await api("GET", `/keys/${siteKey}`);
+  if (epoch !== selectionEpoch) return;
   if (data.error) {
     showModal(
       "Error",
@@ -666,18 +770,18 @@ function renderKeyDetail() {
 
           <hr class="settings-divider">
 
-          <h4 class="config-subsection-title">CORS</h4>
+          <h4 class="config-subsection-title">Applicable domains (required)</h4>
           <div class="switch-field">
             <label class="switch">
-              <input type="checkbox" id="cfgCorsEnabled" ${key.config.corsOrigins?.length ? "checked" : ""}>
+              <input type="checkbox" id="cfgCorsEnabled" checked disabled>
               <span class="switch-track"></span>
             </label>
-            <label for="cfgCorsEnabled" class="switch-label">Restrict allowed origins</label>
+            <label for="cfgCorsEnabled" class="switch-label">Domain restrictions always enabled</label>
           </div>
-          <div id="keyCorsPanel" style="display:${key.config.corsOrigins?.length ? "block" : "none"}">
-            <p class="headers-description" style="margin:0 0 8px">Only these origins will be able to request challenges for this key.</p>
+          <div id="keyCorsPanel">
+            <p class="headers-description" style="margin:0 0 8px">Required: 1–50 bare domains. example.com and login.example.com match exactly; *.example.com covers subdomains at any depth, not example.com. HTTP(S), any port. No scheme, port or path. Legacy origin entries must be explicitly replaced; empty or invalid lists deny access.</p>
             <div id="keyCorsOriginsList" class="origin-list">
-              ${(key.config.corsOrigins || []).map((o) => `<div class="origin-entry"><input type="text" class="key-cors-origin-input" value="${escapeHtml(o)}" placeholder="Add an origin\u2026"><button class="origin-remove-btn" title="Remove">&times;</button></div>`).join("")}
+              ${(key.config.corsOrigins || []).map((o) => `<div class="origin-entry"><input type="text" class="key-cors-origin-input" value="${escapeHtml(o)}" placeholder="example.com or *.example.com"><button class="origin-remove-btn" title="Remove">&times;</button></div>`).join("")}
             </div>
           </div>
 
@@ -803,6 +907,24 @@ function renderKeyDetail() {
           </div>
         </div>
 
+        <div class="config-card" id="trainingPanel">
+          <h3 class="config-section-title">Local training observations</h3>
+          <p>Off by default. Collects only whitelisted observations; does not automatically train or upload data. Storage belongs to this single local instance, not a shared multi-instance dataset.</p>
+          <p>Defaults: 1% sampling, 1 day, 1 MiB/site. Local logical file budget: 32 MiB (not a physical filesystem quota), at most 64 active/history sites, plus a bounded permanent tombstone registry. Capacity exhaustion never automatically discards history.</p>
+          <fieldset disabled>
+            <label><input type="checkbox" data-training="enabled"> Enable collection</label>
+            <label>Sampling (%) <input type="number" data-training="rate" value="1" min="0" max="100" step="0.0001"></label>
+            <label>Retention (seconds) <input type="number" data-training="retention" value="86400" min="60" max="604800" step="1"></label>
+            <label>Capacity (KiB) <input type="number" data-training="cap" value="1024" min="64" max="8192" step="1"></label>
+            <button type="button" data-training="save">Save training settings</button>
+            <button type="button" data-training="refresh">Refresh status / restart pages</button>
+            <button type="button" data-training="download">Download one page (up to 128)</button>
+            <button type="button" data-training="delete">Delete observation data</button>
+          </fieldset>
+          <pre data-training="status" style="white-space:pre-wrap">Loading training status...</pre>
+          <p data-training="message" role="status"></p>
+        </div>
+
         <div class="danger-zone">
           <h3 class="config-section-title danger">Danger zone</h3>
           <div class="danger-actions-col">
@@ -902,8 +1024,8 @@ function renderKeyDetail() {
 
   function getKeyCorsEntries() {
     return [...document.querySelectorAll("#keyCorsOriginsList .key-cors-origin-input")]
-      .map((i) => normalizeOrigin(i.value))
-      .filter(Boolean);
+      .map((i) => i.value)
+      .filter((value) => value !== "");
   }
 
   function corsArraysEqual(a, b) {
@@ -1021,7 +1143,7 @@ function renderKeyDetail() {
 
   function ensureKeyCorsEmptyRow() {
     const entries = [...document.querySelectorAll("#keyCorsOriginsList .origin-entry")];
-    const empties = entries.filter((e) => !e.querySelector(".key-cors-origin-input").value.trim());
+    const empties = entries.filter((e) => !e.querySelector(".key-cors-origin-input").value);
     if (empties.length === 0) {
       addKeyCorsRow();
       return;
@@ -1046,8 +1168,8 @@ function renderKeyDetail() {
       checkSecurityDirty();
     });
     input.addEventListener("blur", () => {
-      const normalized = normalizeOrigin(input.value);
-      if (normalized && normalized !== input.value.trim()) input.value = normalized;
+      // Preserve the exact domain input; the shared server parser validates it.
+      // In particular, never strip a legacy origin's scheme or port.
     });
     document.getElementById("keyCorsOriginsList").appendChild(div);
     return input;
@@ -1066,8 +1188,8 @@ function renderKeyDetail() {
       checkSecurityDirty();
     });
     input.addEventListener("blur", () => {
-      const normalized = normalizeOrigin(input.value);
-      if (normalized && normalized !== input.value.trim()) input.value = normalized;
+      // Preserve the exact domain input; the shared server parser validates it.
+      // In particular, never strip a legacy origin's scheme or port.
     });
   });
   ensureKeyCorsEmptyRow();
@@ -1152,16 +1274,177 @@ function renderKeyDetail() {
   document.getElementById("saveSecurityConfigBtn")?.addEventListener("click", saveSecurityConfig);
   document.getElementById("rotateSecretBtn")?.addEventListener("click", rotateSecret);
   document.getElementById("deleteKeyBtn")?.addEventListener("click", deleteKey);
+  bindTrainingPanel(selectedKey.siteKey);
   document.getElementById("createShareBtn")?.addEventListener("click", openCreateShareModal);
   document.getElementById("addBlockRuleBtn")?.addEventListener("click", openAddBlockRuleModal);
 }
 
+function bindTrainingPanel(siteKey) {
+  const panel = document.getElementById("trainingPanel");
+  if (!panel) return;
+  const fieldset = panel.querySelector("fieldset");
+  const el = (name) => panel.querySelector(`[data-training="${name}"]`);
+  const base = `/keys/${encodeURIComponent(siteKey)}/training`;
+  const selection = selectionEpoch;
+  const active = () => panel.isConnected && selection === selectionEpoch && selectedKey?.siteKey === siteKey;
+  let cursor = null;
+  let page = null;
+  let loaded = false;
+  let healthy = false;
+  let tombstoned = false;
+  let epoch;
+  let busy = false;
+  const next = document.createElement("button");
+  next.type = "button";
+  next.dataset.training = "next";
+  next.textContent = "Next page (after verifying saved file)";
+  el("download").after(next);
+  const restart = () => { cursor = null; page = null; };
+  const allowed = () => loaded && healthy && !tombstoned;
+  const controls = () => {
+    if (!active()) return;
+    fieldset.disabled = busy || demoMode;
+    for (const name of ["save", "download", "delete", "enabled", "rate", "retention", "cap"]) el(name).disabled = !allowed();
+    next.disabled = !allowed() || !page?.next_cursor;
+    el("download").textContent = page ? "Download this page again" : "Download one page (up to 128)";
+  };
+  const unknown = () => {
+    loaded = false;
+    healthy = false;
+    restart();
+    el("status").textContent = "Current training state is unknown. Writes and export are blocked. Refresh status to retry.";
+  };
+  const request = async (method, path, body) => {
+    const result = await api(method, `${base}/${path}`, body);
+    if (result.success !== true) throw new Error(result.error || "Training request failed");
+    return result.data;
+  };
+  const refresh = async (knownStatus) => {
+    const status = knownStatus || await request("GET", "status");
+    if (!active()) return;
+    if (!status?.config) throw new Error("Invalid training status");
+    if (epoch !== status.epoch) restart();
+    epoch = status.epoch;
+    healthy = status.healthy === true;
+    tombstoned = tombstoned || status.tombstoned === true;
+    loaded = typeof status.healthy === "boolean" && typeof status.tombstoned === "boolean";
+    el("enabled").checked = !tombstoned && status.config.enabled === true;
+    el("rate").value = status.config.sample_rate_ppm / 10000;
+    el("retention").value = status.config.retention_secs;
+    el("cap").value = status.config.cap_bytes / 1024;
+    const notice = tombstoned ? "Collection retired; it cannot be re-enabled. Writes and export are blocked."
+      : !loaded ? "Health is unknown. Writes and export are blocked."
+      : !healthy ? "Collection is unhealthy. Writes and export are blocked." : "Collection is healthy.";
+    el("status").textContent = `${notice} Refresh status remains available.\n${JSON.stringify(status, null, 2)}`;
+  };
+  const run = async (action, mutation = false) => {
+    if (!active() || busy || (mutation && !allowed())) return;
+    busy = true;
+    controls();
+    el("message").textContent = "";
+    try {
+      await action();
+    } catch (error) {
+      // A transport/storage error may follow a durable mutation. Never assume
+      // that failed HTTP means collection stayed enabled/disabled or data survived.
+      if (!active()) return;
+      restart();
+      const message = mutation
+        ? `${error.message}. The operation may have taken effect; checking current status.`
+        : `${error.message}. Checking current status; no write will be retried.`;
+      el("message").textContent = message;
+      try {
+        await refresh();
+        if (active()) el("message").textContent = `${message} Current status reloaded below; review it before retrying.`;
+      } catch (statusError) {
+        if (!active()) return;
+        unknown();
+        el("message").textContent = `${message} Status check failed: ${statusError.message}`;
+      }
+    } finally {
+      busy = false;
+      controls();
+    }
+  };
+  panel.trainingRecheck = async (result) => {
+    if (!active()) return;
+    unknown();
+    if (result.success === true) {
+      try { await refresh(result.data); } catch { unknown(); }
+    }
+    controls();
+  };
+  el("save").addEventListener("click", () => run(async () => {
+    for (const name of ["rate", "retention", "cap"]) {
+      if (!el(name).value || !el(name).reportValidity()) throw new Error("Enter valid training limits");
+    }
+    const config = {
+      enabled: el("enabled").checked,
+      sample_rate_ppm: Math.round(Number(el("rate").value) * 10000),
+      retention_secs: Number(el("retention").value),
+      cap_bytes: Number(el("cap").value) * 1024,
+    };
+    await request("PUT", "config", config);
+    if (!active()) return;
+    restart();
+    el("message").textContent = "Settings saved; refreshing status...";
+    await refresh();
+    if (active()) el("message").textContent = "Training settings saved; review current status below.";
+  }, true));
+  el("refresh").addEventListener("click", () => run(async () => { restart(); await refresh(); }));
+  el("download").addEventListener("click", () => run(async () => {
+    const query = new URLSearchParams({ limit: "128" });
+    if (cursor) query.set("cursor", cursor);
+    if (!allowed()) return;
+    const result = await request("GET", `export?${query}`);
+    if (!active()) return;
+    page = result;
+    const blob = new Blob([JSON.stringify(page, null, 2)], { type: "application/json" });
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = "training-page.json";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    el("message").textContent = "Download initiated, not confirmed saved. Download this page again if needed. " +
+      (page.next_cursor ? "Verify the saved file before explicitly choosing Next page." : "This is the last page. Refresh to restart.");
+  }));
+  next.addEventListener("click", () => {
+    if (!active() || busy || !allowed() || !page?.next_cursor) return;
+    cursor = page.next_cursor;
+    page = null;
+    el("message").textContent = "Next page selected. Click Download to request it.";
+    controls();
+  });
+  el("delete").addEventListener("click", () => {
+    if (!active() || busy || !allowed()) return;
+    if (!window.confirm(`Delete stored observations for this site (${siteKey}) only and invalidate export cursors? Settings are preserved: if enabled, NEW observations will still be collected.`)) return;
+    run(async () => {
+      await request("DELETE", "data");
+      if (!active()) return;
+      restart();
+      el("message").textContent = "Data deleted; refreshing status...";
+      await refresh();
+      if (active()) el("message").textContent = "Observation data deleted. Review current collection status below.";
+    }, true);
+  });
+  controls();
+  if (demoMode) {
+    el("status").textContent = "Training management is unavailable in demo mode.";
+    return;
+  }
+  run(refresh);
+}
+
 async function loadChartData(duration) {
+  const selection = selectionEpoch;
+  const siteKey = selectedKey?.siteKey;
   const refreshBtn = document.getElementById("refreshBtn");
   refreshBtn?.classList.add("spinning");
   document.getElementById("chartLoading")?.classList.add("visible");
 
-  const data = await api("GET", `/keys/${selectedKey.siteKey}?chartDuration=${duration}`);
+  const data = await api("GET", `/keys/${siteKey}?chartDuration=${duration}`);
+  if (selection !== selectionEpoch || selectedKey?.siteKey !== siteKey) return;
 
   refreshBtn?.classList.remove("spinning");
   document.getElementById("chartLoading")?.classList.remove("visible");
@@ -2502,20 +2785,14 @@ async function saveSecurityConfig() {
   const rlDurVal = document.getElementById("cfgRatelimitDuration").value;
   const ratelimitMax = rlMaxVal === "" ? null : parseInt(rlMaxVal, 10);
   const ratelimitDuration = rlDurVal === "" ? null : parseInt(rlDurVal, 10);
-  const corsEnabled = document.getElementById("cfgCorsEnabled").checked;
-  const keyCorsEntries = corsEnabled
-    ? [...document.querySelectorAll("#keyCorsOriginsList .key-cors-origin-input")]
-        .map((i) => {
-          let v = i.value.trim();
-          if (!v) return "";
-          try {
-            v = new URL(v.includes("://") ? v : "https://" + v).host;
-          } catch {}
-          return v.replace(/\/+$/, "");
-        })
-        .filter(Boolean)
-    : [];
-  const corsOrigins = keyCorsEntries.length ? keyCorsEntries : null;
+  let corsOrigins;
+  try {
+    corsOrigins = collectSiteDomains(document.querySelectorAll("#keyCorsOriginsList .key-cors-origin-input"));
+  } catch (error) {
+    showModal("Error", `<div class="modal-body"><p>${escapeHtml(error.message)}</p></div>`);
+    btn.disabled = false;
+    return;
+  }
   const blockNonBrowserUA = document.getElementById("cfgBlockNonBrowserUA").checked;
   const reqHeadersEnabled = document.getElementById("cfgRequiredHeadersEnabled").checked;
   const requiredHeaders = reqHeadersEnabled
@@ -2561,7 +2838,7 @@ async function saveSecurityConfig() {
       throttleRestrictMs,
     };
   } else {
-    showModal("Error", '<div class="modal-body"><p>Failed to save security settings.</p></div>');
+    showModal("Error", `<div class="modal-body"><p>${escapeHtml(res.error || "Failed to save security settings.")}</p></div>`);
     btn.disabled = false;
   }
 }
@@ -2588,19 +2865,48 @@ function rotateSecret() {
 }
 
 function deleteKey() {
+  const siteKey = selectedKey?.siteKey;
+  const selection = selectionEpoch;
+  const active = () => selection === selectionEpoch && selectedKey?.siteKey === siteKey;
+  if (!siteKey) return;
   showConfirmModal(
     "Delete Key?",
-    "This will permanently delete this key and all associated data. This cannot be undone.",
+    `This will permanently delete only this site's key (${escapeHtml(siteKey)}) and associated data. This cannot be undone.`,
     "Delete",
     async () => {
-      const res = await api("DELETE", `/keys/${selectedKey.siteKey}`);
-      if (res.success) {
+      if (!active()) return;
+      const panel = document.getElementById("trainingPanel");
+      const button = document.getElementById("deleteKeyBtn");
+      // Do not race an in-flight training write/read with site retirement.
+      if (panel?.querySelector("fieldset")?.disabled || button?.disabled) return;
+      if (button) button.disabled = true;
+      panel?.querySelector("fieldset")?.setAttribute("disabled", "");
+      const res = await api("DELETE", `/keys/${encodeURIComponent(siteKey)}`);
+      if (!active()) return;
+      if (res.success === true) {
+        ++selectionEpoch;
         selectedKey = null;
         welcomeScreen.style.display = "flex";
         keyDetail.style.display = "none";
         await loadKeys();
       } else {
-        showModal("Error", '<div class="modal-body"><p>Failed to delete key.</p></div>');
+        const original = res.error || "Failed to delete key";
+        // Read-only reconciliation: never retry a destructive request automatically.
+        const [status, site] = await Promise.all([
+          api("GET", `/keys/${encodeURIComponent(siteKey)}/training/status`),
+          api("GET", `/keys/${encodeURIComponent(siteKey)}`),
+        ]);
+        if (!active()) return;
+        await panel?.trainingRecheck?.(status);
+        if (!active()) return;
+        const state = status.success === true && status.data?.tombstoned === true
+          ? "Collection is retired and cannot be re-enabled; key deletion is not confirmed complete."
+          : site.key?.siteKey === siteKey
+            ? "The site still exists; deletion is not complete."
+            : "Deletion state is unknown. Refresh and review before retrying.";
+        showModal("Deletion not confirmed", '<div class="modal-body"><p id="deleteKeyError"></p></div>');
+        document.getElementById("deleteKeyError").textContent = `${original}. ${state} Status check: ${status.error || "returned"}. Site check: ${site.error || "returned"}. No write was retried.`;
+        if (button?.isConnected) button.disabled = false;
       }
     },
     true,
@@ -2666,6 +2972,16 @@ function showConfirmModal(title, message, confirmText, onConfirm, isDanger = fal
   });
 }
 
+// The final empty row is an add-domain affordance, not an allow-list item.
+// Keep all nonempty input verbatim: invalid entries must fail the whole request.
+function collectSiteDomains(inputs) {
+  const domains = [...inputs].map((input) => input.value).filter((value) => value !== "");
+  if (domains.length < 1 || domains.length > 50) {
+    throw new Error("Enter 1–50 applicable bare domains. Domain restrictions cannot be disabled.");
+  }
+  return domains;
+}
+
 function openCreateKeyModal(prefill = "") {
   const modal = createModal(
     "Create key",
@@ -2689,15 +3005,16 @@ function openCreateKeyModal(prefill = "") {
       </div>
       <div class="switch-field">
         <label class="switch">
-          <input type="checkbox" id="newKeyCorsEnabled">
+          <input type="checkbox" id="newKeyCorsEnabled" checked disabled>
           <span class="switch-track"></span>
         </label>
         <label for="newKeyCorsEnabled" class="switch-label">
-          Restrict allowed origins
-          <span class="hint">Only these origins will be able to request challenges for this key.</span>
+          Applicable domains (required)
+          <span class="hint">Enter 1–50 bare domains: example.com or login.example.com for exact matches; *.example.com for subdomains at any depth, excluding the root. HTTP(S), any port. No scheme, port or path.</span>
         </label>
       </div>
-      <div id="newKeyCorsPanel" style="display:none">
+      <p id="newKeyDomainError" role="alert" aria-live="polite"></p>
+      <div id="newKeyCorsPanel">
         <div id="newKeyCorsOriginsList" class="origin-list">
           <div class="origin-entry"><input type="text" class="new-key-cors-origin-input" placeholder="example.com"><button class="origin-remove-btn" title="Remove">&times;</button></div>
         </div>
@@ -2727,7 +3044,7 @@ function openCreateKeyModal(prefill = "") {
 
   function ensureNewKeyCorsEmptyRow() {
     const entries = [...corsList.querySelectorAll(".origin-entry")];
-    const empties = entries.filter((e) => !e.querySelector(".new-key-cors-origin-input").value.trim());
+    const empties = entries.filter((e) => !e.querySelector(".new-key-cors-origin-input").value);
     if (empties.length === 0) addNewKeyCorsRow();
     while (empties.length > 1) empties.pop().remove();
   }
@@ -2738,15 +3055,8 @@ function openCreateKeyModal(prefill = "") {
       inp.classList.remove("invalid");
     });
     inp.addEventListener("blur", () => {
-      const raw = inp.value.trim();
-      if (!raw) return;
-      const normalized = normalizeOrigin(raw);
-      if (!normalized) {
-        inp.classList.add("invalid");
-        return;
-      }
-      inp.classList.remove("invalid");
-      if (normalized !== raw) inp.value = normalized;
+      // Do not turn old origins into broader domain permissions.
+      // The server validates every nonempty row with the shared domain parser.
     });
   }
 
@@ -2794,13 +3104,17 @@ function openCreateKeyModal(prefill = "") {
     const body = { name: input.value.trim() };
     if (instrToggle.checked) body.instrumentation = true;
     if (blockBotsToggle.checked) body.blockAutomatedBrowsers = true;
-    if (corsToggle.checked) {
-      const origins = [...corsList.querySelectorAll(".new-key-cors-origin-input")]
-        .map((i) => normalizeOrigin(i.value))
-        .filter(Boolean);
-      if (origins.length) body.corsOrigins = origins;
+    const errorNode = modal.querySelector("#newKeyDomainError");
+    errorNode.textContent = "";
+    let res;
+    try {
+      body.corsOrigins = collectSiteDomains(corsList.querySelectorAll(".new-key-cors-origin-input"));
+      res = await api("POST", "/keys", body);
+    } catch (error) {
+      errorNode.textContent = error.message || "Failed to create key.";
+      submitBtn.disabled = false;
+      return;
     }
-    const res = await api("POST", "/keys", body);
     if (res.siteKey && res.secretKey) {
       closeModal();
       showModal(
@@ -2819,17 +3133,29 @@ function openCreateKeyModal(prefill = "") {
       await loadKeys();
       selectKey(res.siteKey);
     } else {
-      showModal("Error", '<div class="modal-body"><p>Failed to create key.</p></div>');
+      errorNode.textContent = res.error || "Failed to create key.";
+      submitBtn.disabled = false;
     }
   });
 }
 
 async function openSettings() {
-  const hs = headerSettings || { ipHeader: "", countryHeader: "", asnHeader: "" };
-  const rl = ratelimitSettings || { max: 30, duration: 5000 };
-  const cs = corsSettings || { origins: null };
+  if (settingsLoad) await settingsLoad;
+  if (settingsError || !headerSettings || !ratelimitSettings || !corsSettings || !filteringSettings || !ipdbStatus) {
+    const failed = createModal("Settings unavailable", '<div class="modal-body"><p>Settings could not be loaded. No defaults have been substituted; saving is disabled.</p><button id="retrySettings">Retry loading settings</button></div>');
+    failed.querySelector("#retrySettings").onclick = async (event) => {
+      event.target.disabled = true;
+      await loadSettings();
+      failed.remove();
+      openSettings();
+    };
+    return;
+  }
+  const hs = headerSettings;
+  const rl = ratelimitSettings;
+  const cs = corsSettings;
   const corsOriginsList = cs.origins || [];
-  const fl = filteringSettings || { blockNonBrowserUA: false, requiredHeaders: [] };
+  const fl = filteringSettings;
   const globalRequiredHeaders = fl.requiredHeaders || [];
   const modal = createModal(
     "Settings",
@@ -3196,8 +3522,8 @@ async function openSettings() {
       checkCorsDirty();
     });
     input.addEventListener("blur", () => {
-      const normalized = normalizeOrigin(input.value);
-      if (normalized && normalized !== input.value.trim()) input.value = normalized;
+      // Preserve the exact domain input; the shared server parser validates it.
+      // In particular, never strip a legacy origin's scheme or port.
     });
     document.getElementById("globalCorsOrigins").appendChild(div);
     return input;
@@ -3216,8 +3542,8 @@ async function openSettings() {
       checkCorsDirty();
     });
     input.addEventListener("blur", () => {
-      const normalized = normalizeOrigin(input.value);
-      if (normalized && normalized !== input.value.trim()) input.value = normalized;
+      // Preserve the exact domain input; the shared server parser validates it.
+      // In particular, never strip a legacy origin's scheme or port.
     });
   });
   ensureGlobalCorsEmptyRow();
@@ -3235,8 +3561,8 @@ async function openSettings() {
     const enabled = document.getElementById("cfgGlobalCorsEnabled").checked;
     const origins = enabled ? getCorsEntries() : [];
     document.querySelectorAll("#globalCorsOrigins .cors-origin-input").forEach((input) => {
-      const normalized = normalizeOrigin(input.value);
-      if (normalized && normalized !== input.value.trim()) input.value = normalized;
+      // Preserve the exact domain input; the shared server parser validates it.
+      // In particular, never strip a legacy origin's scheme or port.
     });
     const res = await api("PUT", "/settings/cors", { origins: origins.length ? origins : null });
     if (res.success) {

@@ -280,7 +280,15 @@ pub(crate) async fn challenge_inner(
         let nonce = random_hex(32);
         let mut challenges = challs;
         let mut expected_list = expected;
-        append_instrumentation(&cfg, expires, &mut challenges, &mut expected_list);
+        let cfg_cpu = cfg.clone();
+        let built = cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General, move || {
+            append_instrumentation(&cfg_cpu, expires, &mut challenges, &mut expected_list);
+            (challenges, expected_list)
+        }).await;
+        let (challenges, expected_list) = match built {
+            Ok(value) => value,
+            Err(error) => return crate::cpu_error_response(error),
+        };
         let Some(ev2) = v2::encrypt_gcm(
             &json!({ "expected": expected_list }),
             &key.jwt_secret,
@@ -320,8 +328,8 @@ pub(crate) async fn challenge_inner(
             Ok(f) => f,
             Err(e) => {
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    { eprintln!("[challenge] store_error: {e}"); Json(json!({"error": "store_error"})) },
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": if e == "cpu_busy" { "cpu_busy" } else { "rsw_keypair_unavailable" }})),
                 )
                     .into_response()
             }
@@ -330,22 +338,16 @@ pub(crate) async fn challenge_inner(
         // async workers. Clamp `t` like cap.js ([10_000, 300_000]) — a value
         // above 2^31 wraps negative in the worker (`t | 0`) and never solves.
         let rsw_t = cfg.rsw_t.clamp(10_000, 300_000);
-        let Some(minter) = rsw_minter(&st, fields, rsw_t).await else {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "rsw_keypair_unavailable"})),
-            )
-                .into_response();
+        let minter = match rsw_minter(&st, fields, rsw_t).await {
+            Ok(minter) => minter,
+            Err(error) => return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": error.as_str()}))).into_response(),
         };
-        // Minting is four half-size modpows; still CPU, still off the workers.
-        let Some((challenge, expected)) =
-            tokio::task::spawn_blocking(move || v2::rsw_challenge(&minter)).await.ok()
-        else {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "rsw_keypair_unavailable"})),
-            )
-                .into_response();
+        // Mint per request: only the CRT minter, never its randomness, is cached.
+        let (challenge, expected) = match cap_kv::cpu::run_cpu(
+            cap_kv::cpu::CpuClass::General, move || v2::rsw_challenge(&minter)).await {
+            Ok(value) => value,
+            Err(error) => return crate::cpu_error_response(error),
         };
         let now = now_ms();
         let expires = now + CHALLENGE_TTL_MS;
@@ -353,7 +355,15 @@ pub(crate) async fn challenge_inner(
 
         let mut challenges = vec![challenge];
         let mut expected_list = vec![expected];
-        append_instrumentation(&cfg, expires, &mut challenges, &mut expected_list);
+        let cfg_cpu = cfg.clone();
+        let built = cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General, move || {
+            append_instrumentation(&cfg_cpu, expires, &mut challenges, &mut expected_list);
+            (challenges, expected_list)
+        }).await;
+        let (challenges, expected_list) = match built {
+            Ok(value) => value,
+            Err(error) => return crate::cpu_error_response(error),
+        };
 
         let Some(ev) = v2::encrypt_gcm(
             &json!({ "expected": expected_list }),
@@ -415,7 +425,16 @@ pub(crate) async fn challenge_inner(
     // v1 carries the instrumentation meta sealed in `ei`, exactly like the JS
     // reference; without it an automated client on the old protocol is never
     // fingerprinted and scores as clean.
-    let instrument = v1_instrumentation(&cfg, expires, &key.jwt_secret);
+    let cfg_cpu = cfg.clone();
+    let secret_cpu = key.jwt_secret.clone();
+    let instrument = match cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General,
+        move || v1_instrumentation(&cfg_cpu, expires, &secret_cpu)).await {
+        Ok(value) => value,
+        Err(error) => return crate::cpu_error_response(error),
+    };
+    if cfg.instrumentation && instrument.is_none() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "seal_failed"}))).into_response();
+    }
     if let Some((ei, _)) = &instrument {
         payload["ei"] = json!(ei);
     }

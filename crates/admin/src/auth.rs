@@ -90,13 +90,10 @@ pub(crate) async fn login(
     {
         let window = util::now_ms() / LOGIN_WINDOW_MS;
         let key = format!("rl:login:{ip}:{LOGIN_WINDOW_MS}:{window}");
-        let count = match store.incr(&key).await {
+        let count = match store.incr_with_expire(&key, LOGIN_WINDOW_MS / 1000 + 1).await {
             Ok(c) => c,
             Err(_) => return internal(),
         };
-        if count == 1 {
-            let _ = store.expire(&key, LOGIN_WINDOW_MS / 1000 + 1).await;
-        }
         if count > LOGIN_MAX {
             return resp(
                 429,
@@ -112,12 +109,7 @@ pub(crate) async fn login(
         return resp(401, json!({ "success": false, "error": "Incorrect admin key" }));
     }
 
-    match crate::totp::check_second_factor(store, &body).await {
-        Ok(true) => {}
-        Ok(false) => return internal(),
-        Err(resp) => return resp,
-    }
-
+    // Finish fallible CPU admission before consuming a one-use second factor.
     let session_token = util::random_hex(30);
     let now = util::now_ms();
     let expires = now + SESSION_TTL_MS;
@@ -125,8 +117,13 @@ pub(crate) async fn login(
 
     let hashed_token = match util::argon2_hash_async(&session_token).await {
         Ok(h) => h,
-        Err(_) => return internal(),
+        Err(e) => return util::argon2_error_response(e),
     };
+    match crate::totp::check_second_factor(store, &body).await {
+        Ok(true) => {}
+        Ok(false) => return internal(),
+        Err(resp) => return resp,
+    }
     let ttl_seconds = ((expires - now) as f64 / 1000.0).ceil() as i64;
 
     let payload = json!({ "created": created, "expires": expires }).to_string();
@@ -220,7 +217,7 @@ pub(crate) async fn authenticate(
         return Err(unauth("Unauthorized. An invalid session token was used."));
     }
 
-    if !util::argon2_verify_async(token, hash).await {
+    if !util::argon2_verify_async(token, hash).await.map_err(util::argon2_error_response)? {
         return Err(unauth("Unauthorized. An invalid session token was used."));
     }
 
@@ -254,7 +251,7 @@ async fn authenticate_bot(
         _ => return Err(unauth("Unauthorized. Deleted or non-existent bot token.")),
     };
 
-    if !util::argon2_verify_async(token, &token_hash).await {
+    if !util::argon2_verify_async(token, &token_hash).await.map_err(util::argon2_error_response)? {
         return Err(unauth("Unauthorized. Invalid bot token."));
     }
 

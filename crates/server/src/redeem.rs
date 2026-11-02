@@ -163,6 +163,14 @@ pub(crate) async fn redeem(
         return (StatusCode::FORBIDDEN, Json(json!({"error": "expired"}))).into_response();
     }
     let is_v2 = claims.get("f").and_then(Value::as_u64) == Some(2);
+    // Observation work is opt-in. A missing/unavailable service must not alter
+    // verification. try_record checks the gate again before enqueueing.
+    let training_enabled = st.training.as_ref()
+        .is_some_and(|service| service.enabled(&site_key));
+    // Server wall-time observation: proof/admission/detection/nonce waits,
+    // ending at policy evaluation; not client timing or pure CPU/GPU duration.
+    let training_started = std::time::Instant::now();
+    let mut training_client = None;
     let mut v2_trust: Option<(cap_detect::Trust, cap_detect::Action)> = None;
     // Protocol-layer findings from the trusted proxy. Present for both
     // protocols: these describe the connection, not the client's claims.
@@ -172,7 +180,16 @@ pub(crate) async fn redeem(
     };
     if !is_v2 {
         // As with v2, verify the proof before spending CPU on detection.
-        if let Err(reason) = verify_v1_pow(token, &claims, &solutions_raw) {
+        let token_cpu = token.to_owned();
+        let claims_cpu = claims.clone();
+        let solutions_cpu = solutions_raw.clone();
+        let verdict = match cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General, move || {
+            verify_v1_pow(&token_cpu, &claims_cpu, &solutions_cpu)
+        }).await {
+            Ok(verdict) => verdict,
+            Err(error) => return crate::cpu_error_response(error),
+        };
+        if let Err(reason) = verdict {
             let status = if reason == "invalid_solutions" {
                 StatusCode::BAD_REQUEST
             } else {
@@ -207,8 +224,23 @@ pub(crate) async fn redeem(
                 return (StatusCode::FORBIDDEN, Json(json!({"error": "instr_missing"})))
                     .into_response();
             };
-            if let Err(reason) = v2::verify_instr(&meta, instr) {
-                return (StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response();
+            let meta_cpu = meta.clone();
+            let instr_cpu = instr.clone();
+            let verdict = match cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General,
+                move || v2::verify_instr_observation(&meta_cpu, &instr_cpu)).await {
+                Ok(verdict) => verdict,
+                Err(error) => return crate::cpu_error_response(error),
+            };
+            let verified = match verdict {
+                Ok(verified) => verified,
+                Err(reason) => return (StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response(),
+            };
+            // Only compact whitelist features survive the capture lifetime;
+            // do not queue or retain a second raw probe for observation.
+            if training_enabled && verified.mac_verified {
+                if let Some(probe) = instr.get("p") {
+                    training_client = Some(crate::training_capture::extract(probe, None));
+                }
             }
             // The challenge asked for instrumentation; a result without a
             // probe would skip detection entirely, so refuse it.
@@ -321,20 +353,23 @@ pub(crate) async fn redeem(
         // workers so a redeem flood cannot starve unrelated endpoints.
         let expected_c = expected.clone();
         let sols_c = solutions_raw.clone();
-        let verdict = tokio::task::spawn_blocking(move || {
-            v2::verify_solutions(&expected_c, &sols_c)
-        })
-        .await
-        .unwrap_or_else(|_| Err("verify_panicked".to_string()));
-        if let Err(reason) = verdict {
-            st.metrics
-                .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Invalid solution", "reason": reason})),
-            )
-                .into_response();
-        }
+        let verdict = match cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General, move || {
+            v2::verify_solutions_observation(&expected_c, &sols_c)
+        }).await {
+            Ok(verdict) => verdict,
+            Err(error) => return crate::cpu_error_response(error),
+        };
+        let verified = match verdict {
+            Ok(verified) => verified,
+            Err(reason) => {
+                st.metrics
+                    .incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "Invalid solution", "reason": reason})),
+                ).into_response();
+            }
+        };
 
         // Run the probe detector on the captured instrumentation payload and
         // remember the verdict; the deny decision is enforced after the nonce
@@ -357,6 +392,9 @@ pub(crate) async fn redeem(
             v2_trust = Some((trust, action));
         }
         if let Some(cap) = captured {
+            if training_enabled && verified.mac_verified {
+                training_client = Some(crate::training_capture::extract(&cap.p, None));
+            }
             let accept_language = header_str(&headers, "accept-language");
             let primary_lang = accept_language
                 .split(',')
@@ -390,8 +428,13 @@ pub(crate) async fn redeem(
     let Some(sig) = jwt_sig_hex(token) else {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid_token"}))).into_response();
     };
-    match st.store.consume_nonce(&sig, exp - now).await {
-        Ok(true) => {}
+    // Admission and verification may outlive the challenge. Never consume a
+    // nonce using the timestamp taken before waiting for CPU capacity.
+    let Some(nonce_ttl) = remaining_nonce_ttl(exp, now_ms()) else {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "expired"}))).into_response();
+    };
+    let nonce_consumed = match st.store.consume_nonce(&sig, nonce_ttl).await {
+        Ok(true) => true,
         Ok(false) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -406,7 +449,19 @@ pub(crate) async fn redeem(
             )
                 .into_response()
         }
-    }
+    };
+
+    // This point is reachable only after successful atomic nonce consumption.
+    // training_client can exist only when MAC verification actually succeeded.
+    let mut training_sample = if crate::training_capture::eligible(
+        training_enabled, training_client.is_some(), nonce_consumed,
+    ) {
+        training_client.zip(v2_trust.as_ref()).map(|(client, (trust, action))| {
+            crate::training_capture::sample(client, net.as_ref(), trust, *action,
+                key.config.block_on_deny, training_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                if is_v2 { crate::training::Protocol::V2 } else { crate::training::Protocol::V1 })
+        })
+    } else { None };
 
     if let Some((trust, action)) = &v2_trust {
         eprintln!(
@@ -414,6 +469,9 @@ pub(crate) async fn redeem(
             trust.score, trust.level
         );
         if matches!(action, cap_detect::Action::Deny) && key.config.block_on_deny {
+            if let (Some(service), Some(sample)) = (st.training.as_ref(), training_sample.take()) {
+                let _ = service.try_record(&site_key, sample);
+            }
             st.metrics.incr(&format!("metrics:failed:{site_key}"), &hourly_bucket(now).to_string(), 1);
             let mut doc = json!({ "success": false, "error": "trust_denied" });
             if st.admin_cfg.demo {
@@ -439,6 +497,12 @@ pub(crate) async fn redeem(
             { eprintln!("[redeem] bind_failed: {e}"); Json(json!({"error": "bind_failed"})) },
         )
             .into_response();
+    }
+    // An allowed policy decision is recorded only after issue succeeds. Thus an
+    // issue-store failure never masquerades as successful redemption. This is
+    // still an observation, not evidence of a later siteverify or of humanity.
+    if let (Some(service), Some(sample)) = (st.training.as_ref(), training_sample.take()) {
+        let _ = service.try_record(&site_key, sample);
     }
     let _ = st.kv.del(&crate::integrity::chalenv_key(token)).await;
     eprintln!("[redeem] site={site_key} issued token (verified)");
@@ -494,6 +558,39 @@ fn session_matches(bound: Option<&str>, sent: Option<&str>, require_bound: bool)
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn expiry_is_rechecked_after_cpu_wait_before_consumption() {
+        use cap_kv::cpu::{CpuClass, CpuConfig, CpuScheduler};
+        use std::{future::Future, sync::Arc, task::Poll};
+        let scheduler = Arc::new(CpuScheduler::new(CpuConfig {
+            total: 1, argon: 1, waiters: 1, ..Default::default()
+        }).unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_scheduler = scheduler.clone();
+        let running = tokio::spawn(async move {
+            worker_scheduler.run(CpuClass::General, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }).await.unwrap();
+        });
+        started_rx.await.unwrap();
+        let exp = 200;
+        assert_eq!(super::remaining_nonce_ttl(exp, 100), Some(100));
+        let mut queued = Box::pin(scheduler.run(CpuClass::General, || true));
+        std::future::poll_fn(|cx| {
+            assert!(queued.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+        // Advance the injected wall clock while the real CPU admission waits.
+        let after_queue = 200;
+        release_tx.send(()).unwrap();
+        assert!(queued.await.unwrap()); // valid proof stays valid
+        assert_eq!(super::remaining_nonce_ttl(exp, after_queue), None);
+        assert_eq!(super::remaining_nonce_ttl(exp, 201), None);
+        running.await.unwrap();
+    }
+
     use super::session_matches;
 
     #[test]
@@ -508,6 +605,10 @@ mod tests {
             assert!(!session_matches(None, sent, true));
         }
     }
+}
+
+fn remaining_nonce_ttl(exp: i64, now: i64) -> Option<i64> {
+    exp.checked_sub(now).filter(|ttl| *ttl > 0)
 }
 
 fn verify_v1_pow(token: &str, claims: &Value, raw: &[Value]) -> Result<(), &'static str> {

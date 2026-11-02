@@ -226,9 +226,11 @@ dependencies = [
  "argon2",
  "base64",
  "cap-core",
+ "cap-embed",
  "cap-kv",
  "cap-proto",
  "cap-store",
+ "cap-verify",
  "chrono",
  "data-encoding",
  "hmac",
@@ -282,6 +284,7 @@ name = "cap-embed"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "url",
 ]
 
 [[package]]

@@ -17,7 +17,7 @@ use super::*;
 
     #[test]
     fn create_config_defaults() {
-        let cfg = keys::build_create_config(&json!({})).expect("defaults");
+        let cfg = keys::build_create_config(&json!({"corsOrigins": ["example.com"]})).expect("defaults");
         assert_eq!(cfg["difficulty"], 4);
         assert_eq!(cfg["challengeCount"], 80);
         assert_eq!(cfg["saltSize"], 32);
@@ -34,7 +34,7 @@ use super::*;
         let cfg = keys::build_create_config(&json!({
             "saltSize": 64, "requireSessionBind": true, "blockOnDeny": false,
             "autoBlockDenyMs": 5000, "rsw": true, "rswT": 120000,
-            "corsOrigins": ["https://a.example"],
+            "corsOrigins": ["a.example"],
         }))
         .unwrap();
         assert_eq!(cfg["saltSize"], 64);
@@ -42,9 +42,9 @@ use super::*;
         assert_eq!(cfg["blockOnDeny"], false);
         assert_eq!(cfg["autoBlockDenyMs"], 5000);
         assert_eq!(cfg["rswT"], 120000);
-        assert_eq!(cfg["corsOrigins"][0], "https://a.example");
+        assert_eq!(cfg["corsOrigins"][0], "a.example");
 
-        for bad in [
+        for mut bad in [
             json!({"saltSize": 8}),
             json!({"polymorphism": 2}),
             json!({"rswT": 1000}),
@@ -52,6 +52,9 @@ use super::*;
             json!({"autoBlockDenyMs": 86_400_001}),
             json!({"corsOrigins": vec!["x"; 51]}),
         ] {
+            if bad.get("corsOrigins").is_none() {
+                bad["corsOrigins"] = json!(["example.com"]);
+            }
             assert!(
                 keys::build_create_config(&bad).is_err(),
                 "should reject {bad}"
@@ -66,7 +69,7 @@ use super::*;
             "instrumentation": false, "obfuscationLevel": 3,
             "blockAutomatedBrowsers": false, "rsw": false, "rswT": 75000,
             "protocol": "hashwx", "hashwxDifficulty": 1000000,
-            "extendedProbes": false,
+            "extendedProbes": false, "corsOrigins": ["example.com"],
         });
         let merged = keys::merge_update_config(&existing, &json!({"difficulty": 6})).unwrap();
         assert_eq!(merged["difficulty"], 6);
@@ -74,10 +77,11 @@ use super::*;
 
         let merged = keys::merge_update_config(
             &existing,
-            &json!({"corsOrigins": null, "requiredHeaders": ["X-A"]}),
+            &json!({"corsOrigins": ["*.example.com"], "requiredHeaders": ["X-A"]}),
         )
         .unwrap();
-        assert!(merged["corsOrigins"].is_null());
+        assert_eq!(merged["corsOrigins"], json!(["*.example.com"]));
+        assert!(keys::merge_update_config(&existing, &json!({"corsOrigins": null})).is_err());
         assert_eq!(merged["requiredHeaders"][0], "X-A");
 
         assert!(keys::merge_update_config(&existing, &json!({"difficulty": 9})).is_err());
@@ -227,7 +231,7 @@ use super::*;
             "POST",
             "/keys",
             auth.clone(),
-            json!({"name": name, "saltSize": 64}),
+            json!({"name": name, "saltSize": 64, "corsOrigins": ["example.com"]}),
         )
         .await;
         assert_eq!(r.status, 200);
@@ -323,7 +327,11 @@ use super::*;
             json!(null),
         )
         .await;
-        assert_eq!(r.body, json!({"success": true}));
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, json!({"success": true, "deletion": {
+            "state": "complete", "retryable": false,
+            "training": "not-managed", "scope": "local-instance"
+        }}));
         let r = call(
             &store,
             &cfg,
@@ -427,7 +435,7 @@ use super::*;
             "POST",
             "/keys",
             auth.clone(),
-            json!({"name": format!("a{}", uniq())}),
+            json!({"name": format!("a{}", uniq()), "corsOrigins": ["example.com"]}),
         )
         .await;
         let sk_a = r.body["siteKey"].as_str().unwrap().to_string();
@@ -437,7 +445,7 @@ use super::*;
             "POST",
             "/keys",
             auth.clone(),
-            json!({"name": format!("b{}", uniq())}),
+            json!({"name": format!("b{}", uniq()), "corsOrigins": ["example.com"]}),
         )
         .await;
         let sk_b = r.body["siteKey"].as_str().unwrap().to_string();

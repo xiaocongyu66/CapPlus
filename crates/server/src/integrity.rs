@@ -137,10 +137,8 @@ fn parse_challenge_env(raw: Result<Option<String>, String>) -> Result<Value, Str
         || env.get("ip").and_then(Value::as_str).map(|ip| !ip.is_empty()).unwrap_or(false);
     let valid_parent = match env.get("parent") {
         Some(Value::Null) => true,
-        Some(Value::String(parent)) => matches!(
-            cap_embed::frame_policy(&["*".to_string()], parent),
-            cap_embed::FramePolicy::Allow(canonical) if canonical == *parent
-        ),
+        Some(Value::String(parent)) => cap_embed::parse_origin(parent)
+            .is_some_and(|canonical| canonical == *parent),
         _ => false,
     };
     let valid_sid = match env.get("sid") {
@@ -195,7 +193,7 @@ mod embed_context_tests {
 
     #[test]
     fn embed_context_is_scoped_signed_current_and_canonical() {
-        let origins = vec!["https://app.example:8443".to_string()];
+        let origins = vec!["app.example".to_string()];
         let valid = json!({"typ":"embed", "sk":"site-a",
             "sid":"0123456789abcdef0123456789abcdef",
             "parent":"https://app.example:8443", "exp":now_ms() + 60_000});
@@ -213,8 +211,10 @@ mod embed_context_tests {
         );
         assert!(check(&valid, "wrong", "site-a", &origins).is_err());
         assert!(check(&valid, "secret", "site-b", &origins).is_err());
-        assert!(check(&valid, "secret", "site-a", &["https://other.example".into()]).is_err());
+        assert!(check(&valid, "secret", "site-a", &["other.example".into()]).is_err());
+        // Legacy origin configuration remains invalid; it is not auto-migrated.
         assert!(check(&valid, "secret", "site-a", &["https://app.example".into()]).is_err());
+        assert!(check(&valid, "secret", "site-a", &["https://app.example:8443".into()]).is_err());
         for (field, value) in [
             ("typ", json!("chal")), ("exp", json!(now_ms() - 1)),
             ("exp", Value::Null), ("parent", json!("https://APP.example:8443/path")),

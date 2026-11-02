@@ -239,7 +239,7 @@ pub(crate) async fn apikeys_create(store: &AdminStore, body: &Value) -> AdminRes
     let token = util::b64_strip(&util::random_bytes(32));
     let token_hash = match util::argon2_hash_async(&token).await {
         Ok(h) => h,
-        Err(_) => return internal(),
+        Err(e) => return util::argon2_error_response(e),
     };
     let created = util::now_ms();
     let readonly = obj.get("readonly").and_then(|v| v.as_bool()) == Some(true);

@@ -1,119 +1,16 @@
-//! Minimal HTTP throughput bench: N keep-alive connections, fixed duration.
-//!
-//! ```text
-//! cargo run --release -p cap-server --example bench -- <url> <concurrency> <seconds>
-//! ```
+//! Real-browser business-flow benchmark (not an empty-POST HTTP benchmark).
+//! Usage: cargo run -p cap-server --example bench -- <harness arguments>
+//! Run `python3 test/business_bench_isolated.py --help` for the interface.
+//! The harness owns an isolated Redis and server, and counts only successful
+//! challenge -> official widget solve -> redeem -> first siteverify flows.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use http_body_util::{BodyExt, Empty};
-use hyper::body::Bytes;
-use hyper::{Method, Request};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
-
-#[tokio::main]
-async fn main() {
-    let mut args = std::env::args().skip(1);
-    let url = args.next().expect("usage: bench <url> [concurrency] [seconds]");
-    let conc: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(64);
-    let secs: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(5).max(1);
-    let method = if std::env::var("BENCH_GET").is_ok() { Method::GET } else { Method::POST };
-
-    let uri: hyper::Uri = url.parse().expect("url");
-    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
-    let ok = Arc::new(AtomicU64::new(0));
-    let err = Arc::new(AtomicU64::new(0));
-    let lat = Arc::new(std::sync::Mutex::new(Vec::<u128>::new()));
-    // Warm up: establish every connection before the clock starts, otherwise
-    // TCP setup lands in the measured window.
-    let warm: Vec<_> = (0..conc)
-        .map(|_| {
-            let client = client.clone();
-            let uri = uri.clone();
-            tokio::spawn(async move {
-                let req = Request::builder()
-                    .method(Method::GET)
-                    .uri(uri)
-                    .body(Empty::new())
-                    .unwrap();
-                let _ = client.request(req).await;
-            })
-        })
-        .collect();
-    for t in warm {
-        let _ = t.await;
-    }
-
-    let start = Instant::now();
-    let deadline = Instant::now() + Duration::from_secs(secs);
-
-    let mut tasks = Vec::new();
-    for worker_id in 0..conc {
-        let client = client.clone();
-        let uri = uri.clone();
-        let ok = ok.clone();
-        let err = err.clone();
-        let lat = lat.clone();
-        let method = method.clone();
-        tasks.push(tokio::spawn(async move {
-            let mut local = Vec::new();
-            // Distinct IPs per worker: with CAP_TRUST_PROXY the server would
-            // otherwise put every request in one rate-limit bucket.
-            let xff = format!("10.{}.{}.1", worker_id % 250, (worker_id / 250) % 250);
-            while Instant::now() < deadline {
-                let req = Request::builder()
-                    .method(method.clone())
-                    .uri(uri.clone())
-                    .header("content-type", "application/json")
-                    .header("x-forwarded-for", &xff)
-                    .body(Empty::new())
-                    .unwrap();
-                let t0 = Instant::now();
-                match client.request(req).await {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        let _ = resp.into_body().collect().await;
-                        if status.is_success() {
-                            ok.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            err.fetch_add(1, Ordering::Relaxed);
-                        }
-                        local.push(t0.elapsed().as_micros());
-                    }
-                    Err(_) => {
-                        err.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            lat.lock().unwrap().extend(local);
-        }));
-    }
-    for t in tasks {
-        let _ = t.await;
-    }
-
-    let elapsed = start.elapsed().as_secs_f64().max(0.001);
-    let total = ok.load(Ordering::Relaxed);
-    let errors = err.load(Ordering::Relaxed);
-    let mut v = lat.lock().unwrap().clone();
-    v.sort_unstable();
-    let pct = |p: f64| -> f64 {
-        if v.is_empty() {
-            0.0
-        } else {
-            v[((v.len() as f64 * p) as usize).min(v.len() - 1)] as f64 / 1000.0
-        }
-    };
-    println!(
-        "rps={:.0} ok={} err={} p50={:.2}ms p95={:.2}ms p99={:.2}ms",
-        total as f64 / elapsed,
-        total,
-        errors,
-        pct(0.5),
-        pct(0.95),
-        pct(0.99)
-    );
+fn main() {
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/business_bench_isolated.py");
+    let status = std::process::Command::new("python3")
+        .arg(harness)
+        .args(std::env::args_os().skip(1))
+        .status()
+        .expect("start isolated business-flow benchmark");
+    std::process::exit(status.code().unwrap_or(1));
 }

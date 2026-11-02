@@ -36,6 +36,9 @@ mod redeem;
 mod siteverify;
 mod metrics_buf;
 mod ratelimit;
+mod training;
+mod training_capture;
+mod training_routes;
 
 use admin_routes::{
     ipdb_delete, ipdb_download, ipdb_progress, ipdb_put, ipdb_status, release_activate,
@@ -87,12 +90,12 @@ struct AppState {
     cache: Arc<cache::ConfigCache>,
     limiter: Arc<ratelimit::LocalLimiter>,
     metrics: Arc<metrics_buf::MetricsBuffer>,
+    training: Option<training::TrainingService>,
     /// `CAP_RL_MODE=redis` forces the shared Redis limiter.
     redis_ratelimit: bool,
-    /// Built RSW minters keyed by (keypair fingerprint, t). Building one costs
-    /// two full-size modpows; the keypair changes only when an admin
-    /// regenerates it, so the fingerprint check is enough to stay correct.
-    rsw_minters: Arc<std::sync::Mutex<std::collections::HashMap<(String, u64), Arc<cap_proto::RswMinter>>>>,
+    /// Capacity-32, singleflight CRT minters keyed by the complete canonical
+    /// keypair, time parameter and algorithm domain. Never cache minted proofs.
+    rsw_minters: moka::future::Cache<String, Arc<cap_proto::RswMinter>>,
     /// Serialises first-use keypair generation so concurrent requests do not
     /// each generate (and overwrite) their own keypair.
     rsw_keygen: Arc<tokio::sync::Mutex<()>>,
@@ -199,6 +202,18 @@ const PUBLIC_UNAUTHED: [&str; 7] = [
 /// different origin, and the JS server's CORS layer allows it by default.
 /// Authentication still applies to the real (non-preflight) request.
 async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let segments: Vec<_> = req.uri().path().split('/').filter(|s| !s.is_empty()).collect();
+    if matches!(segments.as_slice(), ["server", "keys", _, "training", ..]) {
+        // Same-origin management only. Apply even to routing/extraction errors,
+        // trailing/repeated slashes, and OPTIONS intercepted by this outer layer.
+        let mut response = if req.method() == axum::http::Method::OPTIONS {
+            StatusCode::METHOD_NOT_ALLOWED.into_response()
+        } else {
+            next.run(req).await
+        };
+        response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
     let origin = req
         .headers()
         .get(header::ORIGIN)
@@ -254,16 +269,9 @@ async fn is_blocked(
     let Some(list) = st.cache.blocked(&st.kv, site_key).await else {
         return Err(());
     };
+    // Expired snapshots are CAS-cleaned once in the cache loader.
     if list.is_empty() {
-        if !list.expired.is_empty() {
-            let refs: Vec<&str> = list.expired.iter().map(String::as_str).collect();
-            let _ = st.kv.hdel_fields(&format!("blocked:{site_key}"), &refs).await;
-        }
         return Ok(false);
-    }
-    if !list.expired.is_empty() {
-        let refs: Vec<&str> = list.expired.iter().map(String::as_str).collect();
-        let _ = st.kv.hdel_fields(&format!("blocked:{site_key}"), &refs).await;
     }
     // O(1) for an exact IP; CIDRs are usually a handful of entries.
     if list.ips.contains(ip) {
@@ -330,29 +338,44 @@ async fn ensure_rsw_keypair(st: &AppState) -> Result<std::collections::HashMap<S
     if !fields.is_empty() {
         return Ok(fields);
     }
-    let _guard = st.rsw_keygen.lock().await;
-    // Another request may have generated it while we waited.
-    let fields = load().await?;
-    if !fields.is_empty() {
-        return Ok(fields);
-    }
-    let bits = settings().rsw_bits.max(512) & !1; // even, at least 512
-    let pair = tokio::task::spawn_blocking(move || cap_proto::generate_keypair(bits))
-        .await
-        .map_err(|e| e.to_string())?;
-    let pairs = [
-        ("N", pair.n.to_str_radix(10)),
-        ("p", pair.p.to_str_radix(10)),
-        ("q", pair.q.to_str_radix(10)),
-        ("bits", pair.bits.to_string()),
-        ("created", now_ms().to_string()),
-    ];
-    st.kv
-        .hset_pairs("settings:rsw_keypair", &pairs)
-        .await
-        .map_err(|e| e.to_string())?;
-    eprintln!("[cap] generated the RSW keypair on first use");
-    load().await
+    // No unbounded async lock queue. At most one coordinator exists per process.
+    let guard = st.rsw_keygen.clone().try_lock_owned().map_err(|_| "cpu_busy".to_string())?;
+    let bits = settings().rsw_bits.max(512) & !1;
+    let kv = st.kv.clone();
+    let (mut tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = async {
+            let fields = kv.hgetall("settings:rsw_keypair").await.map_err(|e| e.to_string())?;
+            if !fields.is_empty() { return Ok(fields); }
+            if tx.is_closed() { return Err("cpu_cancelled".to_string()); }
+            // The blocking closure owns the guard too: runtime shutdown cannot
+            // release it while prime generation is still running.
+            let (pair, _guard) = tokio::select! {
+                biased;
+                _ = tx.closed() => return Err("cpu_cancelled".to_string()),
+                result = cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General, move || {
+                    (cap_proto::generate_keypair(bits), guard)
+                }) => result.map_err(|e| cpu_error_code(e).to_string())?,
+            };
+            if tx.is_closed() { return Err("cpu_cancelled".to_string()); }
+            let pairs = [
+                ("N", pair.n.to_str_radix(10)),
+                ("p", pair.p.to_str_radix(10)),
+                ("q", pair.q.to_str_radix(10)),
+                ("bits", pair.bits.to_string()),
+                ("created", now_ms().to_string()),
+            ];
+            // Atomic absent-only publication never overwrites an admin rotation.
+            // Reuse the existing Redis 7 ACL-preflight primitive; the auxiliary
+            // index has exactly one member, not one member per generation.
+            kv.hcreate_indexed("settings:rsw_keypair", &pairs,
+                "settings:generated-keypairs", "settings:rsw_keypair")
+                .await.map_err(|e| e.to_string())?;
+            kv.hgetall("settings:rsw_keypair").await.map_err(|e| e.to_string())
+        }.await;
+        let _ = tx.send(result);
+    });
+    rx.await.map_err(|_| "cpu_unavailable".to_string())?
 }
 
 /// Cached minter for the current keypair and `t`; built on the blocking pool
@@ -361,27 +384,166 @@ async fn rsw_minter(
     st: &AppState,
     fields: std::collections::HashMap<String, String>,
     t: u64,
-) -> Option<Arc<cap_proto::RswMinter>> {
-    let fp = format!(
-        "{}:{}",
-        fields.get("created").map(String::as_str).unwrap_or(""),
-        cap_core::sha256_hex(fields.get("N").map(String::as_str).unwrap_or(""))
-    );
-    let key = (fp, t);
-    if let Some(m) = st.rsw_minters.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return Some(m.clone());
+) -> Result<Arc<cap_proto::RswMinter>, Arc<String>> {
+    let key = rsw_cache_key(&fields, t).map_err(Arc::new)?;
+    bounded_cache_get(&st.rsw_minters, key, async move {
+        cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::General, move || v2::rsw_minter(&fields, t))
+            .await.map_err(|e| cpu_error_code(e).to_string())?
+            .map(Arc::new).ok_or_else(|| "rsw_keypair_unavailable".to_string())
+    }).await
+}
+
+async fn bounded_cache_get<T: Send + Sync + 'static>(
+    cache: &moka::future::Cache<String, Arc<T>>,
+    key: String,
+    build: impl std::future::Future<Output = Result<Arc<T>, String>>,
+) -> Result<Arc<T>, Arc<String>> {
+    if let Some(value) = cache.get(&key).await { return Ok(value); }
+    // Bound singleflight followers too, not just CPU jobs on distinct misses.
+    static ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(20);
+    let _permit = ADMISSION.try_acquire().map_err(|_| Arc::new("cpu_busy".to_string()))?;
+    cache.try_get_with(key, build).await
+}
+
+#[cfg(test)]
+mod cpu_wiring_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn cpu_overload_is_not_an_invalid_proof() {
+        assert_eq!(cpu_error_code(cap_kv::cpu::CpuError::Busy), "cpu_busy");
+        assert_eq!(cpu_error_response(cap_kv::cpu::CpuError::Busy).status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(cpu_error_response(cap_kv::cpu::CpuError::WorkerFailed).status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
-    let minter = tokio::task::spawn_blocking(move || v2::rsw_minter(&fields, t))
-        .await
-        .ok()
-        .flatten()
-        .map(Arc::new)?;
-    let mut map = st.rsw_minters.lock().unwrap_or_else(|e| e.into_inner());
-    // A regenerated keypair makes every old entry dead; t values are clamped
-    // to a small range, so this map stays tiny.
-    map.retain(|(fp, _), _| *fp == key.0);
-    map.insert(key, minter.clone());
-    Some(minter)
+
+    #[test]
+    fn cache_key_covers_all_parameters_and_canonicalizes() {
+        let fields: std::collections::HashMap<String, String> =
+            [("N", "15"), ("p", "3"), ("q", "5"), ("bits", "4"), ("created", "1")]
+                .into_iter().map(|(k,v)| (k.into(), v.into())).collect();
+        let key = rsw_cache_key(&fields, 10).unwrap();
+        for name in ["N", "p", "q", "bits", "created"] {
+            let mut changed = fields.clone();
+            changed.insert(name.into(), "99".into());
+            assert_ne!(key, rsw_cache_key(&changed, 10).unwrap());
+            changed.insert(name.into(), format!("00{}", fields[name]));
+            assert_eq!(key, rsw_cache_key(&changed, 10).unwrap());
+        }
+        assert_ne!(key, rsw_cache_key(&fields, 11).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cache_singleflight_failure_retry_and_capacity() {
+        let cache = moka::future::Cache::new(32);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut jobs = Vec::new();
+        for _ in 0..8 {
+            let (cache, builds, gate) = (cache.clone(), builds.clone(), gate.clone());
+            jobs.push(tokio::spawn(async move {
+                bounded_cache_get(&cache, "same".into(), async {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    gate.notified().await;
+                    Ok(Arc::new(7usize))
+                }).await.unwrap()
+            }));
+        }
+        while builds.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+        gate.notify_one();
+        for job in jobs { assert_eq!(*job.await.unwrap(), 7); }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        for _ in 0..2 {
+            assert!(bounded_cache_get(&cache, "bad".into(), async {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Err("failure".into())
+            }).await.is_err());
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        assert!(cache.get(&"bad".to_string()).await.is_none());
+        for i in 0..100 {
+            bounded_cache_get(&cache, i.to_string(), async { Ok(Arc::new(i)) }).await.unwrap();
+        }
+        cache.run_pending_tasks().await;
+        assert!(cache.entry_count() <= 32);
+    }
+
+    #[tokio::test]
+    async fn old_cache_completion_does_not_remove_new_generation() {
+        use std::{future::Future, task::Poll};
+        let cache = moka::future::Cache::new(32);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut old = Box::pin(bounded_cache_get(&cache, "old".into(), async {
+            wait.await.unwrap();
+            Ok(Arc::new(1usize))
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(old.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+        bounded_cache_get(&cache, "new".into(), async { Ok(Arc::new(2)) }).await.unwrap();
+        release.send(()).unwrap();
+        assert_eq!(*old.await.unwrap(), 1);
+        assert_eq!(*cache.get(&"new".to_string()).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_keygen_keeps_lock_and_cpu_budget_until_worker_finishes() {
+        let scheduler = Arc::new(cap_kv::cpu::CpuScheduler::new(cap_kv::cpu::CpuConfig {
+            total: 1, argon: 1, waiters: 0, ..Default::default()
+        }).unwrap());
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lock.clone().try_lock_owned().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_scheduler = scheduler.clone();
+        let job = tokio::spawn(async move {
+            worker_scheduler.run(cap_kv::cpu::CpuClass::General, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                guard
+            }).await
+        });
+        started_rx.await.unwrap();
+        job.abort();
+        let _ = job.await;
+        assert!(lock.clone().try_lock_owned().is_err());
+        assert_eq!(scheduler.run(cap_kv::cpu::CpuClass::General, || ()).await,
+            Err(cap_kv::cpu::CpuError::Busy));
+        release_tx.send(()).unwrap();
+        let _done = lock.lock().await;
+    }
+}
+
+fn cpu_error_code(error: cap_kv::cpu::CpuError) -> &'static str {
+    match error {
+        cap_kv::cpu::CpuError::Busy => "cpu_busy",
+        _ => "cpu_unavailable",
+    }
+}
+
+fn cpu_error_response(error: cap_kv::cpu::CpuError) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({"error": cpu_error_code(error)}))).into_response()
+}
+
+/// Canonical unsigned decimal fields, length-delimited JSON and algorithm
+/// domain separation. Never log this preimage (it contains private factors).
+fn rsw_cache_key(fields: &std::collections::HashMap<String, String>, t: u64) -> Result<String, String> {
+    let mut parts = vec!["cap-rsw-crt-v1".to_string()];
+    for name in ["N", "p", "q", "bits", "created"] {
+        let value = fields.get(name).ok_or("rsw_keypair_unavailable")?;
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("rsw_keypair_unavailable".into());
+        }
+        let canonical = value.trim_start_matches('0');
+        parts.push(if canonical.is_empty() { "0" } else { canonical }.to_string());
+    }
+    parts.push(t.to_string());
+    Ok(cap_core::sha256_hex(&serde_json::to_string(&parts).expect("string serialization")))
 }
 
 /// Attribute a successful solve to a country / ASN. Explicit proxy headers
@@ -502,7 +664,42 @@ async fn admin_handler(
         body: &body,
         peer: &peer_ip,
     };
-    let resp = cap_admin::handle(admin, st.admin_cfg.as_ref(), &req).await;
+    let segments: Vec<_> = admin_path.split('/').filter(|s| !s.is_empty()).collect();
+    let site_delete = method == axum::http::Method::DELETE
+        && matches!(segments.as_slice(), ["keys", _]) && !st.admin_cfg.demo;
+    let resp = if site_delete {
+        match cap_admin::authorize_site_delete(admin, &req).await {
+            Err(response) => response,
+            Ok(authorized) => {
+                // Authentication precedes both intent and local side effects.
+                // Completion covers this instance only, not other processes with
+                // independent in-memory writers (even with a shared directory).
+                if let Some(training) = st.training.as_ref() {
+                    match authorized.prepare().await {
+                        Err(response) => response,
+                        Ok(()) => match training.delete_site(segments[1]).await {
+                            Ok(_) => authorized.finish().await,
+                            Err(_) => {
+                                let phase = match training.status(segments[1]).await {
+                                    Ok(status) if status.tombstoned => "committed",
+                                    _ => "unknown",
+                                };
+                                cap_admin::deletion_incomplete(phase)
+                            },
+                        },
+                    }
+                } else {
+                    cap_admin::deletion_incomplete("unknown")
+                }
+            }
+        }
+    } else {
+        cap_admin::handle(admin, st.admin_cfg.as_ref(), &req).await
+    };
+    // Includes lost replies / partial commits, not just successful writes.
+    if site_delete && resp.body.get("deletion").is_some() {
+        st.cache.clear();
+    }
     // A successful admin write must be visible immediately on this instance;
     // otherwise a revoked key keeps redeeming (and a new one 404s) for up to
     // the cache TTL.
@@ -535,6 +732,7 @@ async fn admin_handler(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::init()?;
+    cap_kv::cpu::init_from_env()?;
     eprintln!("[cap] data directory: {}", cfg.data_dir.display());
 
     let kv = cap_kv::Kv::connect_redis(&cfg.redis_url).await?;
@@ -597,6 +795,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("[cap] could not publish the built-in widget: {e}"),
     }
 
+    // Recovery and the exclusive local file lock must not block the executor.
+    let training_dir = cfg.data_dir.join("training");
+    let training = match tokio::task::spawn_blocking(move || training::TrainingService::open(training_dir)).await {
+        Ok(Ok(service)) => Some(service),
+        result => {
+            eprintln!("[cap] training storage unavailable; collection disabled: {}",
+                match result { Ok(Err(e)) => e.to_string(), Err(e) => e.to_string(), _ => unreachable!() });
+            None
+        }
+    };
+
     let embed_widget_url = cfg.embed_widget_url.clone();
     let port = cfg.port;
     let _ = SETTINGS.set(cfg);
@@ -612,7 +821,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache: Arc::new(cache::ConfigCache::new()),
         limiter: Arc::new(ratelimit::LocalLimiter::new()),
         metrics: Arc::new(metrics_buf::MetricsBuffer::new()),
-        rsw_minters: Default::default(),
+        training,
+        rsw_minters: moka::future::Cache::new(32),
         rsw_keygen: Default::default(),
         redis_ratelimit: std::env::var("CAP_RL_MODE")
             .map(|v| v.eq_ignore_ascii_case("redis"))
@@ -620,6 +830,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
+        .merge(training_routes::router())
         .route("/health", get(health_check))
         .route("/health/live", get(health))
         .route("/embed.js", get(embed_js))
@@ -717,14 +928,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Expire stale rate-limit windows so the map cannot grow with the IP count.
+    // 回收只发生在后台，避免满表请求反复触发持锁全表扫描。
     {
         let limiter = state.limiter.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut rounds = 0u8;
+            let mut previous = (0, 0);
             loop {
                 tick.tick().await;
                 limiter.sweep();
+                rounds += 1;
+                if rounds == 60 {
+                    let current = limiter.rejection_counts();
+                    if current.0 != previous.0 {
+                        eprintln!("[cap] local limiter rejections: capacity={}, quota={}",
+                            current.0.saturating_sub(previous.0),
+                            current.1.saturating_sub(previous.1));
+                    }
+                    previous = current;
+                    rounds = 0;
+                }
             }
         });
     }

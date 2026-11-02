@@ -26,6 +26,14 @@ impl AdminStore {
         Ok(Self { kv: Kv::connect_redis(url).await.map_err(e)? })
     }
 
+    pub(crate) async fn begin_site_delete(&self, site: &str) -> Result<bool, String> {
+        self.kv.begin_site_delete(site).await.map_err(e)
+    }
+
+    pub(crate) async fn finish_site_delete(&self, site: &str, keys: &[String]) -> Result<(), String> {
+        self.kv.finish_site_delete(site, keys).await.map_err(e)
+    }
+
     pub(crate) async fn get(&self, key: &str) -> Result<Option<String>, String> {
         self.kv.get(key).await.map_err(e)
     }
@@ -42,9 +50,9 @@ impl AdminStore {
         self.kv.del(key).await.map_err(e)
     }
 
-    /// `INCR key` — used by the fixed-window login rate limiter.
-    pub(crate) async fn incr(&self, key: &str) -> Result<i64, String> {
-        self.kv.incr(key).await.map_err(e)
+    /// Atomically count a login and set the first request's fixed-window TTL.
+    pub(crate) async fn incr_with_expire(&self, key: &str, secs: i64) -> Result<i64, String> {
+        self.kv.incr_with_expire(key, secs).await.map_err(e)
     }
 
     /// `EXPIRE key <secs>` — rate-limit windows and share hashes.
@@ -60,10 +68,6 @@ impl AdminStore {
         secs: i64,
     ) -> Result<bool, String> {
         self.kv.claim_totp(name, expected_secret, counter, secs).await.map_err(e)
-    }
-
-    pub(crate) async fn del_many(&self, keys: &[String]) -> Result<(), String> {
-        self.kv.del_many(keys).await.map_err(e)
     }
 
     /// Public existence check for the lead (cookie session bindings).
@@ -102,6 +106,15 @@ impl AdminStore {
     /// `HDEL name f1 f2 …` — drop fields from a hash.
     pub(crate) async fn hdel_fields(&self, name: &str, fields: &[&str]) -> Result<(), String> {
         self.kv.hdel_fields(name, fields).await.map_err(e)
+    }
+
+    pub(crate) async fn hdel_expired_blocks(
+        &self,
+        name: &str,
+        snapshots: &[(String, String)],
+        now: i64,
+    ) -> Result<i64, String> {
+        self.kv.hdel_expired_blocks(name, snapshots, now).await.map_err(e)
     }
 
     pub(crate) async fn hgetall(&self, name: &str) -> Result<HashMap<String, String>, String> {

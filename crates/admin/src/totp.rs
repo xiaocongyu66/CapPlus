@@ -20,6 +20,11 @@ type HmacSha1 = Hmac<Sha1>;
 
 const TWOFA_KEY: &str = "settings:2fa";
 
+#[cfg(test)]
+tokio::task_local! {
+    static CONSUME_BARRIER: std::sync::Arc<tokio::sync::Barrier>;
+}
+
 /// Interval in seconds, as every authenticator app assumes.
 const STEP: i64 = 30;
 const DIGITS: u32 = 6;
@@ -138,7 +143,7 @@ pub(crate) async fn enable(store: &AdminStore, body: &Value) -> crate::AdminResp
     for c in &codes {
         match util::argon2_hash_async(c).await {
             Ok(h) => hashes.push(h),
-            Err(_) => return internal(),
+            Err(e) => return util::argon2_error_response(e),
         }
     }
 
@@ -236,10 +241,14 @@ async fn check_second_factor_at(
             .unwrap_or_default();
         if let Some(secret) = h.get("totpSecret") {
             for hash in &hashes {
-                if util::argon2_verify_async(code, hash).await {
+                if util::argon2_verify_async(code, hash).await.map_err(util::argon2_error_response)? {
                     // Argon runs outside Redis; consume only if the hash is
                     // still present in the current configuration. Never write
                     // this snapshot back over another login or a rotation.
+                    #[cfg(test)]
+                    if let Ok(barrier) = CONSUME_BARRIER.try_with(Clone::clone) {
+                        barrier.wait().await;
+                    }
                     match store.consume_recovery_hash(name, secret, hash).await {
                         Ok(true) => return Ok(true),
                         Ok(false) => break,
@@ -281,11 +290,24 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
     async fn recovery_login_concurrency() {
+        cap_kv::cpu::init(cap_kv::cpu::CpuConfig::default()).unwrap();
         let _guard = LOGIN_TEST_LOCK.lock().await;
-        let store = AdminStore::connect(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        let url = std::env::var("CAP_TEST_REDIS_URL").expect("isolated Redis required");
+        assert!(!url.is_empty());
+        assert_eq!(std::env::var("REDIS_URL").expect("explicit REDIS_URL required"), url);
+        let store = AdminStore::connect(&url).await.unwrap();
         let name = &format!("test:2fa:{}", util::random_hex(16));
-        let a = util::argon2_hash_async("recovery-a").await.unwrap();
-        let b = util::argon2_hash_async("recovery-b").await.unwrap();
+        // Cheap fixture hashes isolate the CAS race from admission deadlines;
+        // production and legacy cost compatibility are tested separately.
+        fn fixture(password: &str) -> String {
+            use argon2::PasswordHasher;
+            let salt = argon2::password_hash::SaltString::encode_b64(b"recovery-test-salt").unwrap();
+            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13,
+                argon2::Params::new(32, 1, 1, None).unwrap())
+                .hash_password(password.as_bytes(), &salt).unwrap().to_string()
+        }
+        let a = fixture("recovery-a");
+        let b = fixture("recovery-b");
         store.hset_pairs(name, &[
             ("totpEnabled", "true".into()),
             ("totpSecret", new_secret()),
@@ -294,14 +316,26 @@ mod tests {
         ]).await.unwrap();
         let body_a = json!({"recovery": "recovery-a"});
         let body_b = json!({"recovery": "recovery-b"});
-        let (one, two) = tokio::join!(check_second_factor_at(&store, &body_a, name), check_second_factor_at(&store, &body_b, name));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                CONSUME_BARRIER.scope(barrier.clone(), check_second_factor_at(&store, &body_a, name)),
+                CONSUME_BARRIER.scope(barrier.clone(), check_second_factor_at(&store, &body_b, name)))
+        }).await.expect("both verified snapshots must reach consumption barrier");
         assert!(matches!(one, Ok(true)) && matches!(two, Ok(true)));
         assert_eq!(store.hget(name, "recovery").await.unwrap().as_deref(), Some("[]"));
         assert!(check_second_factor_at(&store, &body_a, name).await.is_err());
         assert!(check_second_factor_at(&store, &body_b, name).await.is_err());
         store.hset_pairs(name, &[("recovery", serde_json::to_string(&[&a]).unwrap())]).await.unwrap();
-        let (one, two) = tokio::join!(check_second_factor_at(&store, &body_a, name), check_second_factor_at(&store, &body_a, name));
-        assert_ne!(matches!(one, Ok(true)), matches!(two, Ok(true)));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                CONSUME_BARRIER.scope(barrier.clone(), check_second_factor_at(&store, &body_a, name)),
+                CONSUME_BARRIER.scope(barrier.clone(), check_second_factor_at(&store, &body_a, name)))
+        }).await.expect("both verified snapshots must reach consumption barrier");
+        let statuses = [one.map(|_| 200).unwrap_or_else(|r| r.status),
+            two.map(|_| 200).unwrap_or_else(|r| r.status)];
+        assert!(statuses == [200, 401] || statuses == [401, 200], "{statuses:?}");
         assert_eq!(store.hget(name, "recovery").await.unwrap().as_deref(), Some("[]"));
         // Legacy recovery is refused independently of markers, while ordinary
         // TOTP still works, allowing authenticated users to regenerate codes.
@@ -319,8 +353,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
     async fn totp_state_and_login() {
+        cap_kv::cpu::init(cap_kv::cpu::CpuConfig::default()).unwrap();
         let _guard = LOGIN_TEST_LOCK.lock().await;
-        let store = AdminStore::connect(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        let url = std::env::var("CAP_TEST_REDIS_URL").expect("isolated Redis required");
+        assert!(!url.is_empty());
+        assert_eq!(std::env::var("REDIS_URL").expect("explicit REDIS_URL required"), url);
+        let store = AdminStore::connect(&url).await.unwrap();
         let name = &format!("test:totp-state:{}", util::random_hex(16));
         let empty = json!({});
         assert!(matches!(check_second_factor_at(&store, &empty, name).await, Ok(true)));

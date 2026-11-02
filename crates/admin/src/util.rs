@@ -1,7 +1,7 @@
 //! Small crypto / encoding helpers shared by the admin handlers.
 
-use argon2::password_hash::{PasswordHash, SaltString, rand_core::OsRng};
-use argon2::{Argon2, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::{SaltString, rand_core::OsRng};
+use argon2::{Argon2, PasswordHasher};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use rand::RngCore;
@@ -90,38 +90,99 @@ pub fn admin_key_eq(expected: &str, provided: &str) -> bool {
     a.ct_eq(&b).into()
 }
 
-pub fn argon2_hash(password: &str) -> Result<String, String> {
+#[derive(Debug)]
+pub enum ArgonError {
+    Cpu(cap_kv::cpu::CpuError),
+    InvalidPhc,
+    HashFailed,
+}
+
+pub(crate) fn argon2_error_response(error: ArgonError) -> crate::AdminResponse {
+    if matches!(error, ArgonError::Cpu(cap_kv::cpu::CpuError::Busy)) {
+        let mut response = crate::resp(
+            503,
+            serde_json::json!({"success": false, "error": "CPU service busy"}),
+        );
+        response.headers.push(("Retry-After".into(), "1".into()));
+        response
+    } else {
+        crate::internal()
+    }
+}
+
+fn argon2_hash(password: &str) -> Result<String, ArgonError> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
-        .map_err(|e| e.to_string())
+        .map_err(|_| ArgonError::HashFailed)
 }
 
-pub fn argon2_verify(password: &str, phc: &str) -> bool {
-    match PasswordHash::new(phc) {
-        Ok(parsed) => Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok(),
-        Err(_) => false,
-    }
+fn argon2_verify(password: &str, phc: &str) -> Result<bool, ArgonError> {
+    cap_verify::verify_argon2(password, phc).map_err(|_| ArgonError::InvalidPhc)
 }
 
-/// [`argon2_verify`] on the blocking pool. Argon2 is deliberately slow
-/// (tens of ms); running it inline would stall an async worker per request.
-pub async fn argon2_verify_async(password: &str, phc: &str) -> bool {
+/// Wrong passwords are Ok(false); admission and malformed stored PHCs are errors.
+pub async fn argon2_verify_async(password: &str, phc: &str) -> Result<bool, ArgonError> {
+    cap_verify::validate_argon2_phc(phc).map_err(|_| ArgonError::InvalidPhc)?;
     let (password, phc) = (password.to_string(), phc.to_string());
-    tokio::task::spawn_blocking(move || argon2_verify(&password, &phc))
-        .await
-        .unwrap_or(false)
+    cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::Argon, move || {
+        argon2_verify(&password, &phc)
+    })
+    .await
+    .map_err(ArgonError::Cpu)?
 }
 
-/// [`argon2_hash`] on the blocking pool.
-pub async fn argon2_hash_async(password: &str) -> Result<String, String> {
+pub async fn argon2_hash_async(password: &str) -> Result<String, ArgonError> {
     let password = password.to_string();
-    tokio::task::spawn_blocking(move || argon2_hash(&password))
+    cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::Argon, move || argon2_hash(&password))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(ArgonError::Cpu)?
+}
+
+#[cfg(test)]
+mod cpu_tests {
+    use super::*;
+    #[test]
+    fn password_mismatch_and_service_failure_are_distinct() {
+        let phc = argon2_hash("correct").unwrap();
+        assert!(argon2_verify("correct", &phc).unwrap());
+        assert!(!argon2_verify("wrong", &phc).unwrap());
+        assert!(matches!(
+            argon2_verify("x", "broken"),
+            Err(ArgonError::InvalidPhc)
+        ));
+        assert_eq!(
+            argon2_error_response(ArgonError::Cpu(cap_kv::cpu::CpuError::Busy)).status,
+            503
+        );
+        assert_eq!(argon2_error_response(ArgonError::InvalidPhc).status, 500);
+        assert_eq!(
+            argon2_error_response(ArgonError::Cpu(cap_kv::cpu::CpuError::WorkerFailed)).status,
+            500
+        );
+    }
+    #[test]
+    fn accepts_legacy_node_argon2_default_costs() {
+        let params = argon2::Params::new(65536, 3, 4, None).unwrap();
+        let legacy = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let salt = SaltString::encode_b64(b"legacy-test-salt").unwrap();
+        let phc = legacy.hash_password(b"correct", &salt).unwrap().to_string();
+        assert!(argon2_verify("correct", &phc).unwrap());
+        assert!(!argon2_verify("wrong", &phc).unwrap());
+    }
+    #[test]
+    fn rejects_excessive_phc_work_before_hashing() {
+        let phc = argon2_hash("correct").unwrap();
+        for excessive in ["m=65537,t=2,p=1", "m=19456,t=11,p=1", "m=19456,t=2,p=5"] {
+            let bad = phc.replace("m=19456,t=2,p=1", excessive);
+            assert_ne!(phc, bad);
+            assert!(matches!(
+                argon2_verify("correct", &bad),
+                Err(ArgonError::InvalidPhc)
+            ));
+        }
+    }
 }
 
 /// Normalize an integrity hash the way `integrity.js#norm` does: trim, lower,

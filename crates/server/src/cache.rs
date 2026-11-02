@@ -41,8 +41,8 @@ pub struct BlockList {
     pub cidrs: Vec<String>,
     pub countries: std::collections::HashSet<String>,
     pub asns: std::collections::HashSet<String>,
-    /// Fields whose TTL has passed; the caller should drop them from Redis.
-    pub expired: Vec<String>,
+    /// Expired field/value snapshots, swept once by the cache loader via CAS.
+    pub expired: Vec<(String, String)>,
 }
 
 impl BlockList {
@@ -59,7 +59,7 @@ impl BlockList {
             let permanent = value == "0";
             let expires = value.parse::<i64>().unwrap_or(0);
             if !permanent && expires <= now {
-                out.expired.push(field.clone());
+                out.expired.push((field.clone(), value.clone()));
                 continue;
             }
             if let Some(net) = field.strip_prefix("cidr:") {
@@ -211,7 +211,16 @@ impl ConfigCache {
         self.blocked
             .try_get_with_by_ref(site_key, async {
                 match kv.hgetall(&format!("blocked:{site_key}")).await {
-                    Ok(fields) => Ok(Arc::new(BlockList::from_fields(&fields, crate::now_ms()))),
+                    Ok(fields) => {
+                        let now = crate::now_ms();
+                        let list = BlockList::from_fields(&fields, now);
+                        // Cleanup is opportunistic, once per coalesced load (not
+                        // per request). Its failure must not discard live blocks.
+                        let _ = kv.hdel_expired_blocks(
+                            &format!("blocked:{site_key}"), &list.expired, now,
+                        ).await;
+                        Ok(Arc::new(list))
+                    },
                     Err(_) => Err(LoadError),
                 }
             })
@@ -231,6 +240,54 @@ impl ConfigCache {
 mod security_settings_tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated isolated CAP_TEST_REDIS_URL"]
+    async fn blocked_cas_concurrent_cache_misses() {
+        let kv = Kv::connect_redis(&std::env::var("CAP_TEST_REDIS_URL").expect("explicit isolated Redis required")).await.unwrap();
+        let site = format!("test:blocked:{}", cap_core::random_hex(16));
+        let name = format!("blocked:{site}");
+        // Explicit invalidation, not wall-clock TTL, controls this interleaving.
+        let mut config = ConfigCache::new();
+        config.blocked = Cache::builder().max_capacity(MAX_KEYS).build();
+        let cache = Arc::new(config);
+        kv.hset_pairs(&name, &[("192.0.2.1", "1".into()), ("192.0.2.2", "0".into())]).await.unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(17));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let (cache, kv, site, barrier) = (cache.clone(), kv.clone(), site.clone(), barrier.clone());
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache.blocked(&kv, &site).await.unwrap()
+            }));
+        }
+        barrier.wait().await;
+        let first = tasks.remove(0).await.unwrap();
+        for task in tasks {
+            assert!(Arc::ptr_eq(&first, &task.await.unwrap()), "misses must share one load");
+        }
+        assert!(first.ips.contains("192.0.2.2"));
+        assert_eq!(first.expired, vec![("192.0.2.1".into(), "1".into())]);
+        assert_eq!(kv.hget(&name, "192.0.2.1").await.unwrap(), None);
+        // Recreate the exact expired value: a hot hit must NOT sweep again.
+        kv.hset_pairs(&name, &[("192.0.2.1", "1".into())]).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &cache.blocked(&kv, &site).await.unwrap()));
+        assert_eq!(kv.hget(&name, "192.0.2.1").await.unwrap().as_deref(), Some("1"));
+        // Deterministic old cache snapshot -> renewal -> stale cleanup.
+        for renewed in ["0".to_string(), (crate::now_ms() + 60_000).to_string()] {
+            kv.hset_pairs(&name, &[("192.0.2.1", renewed.clone())]).await.unwrap();
+            assert_eq!(kv.hdel_expired_blocks(&name, &first.expired, crate::now_ms()).await.unwrap(), 0);
+            assert_eq!(kv.hget(&name, "192.0.2.1").await.unwrap(), Some(renewed));
+        }
+        kv.del(&name).await.unwrap();
+        kv.set(&name, "wrong type").await.unwrap();
+        cache.clear();
+        assert!(cache.blocked(&kv, &site).await.is_none());
+        kv.del(&name).await.unwrap();
+        kv.hset_pairs(&name, &[("192.0.2.2", "0".into())]).await.unwrap();
+        assert!(cache.blocked(&kv, &site).await.unwrap().ips.contains("192.0.2.2"), "read failures must not be cached");
+        kv.del(&name).await.unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "requires a dedicated isolated CAP_TEST_REDIS_URL"]

@@ -100,10 +100,27 @@ pub(crate) async fn verify_common(
 
     // Legacy `$argon2` hashes cost tens of ms; keep them off async workers.
     let secret_check = if key.secret_hash.starts_with("$argon2") {
+        if cap_verify::validate_argon2_phc(&key.secret_hash).is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"success": false, "error": "internal_error"}))).into_response();
+        }
         let (stored, provided) = (key.secret_hash.clone(), req.secret.clone());
-        tokio::task::spawn_blocking(move || check_secret(&stored, &provided))
-            .await
-            .unwrap_or(SecretCheck::Fast(false))
+        match cap_kv::cpu::run_cpu(cap_kv::cpu::CpuClass::Argon,
+            move || cap_verify::verify_argon2(&provided, &stored)).await {
+            Ok(Ok(result)) => SecretCheck::Fast(result),
+            Ok(Err(_)) => return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"success": false, "error": "internal_error"})),
+            ).into_response(),
+            Err(cap_kv::cpu::CpuError::Busy) => return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"success": false, "error": "server_busy"})),
+            ).into_response(),
+            Err(_) => return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"success": false, "error": "internal_error"})),
+            ).into_response(),
+        }
     } else {
         check_secret(&key.secret_hash, &req.secret)
     };

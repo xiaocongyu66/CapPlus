@@ -2,6 +2,15 @@
 
 use serde_json::{Map, Value, json};
 
+pub(crate) fn normalized_domains(value: Option<&Value>) -> Result<Value, String> {
+    let values = value.and_then(Value::as_array)
+        .ok_or("corsOrigins is required and must be an array of 1–50 bare domains")?;
+    let domains = values.iter().map(|v| v.as_str().map(str::to_owned)
+        .ok_or_else(|| "corsOrigins must contain only strings".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    cap_embed::normalize_domains(&domains).map(|domains| json!(domains))
+}
+
 pub(crate) fn num_value(f: f64) -> Value {
     if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
         Value::Number((f as i64).into())
@@ -126,7 +135,7 @@ pub(crate) fn validate_create(obj: &Map<String, Value>) -> Result<(), String> {
     ] {
         check_bool(obj, key)?;
     }
-    check_string_array(obj, "corsOrigins", 50, false)?;
+    normalized_domains(obj.get("corsOrigins"))?;
     check_extended_probes(obj)?;
     check_protocol(obj)?;
     Ok(())
@@ -157,7 +166,9 @@ pub(crate) fn validate_update(obj: &Map<String, Value>) -> Result<(), String> {
     ] {
         check_bool(obj, key)?;
     }
-    check_string_array(obj, "corsOrigins", 50, true)?;
+    if obj.contains_key("corsOrigins") {
+        normalized_domains(obj.get("corsOrigins"))?;
+    }
     check_string_array(obj, "requiredHeaders", 20, true)?;
     check_extended_probes(obj)?;
     check_protocol(obj)?;

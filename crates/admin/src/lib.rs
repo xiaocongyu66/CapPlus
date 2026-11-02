@@ -212,6 +212,51 @@ pub async fn handle(
     add_security_headers(resp)
 }
 
+/// Unforgeable, request-local authorization bound to the store and site.
+/// No public constructor and no generic authorized dispatch endpoint.
+pub struct AuthorizedSiteDelete<'a> {
+    store: &'a AdminStore,
+    site: String,
+}
+
+pub fn deletion_incomplete(training: &str) -> AdminResponse {
+    resp(503, json!({"success": false,
+        "error": "Deletion incomplete; changes may already be committed. Retry this DELETE.",
+        "deletion": {"state": "incomplete", "retryable": true,
+            "training": training, "scope": "local-instance"}}))
+}
+
+pub async fn authorize_site_delete<'a>(
+    store: &'a AdminStore, req: &AdminRequest<'_>,
+) -> Result<AuthorizedSiteDelete<'a>, AdminResponse> {
+    let segments: Vec<_> = req.path.split('/').filter(|s| !s.is_empty()).collect();
+    let ["keys", site] = segments.as_slice() else { return Err(not_found()); };
+    if req.method != "DELETE" { return Err(not_found()); }
+    let scope = auth::authenticate(store, req).await?;
+    if let Some(response) = auth::scope_guard("DELETE", req.path, &scope) {
+        return Err(response);
+    }
+    Ok(AuthorizedSiteDelete { store, site: (*site).into() })
+}
+
+impl AuthorizedSiteDelete<'_> {
+    /// Persist intent before any local side effect. Missing keys need a receipt.
+    pub async fn prepare(&self) -> Result<(), AdminResponse> {
+        match self.store.begin_site_delete(&self.site).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(not_found()),
+            Err(_) => Err(deletion_incomplete("unknown")),
+        }
+    }
+
+    /// Caller must first commit local training retirement on this instance.
+    pub async fn finish(self) -> AdminResponse {
+        let mut response = keys::finish_delete(self.store, &self.site).await;
+        response.body["deletion"]["training"] = json!("committed");
+        response
+    }
+}
+
 /// Demo-mode reads. Returns `None` for anything this module does not own, so
 /// the real handler (e.g. `/about`) still answers.
 fn demo_dispatch(req: &AdminRequest<'_>, method: &str, _body: &Value) -> Option<AdminResponse> {

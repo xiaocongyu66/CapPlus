@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use crate::keys_stats::*;
 use crate::keys_validate::*;
 use crate::util;
-use crate::{AdminStore, Scope, bad_request, internal, ok, resp};
+use crate::{AdminStore, Scope, bad_request, internal, ok};
 
 pub(crate) const DAY: i64 = 86_400;
 
@@ -116,11 +116,7 @@ pub(crate) fn build_create_config(body: &Value) -> Result<Value, String> {
         cfg.insert("hashwxDifficulty".into(), v.clone());
     }
 
-    if let Some(arr) = obj.get("corsOrigins").and_then(|v| v.as_array()) {
-        if !arr.is_empty() {
-            cfg.insert("corsOrigins".into(), Value::Array(arr.clone()));
-        }
-    }
+    cfg.insert("corsOrigins".into(), normalized_domains(obj.get("corsOrigins"))?);
 
     Ok(Value::Object(cfg))
 }
@@ -187,7 +183,10 @@ pub(crate) fn merge_update_config(existing: &Value, body: &Value) -> Result<Valu
     set_present_or_default(b, &mut cfg, "polymorphism", json!(0));
     set_present_or_default(b, &mut cfg, "ratelimitMax", Value::Null);
     set_present_or_default(b, &mut cfg, "ratelimitDuration", Value::Null);
-    set_present_or_default(b, &mut cfg, "corsOrigins", Value::Null);
+    // Omission preserves a valid list, but legacy/empty lists must be explicitly
+    // repaired before any update. Never fall back to unrestricted access.
+    let domains = normalized_domains(b.get("corsOrigins").or_else(|| cfg.get("corsOrigins")))?;
+    cfg.insert("corsOrigins".into(), domains);
     set_present_or_default(b, &mut cfg, "blockNonBrowserUA", Value::Null);
     set_present_or_default(b, &mut cfg, "requiredHeaders", Value::Null);
 
@@ -560,6 +559,35 @@ async fn create_with_generator(
 }
 
 #[cfg(test)]
+mod domain_config_tests {
+    use super::*;
+
+    #[test]
+    fn create_requires_valid_domains_and_normalizes() {
+        for body in [json!({}), json!({"corsOrigins": null}), json!({"corsOrigins": []}),
+            json!({"corsOrigins": ["*"]}), json!({"corsOrigins": ["example.com", "https://example.com"]}),
+            json!({"corsOrigins": [5]}), json!({"corsOrigins": ["example.com:443"]})] {
+            assert!(build_create_config(&body).is_err(), "{body}");
+        }
+        let cfg = build_create_config(&json!({"corsOrigins": ["EXAMPLE.com.", "*.bücher.example"]})).unwrap();
+        assert_eq!(cfg["corsOrigins"], json!(["example.com", "*.xn--bcher-kva.example"]));
+    }
+
+    #[test]
+    fn update_cannot_clear_or_preserve_invalid_legacy_list() {
+        let valid = json!({"corsOrigins": ["example.com"]});
+        assert_eq!(merge_update_config(&valid, &json!({})).unwrap()["corsOrigins"], valid["corsOrigins"]);
+        for body in [json!({"corsOrigins": null}), json!({"corsOrigins": []}), json!({"corsOrigins": ["*"]})] {
+            assert!(merge_update_config(&valid, &body).is_err());
+        }
+        for old in [json!({}), json!({"corsOrigins": []}), json!({"corsOrigins": ["https://example.com:443"]})] {
+            assert!(merge_update_config(&old, &json!({"name": "rename"})).is_err());
+            assert!(merge_update_config(&old, &valid).is_ok());
+        }
+    }
+}
+
+#[cfg(test)]
 mod collision_tests {
     use super::*;
 
@@ -571,11 +599,11 @@ mod collision_tests {
         let old = format!("collision-old-{suffix}");
         let new = format!("collision-new-{suffix}");
         let mut first_candidate = Some(old.clone());
-        let first = create_with_generator(&store, &json!({}), || first_candidate.take().expect("unexpected collision")).await;
+        let first = create_with_generator(&store, &json!({"corsOrigins": ["example.com"]}), || first_candidate.take().expect("unexpected collision")).await;
         assert_eq!(first.status, 200);
         let original = store.hgetall(&format!("key:{old}")).await.unwrap();
         let mut candidates = [old.clone(), new.clone()].into_iter();
-        let next = create_with_generator(&store, &json!({}), || candidates.next().expect("candidates exhausted")).await;
+        let next = create_with_generator(&store, &json!({"corsOrigins": ["example.com"]}), || candidates.next().expect("candidates exhausted")).await;
         assert_eq!(next.status, 200);
         assert_eq!(next.body["siteKey"], new);
         assert_eq!(store.hgetall(&format!("key:{old}")).await.unwrap(), original);
@@ -640,14 +668,15 @@ pub(crate) async fn update(
 }
 
 pub(crate) async fn delete(store: &AdminStore, site_key: &str) -> crate::AdminResponse {
-    let exists = match store.exists(&format!("key:{site_key}")).await {
-        Ok(e) => e,
-        Err(_) => return internal(),
-    };
-    if !exists {
-        return resp(404, json!({ "success": false, "error": "Key not found" }));
+    match store.begin_site_delete(site_key).await {
+        Ok(true) => {},
+        Ok(false) => return crate::not_found(),
+        Err(_) => return crate::deletion_incomplete("unknown"),
     }
+    finish_delete(store, site_key).await
+}
 
+pub(crate) async fn finish_delete(store: &AdminStore, site_key: &str) -> crate::AdminResponse {
     let keys: Vec<String> = [
         format!("key:{site_key}"),
         format!("metrics:verified:{site_key}"),
@@ -662,23 +691,13 @@ pub(crate) async fn delete(store: &AdminStore, site_key: &str) -> crate::AdminRe
         format!("blocked:{site_key}"),
     ]
     .to_vec();
-    if store.del_many(&keys).await.is_err() {
-        return internal();
+    if store.finish_site_delete(site_key, &keys).await.is_err() {
+        return crate::deletion_incomplete("not-managed");
     }
-    if store.srem("keys", site_key).await.is_err() {
-        return internal();
-    }
-
-    // Clean up share links for this key (mirrors deleteSharesForKey in share.js).
-    if let Ok(share_ids) = store.smembers(&format!("shares:{site_key}")).await {
-        for id in &share_ids {
-            let _ = store.del(&format!("share:{id}")).await;
-            let _ = store.srem("shares", id).await;
-        }
-        let _ = store.del(&format!("shares:{site_key}")).await;
-    }
-
-    ok(json!({ "success": true }))
+    ok(json!({ "success": true, "deletion": {
+        "state": "complete", "retryable": false, "training": "not-managed",
+        "scope": "local-instance"
+    }}))
 }
 
 pub(crate) async fn rotate_secret(store: &AdminStore, site_key: &str) -> crate::AdminResponse {

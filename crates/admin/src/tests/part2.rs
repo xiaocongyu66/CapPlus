@@ -193,7 +193,7 @@ use super::*;
             "POST",
             "/keys",
             auth.clone(),
-            json!({"name": format!("sharekey-{}", uniq())}),
+            json!({"name": format!("sharekey-{}", uniq()), "corsOrigins": ["example.com"]}),
         )
         .await;
         let sk = r.body["siteKey"].as_str().unwrap().to_string();
@@ -336,7 +336,7 @@ use super::*;
             "POST",
             "/keys",
             auth.clone(),
-            json!({"name": format!("sa-{}", uniq())}),
+            json!({"name": format!("sa-{}", uniq()), "corsOrigins": ["example.com"]}),
         )
         .await;
         let sk_a = r.body["siteKey"].as_str().unwrap().to_string();
@@ -346,7 +346,7 @@ use super::*;
             "POST",
             "/keys",
             auth.clone(),
-            json!({"name": format!("sb-{}", uniq())}),
+            json!({"name": format!("sb-{}", uniq()), "corsOrigins": ["example.com"]}),
         )
         .await;
         let sk_b = r.body["siteKey"].as_str().unwrap().to_string();

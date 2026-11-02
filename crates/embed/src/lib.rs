@@ -47,111 +47,67 @@ fn esc(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Origin parsing (a small, dependency-free WHATWG-flavoured subset)
+// Shared domain validation and strict HTTP(S) origin parsing
 // ---------------------------------------------------------------------------
 
-fn is_scheme_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'
+/// Validate and canonicalize the single site-domain list (`corsOrigins`).
+/// Legacy origins (scheme/port/path), bare `*`, IPs and empty lists are rejected;
+/// operators must explicitly migrate them, never strip origin restrictions.
+/// Bare domains authorize HTTP(S) on any port; wildcards exclude the apex.
+pub fn normalize_domains(domains: &[String]) -> Result<Vec<String>, String> {
+    if !(1..=50).contains(&domains.len()) {
+        return Err("corsOrigins requires 1–50 bare domains".into());
+    }
+    domains.iter().enumerate().map(|(i, value)| {
+        let (wildcard, host) = match value.strip_prefix("*.") {
+            Some(host) => (true, host),
+            None => (false, value.as_str()),
+        };
+        canonical_domain(host)
+            .map(|host| if wildcard { format!("*.{host}") } else { host })
+            .ok_or_else(|| format!("corsOrigins item {} must be a bare domain or *.domain; legacy origins must be migrated explicitly (no scheme, port, path or bare *)", i + 1))
+    }).collect()
 }
 
-/// Parse `scheme://host[:port]` into a canonical origin string, discarding any
-/// path/query/fragment/userinfo and the scheme's default port. Scheme and host
-/// are lowercased, so `HTTPS://App.Example.COM:443/x` normalises to
-/// `https://app.example.com`.
-fn parse_origin(input: &str) -> Option<String> {
-    let s = input.trim();
-    let (scheme, rest) = s.split_once("://")?;
-
-    let mut scheme_iter = scheme.chars();
-    let first = scheme_iter.next()?;
-    if !first.is_ascii_alphabetic() || !scheme_iter.all(is_scheme_char) {
+fn canonical_domain(host: &str) -> Option<String> {
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c.is_control())
+        || host.contains([':', '/', '\\', '@', '?', '#', '%', '*']) {
         return None;
     }
-    let scheme = scheme.to_ascii_lowercase();
+    let url::Host::Domain(ascii) = url::Host::parse(host).ok()? else { return None; };
+    let ascii = ascii.strip_suffix('.').unwrap_or(&ascii);
+    if ascii.len() > 253 || !ascii.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63
+            && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) { return None; }
+    Some(ascii.to_ascii_lowercase())
+}
 
-    // Authority ends at the first path / query / fragment delimiter.
-    let authority = match rest.find(['/', '?', '#']) {
-        Some(i) => &rest[..i],
-        None => rest,
-    };
-
-    // Strip userinfo (`user:pass@`).
-    let authority = match authority.rsplit_once('@') {
-        Some((_, host)) => host,
-        None => authority,
-    };
-
-    let (host, port) = split_host_port(authority)?;
-    if host.is_empty() {
+/// Strict HTTP(S) origin parser. Reject URL repair, credentials, paths,
+/// queries and fragments rather than silently discarding them.
+fn parent_url(input: &str) -> Option<url::Url> {
+    if input.chars().any(|c| c.is_whitespace() || c.is_control()) || input.contains('\\') {
         return None;
     }
+    let (_, authority) = input.split_once("://")?;
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.is_empty() || authority.contains(['/', '@', '?', '#', '%']) { return None; }
+    let parsed = url::Url::parse(input).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() { return None; }
+    Some(parsed)
+}
 
-    // The origin ends up verbatim in a `frame-ancestors` CSP header, so only
-    // host characters are allowed: anything like `;`, `,`, `'` or a space
-    // would inject a directive. IPv6 literals keep their brackets.
-    let ipv6 = host.starts_with('[') && host.ends_with(']');
-    let ok = if ipv6 {
-        host[1..host.len() - 1]
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
-    } else {
-        host.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-    };
-    if !ok {
-        return None;
-    }
-
-    let host = host.to_ascii_lowercase();
-
-    let default_port = match scheme.as_str() {
-        "http" | "ws" => Some(80u16),
-        "https" | "wss" => Some(443u16),
-        _ => None,
-    };
-
-    let canonical = match port {
-        None => format!("{scheme}://{host}"),
-        Some(p) if Some(p) == default_port => format!("{scheme}://{host}"),
-        Some(p) => format!("{scheme}://{host}:{p}"),
-    };
-    Some(canonical)
+/// Canonicalize a strict HTTP(S) origin, including IDNA and default ports.
+pub fn parse_origin(input: &str) -> Option<String> {
+    parent_url(input).map(|url| url.origin().ascii_serialization())
 }
 
 /// Return the hostname of an origin, without its scheme or port.
 pub fn origin_hostname(origin: &str) -> Option<String> {
-    let canonical = parse_origin(origin)?;
-    let (_, authority) = canonical.split_once("://")?;
-    let (host, _) = split_host_port(authority)?;
-    Some(host.to_string())
-}
-
-fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
-    if let Some(stripped) = authority.strip_prefix('[') {
-        // IPv6 literal: `[::1]` or `[::1]:8080`.
-        let close = stripped.find(']')?;
-        let host = &authority[..close + 2];
-        let tail = &stripped[close + 1..];
-        if tail.is_empty() {
-            return Some((host, None));
-        }
-        let port = tail.strip_prefix(':')?;
-        return Some((host, parse_port(port)?));
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => Some((host, parse_port(port)?)),
-        None => Some((authority, None)),
-    }
-}
-
-fn parse_port(port: &str) -> Option<Option<u16>> {
-    if port.is_empty() {
-        return Some(None);
-    }
-    if !port.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    port.parse::<u16>().ok().map(Some)
+    let parsed = parent_url(origin)?;
+    let host = parsed.host_str()?;
+    Some(host.strip_suffix('.').unwrap_or(host).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +118,7 @@ fn parse_port(port: &str) -> Option<Option<u16>> {
 /// frame-ancestors` directive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FramePolicy {
-    /// Only this origin may frame the document (`"*"` means anyone).
+    /// Only this exact HTTP(S) origin may frame the document.
     Allow(String),
     /// Nobody may frame it (`frame-ancestors 'none'`).
     Deny,
@@ -170,38 +126,20 @@ pub enum FramePolicy {
 
 /// Decide who may embed the widget.
 ///
-/// * no configured origins (or only empty strings) → [`FramePolicy::Allow`]`("*")`
-/// * otherwise `parent` must parse as an origin and be listed → `Allow` with the
-///   canonical parent origin; anything else (unparseable, empty, not listed,
-///   different scheme or port) → [`FramePolicy::Deny`].
+/// Empty or invalid lists deny immediately, including legacy origin entries.
+/// Exact bare domains match only that hostname; `*.example.com` matches any
+/// subdomain depth but not the apex. HTTP(S) and any port are authorized by a
+/// domain entry, but CSP always receives only the precise requesting origin.
 pub fn frame_policy(cors_origins: &[String], parent: &str) -> FramePolicy {
-    let mut configured = cors_origins
-        .iter()
-        .filter(|o| !o.trim().is_empty())
-        .peekable();
-
-    // Fail closed: without a configured allow-list the embedding parent is
-    // unverifiable, and the token would be posted to whatever origin the
-    // attacker put in `?parent=`. An operator who really wants any origin can
-    // configure `"*"` explicitly.
-    if configured.peek().is_none() {
-        return FramePolicy::Deny;
-    }
-    if cors_origins.iter().any(|o| o.trim() == "*") {
-        return match parse_origin(parent) {
-            Some(origin) => FramePolicy::Allow(origin),
-            None => FramePolicy::Deny,
-        };
-    }
-
-    let Some(parent_origin) = parse_origin(parent) else {
+    let Ok(configured) = normalize_domains(cors_origins) else { return FramePolicy::Deny; };
+    let Some(parent_origin) = parse_origin(parent) else { return FramePolicy::Deny; };
+    let Some(host) = origin_hostname(parent).and_then(|h| canonical_domain(&h)) else {
         return FramePolicy::Deny;
     };
-
-    if configured
-        .filter_map(|o| parse_origin(o))
-        .any(|allowed| allowed == parent_origin)
-    {
+    if configured.iter().any(|allowed| match allowed.strip_prefix("*.") {
+        Some(base) => host.strip_suffix(base).is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1),
+        None => allowed == &host,
+    }) {
         FramePolicy::Allow(parent_origin)
     } else {
         FramePolicy::Deny
@@ -548,7 +486,7 @@ mod tests {
 
     #[test]
     fn parent_cannot_inject_csp() {
-        let star = vec!["*".to_string()];
+        let star = vec!["app.example.com".to_string()];
         for bad in [
             "https://a;sandbox",
             "https://a,https://evil",
@@ -559,12 +497,12 @@ mod tests {
             assert_eq!(frame_policy(&star, bad), FramePolicy::Deny, "{bad}");
         }
         assert_eq!(
-            frame_policy(&star, "https://App.Example.com:443/x"),
+            frame_policy(&star, "https://App.Example.com:443/"),
             FramePolicy::Allow("https://app.example.com".into())
         );
         assert_eq!(
             frame_policy(&star, "http://[::1]:8080"),
-            FramePolicy::Allow("http://[::1]:8080".into())
+            FramePolicy::Deny
         );
     }
 
@@ -580,17 +518,55 @@ mod tests {
         // The JS filters out empty strings, so a list of blanks behaves like empty.
         assert_eq!(frame_policy(&list(&["", "  "]), ""), FramePolicy::Deny);
 
-        // An explicit "*" is the documented way to allow any origin.
+        // Bare wildcard never opts out of domain validation.
         assert_eq!(
             frame_policy(&list(&["*"]), "https://app.example.com"),
-            FramePolicy::Allow("https://app.example.com".into())
+            FramePolicy::Deny
         );
         assert_eq!(frame_policy(&list(&["*"]), "garbage"), FramePolicy::Deny);
     }
 
     #[test]
+    fn domain_matrix() {
+        for (domains, parent, allowed) in [
+            (vec!["example.com"], "https://example.com", true),
+            (vec!["example.com"], "https://login.example.com", false),
+            (vec!["login.example.com"], "https://login.example.com", true),
+            (vec!["login.example.com"], "https://example.com", false),
+            (vec!["*.example.com"], "https://a.b.example.com:8443", true),
+            (vec!["*.example.com"], "https://example.com", false),
+            (vec!["*.example.com"], "https://badexample.com", false),
+            (vec!["*.example.com"], "https://example.com.evil", false),
+            (vec!["EXAMPLE.com."], "http://Example.COM.:8080", true),
+            (vec!["bücher.example"], "https://xn--bcher-kva.example", true),
+            (vec!["xn--bcher-kva.example"], "https://bücher.example", true),
+            (vec!["example.com", "*"], "https://example.com", false),
+            (vec!["example.com", "https://other.com"], "https://example.com", false),
+        ] {
+            let policy = frame_policy(&list(&domains), parent);
+            assert_eq!(matches!(policy, FramePolicy::Allow(_)), allowed, "{domains:?} {parent}");
+            if allowed { assert_eq!(policy, FramePolicy::Allow(parse_origin(parent).unwrap())); }
+        }
+        for bad in ["", "*", "https://example.com", "example.com:443", "example.com/",
+            "a@example.com", "example.com?x", "example.com#x", "a..com", "-a.com",
+            "a-.com", "example.com..", "a;script-src.com", "a'unsafe.com", "a\n.com",
+            "*.*.example.com", "127.0.0.1", "[::1]", "%65xample.com"] {
+            assert!(normalize_domains(&list(&[bad])).is_err(), "{bad}");
+        }
+        assert!(normalize_domains(&[]).is_err());
+        assert!(normalize_domains(&vec!["example.com".into(); 50]).is_ok());
+        assert!(normalize_domains(&vec!["example.com".into(); 51]).is_err());
+        for bad in ["https://user@example.com", "https://@example.com", "https://example.com/x",
+            "https://example.com?", "https://example.com#", "https:///example.com",
+            "https://example.com\\evil", "https://example.com\n", "ftp://example.com",
+            "https://example.com:99999", "https://example.com.evil"] {
+            assert_eq!(frame_policy(&list(&["example.com"]), bad), FramePolicy::Deny, "{bad}");
+        }
+    }
+
+    #[test]
     fn exact_match_allowed() {
-        let origins = list(&["https://app.example.com"]);
+        let origins = list(&["app.example.com"]);
         assert_eq!(
             frame_policy(&origins, "https://app.example.com"),
             FramePolicy::Allow("https://app.example.com".into())
@@ -599,17 +575,17 @@ mod tests {
 
     #[test]
     fn trailing_slash_and_case_are_normalised() {
-        let origins = list(&["https://app.example.com"]);
+        let origins = list(&["app.example.com"]);
         assert_eq!(
             frame_policy(&origins, "https://app.example.com/"),
             FramePolicy::Allow("https://app.example.com".into())
         );
         assert_eq!(
-            frame_policy(&origins, "HTTPS://App.Example.COM/embed/path"),
+            frame_policy(&origins, "HTTPS://App.Example.COM"),
             FramePolicy::Allow("https://app.example.com".into())
         );
         // ...and entries in the list are normalised too.
-        let origins = list(&["https://app.example.com/"]);
+        let origins = list(&["App.Example.COM."]);
         assert_eq!(
             frame_policy(&origins, "https://app.example.com"),
             FramePolicy::Allow("https://app.example.com".into())
@@ -618,12 +594,12 @@ mod tests {
 
     #[test]
     fn default_port_matches_explicit_port_entry() {
-        let origins = list(&["https://app.example.com:443"]);
+        let origins = list(&["app.example.com"]);
         assert_eq!(
             frame_policy(&origins, "https://app.example.com"),
             FramePolicy::Allow("https://app.example.com".into())
         );
-        let origins = list(&["https://app.example.com"]);
+        let origins = list(&["app.example.com"]);
         assert_eq!(
             frame_policy(&origins, "https://app.example.com:443"),
             FramePolicy::Allow("https://app.example.com".into())
@@ -631,11 +607,11 @@ mod tests {
     }
 
     #[test]
-    fn different_port_denied() {
-        let origins = list(&["https://app.example.com"]);
+    fn ports_match_domains_but_legacy_entries_deny() {
+        let origins = list(&["app.example.com"]);
         assert_eq!(
             frame_policy(&origins, "https://app.example.com:8443"),
-            FramePolicy::Deny
+            FramePolicy::Allow("https://app.example.com:8443".into())
         );
         let origins = list(&["https://app.example.com:8443"]);
         assert_eq!(
@@ -645,11 +621,11 @@ mod tests {
     }
 
     #[test]
-    fn http_vs_https_denied() {
-        let origins = list(&["https://app.example.com"]);
+    fn http_matches_domains_but_legacy_entries_deny() {
+        let origins = list(&["app.example.com"]);
         assert_eq!(
             frame_policy(&origins, "http://app.example.com"),
-            FramePolicy::Deny
+            FramePolicy::Allow("http://app.example.com".into())
         );
         let origins = list(&["http://app.example.com"]);
         assert_eq!(
@@ -660,7 +636,7 @@ mod tests {
 
     #[test]
     fn unparseable_parent_denied() {
-        let origins = list(&["https://app.example.com"]);
+        let origins = list(&["app.example.com"]);
         assert_eq!(frame_policy(&origins, ""), FramePolicy::Deny);
         assert_eq!(frame_policy(&origins, "not a url"), FramePolicy::Deny);
         assert_eq!(frame_policy(&origins, "app.example.com"), FramePolicy::Deny);
@@ -677,7 +653,7 @@ mod tests {
 
     #[test]
     fn unrelated_origin_denied() {
-        let origins = list(&["https://app.example.com", "https://other.example.org"]);
+        let origins = list(&["app.example.com", "other.example.org"]);
         assert_eq!(
             frame_policy(&origins, "https://evil.example.com"),
             FramePolicy::Deny
@@ -696,7 +672,7 @@ mod tests {
 
     #[test]
     fn second_entry_matches() {
-        let origins = list(&["https://a.example.com", "https://b.example.com"]);
+        let origins = list(&["a.example.com", "b.example.com"]);
         assert_eq!(
             frame_policy(&origins, "https://b.example.com"),
             FramePolicy::Allow("https://b.example.com".into())

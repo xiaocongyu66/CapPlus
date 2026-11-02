@@ -4,6 +4,8 @@
 //! (strings with TTL, hashes, sets, counters), with the same key schema as the
 //! JavaScript server so both can share one instance during migration.
 
+pub mod cpu;
+
 use std::collections::HashMap;
 
 use redis::aio::ConnectionManager;
@@ -116,6 +118,63 @@ impl Kv {
             cmd.arg(k);
         }
         self.query::<i64>(cmd).await.map(|_| ())
+    }
+
+    /// Durable, non-expiring deletion receipt. Only a live key can mint one.
+    pub async fn begin_site_delete(&self, site: &str) -> KvResult<bool> {
+        let mut conn = self.conn.clone();
+        let n: i64 = redis::Script::new(r#"
+            local intent = redis.call('GET', KEYS[2])
+            if intent == 'pending' or intent == 'complete' then return 1 end
+            if intent then return redis.error_reply('invalid deletion receipt') end
+            if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+            redis.call('SET', KEYS[2], 'pending')
+            return 1
+        "#).key(format!("key:{site}")).key(format!("site-delete:{site}"))
+            .invoke_async(&mut conn).await?;
+        Ok(n == 1)
+    }
+
+    /// Preflight all types and write ACLs before mutating. Redis scripts do NOT
+    /// roll back runtime errors; retain the receipt on every error for retry.
+    /// Requires Redis 7 ACL checks; older servers fail closed before deletion.
+    pub async fn finish_site_delete(&self, site: &str, data: &[String]) -> KvResult<()> {
+        let mut conn = self.conn.clone();
+        redis::Script::new(r#"
+            local receipt = redis.call('GET', KEYS[1])
+            if receipt ~= 'pending' and receipt ~= 'complete' then
+                return redis.error_reply('missing deletion receipt')
+            end
+            for i = 2, 4 do
+                local t = redis.call('TYPE', KEYS[i]).ok
+                if t ~= 'none' and t ~= 'set' then return redis.error_reply('WRONGTYPE deletion index') end
+            end
+            local ids = redis.call('SMEMBERS', KEYS[3])
+            local dels = {}
+            for i = 5, #KEYS do table.insert(dels, KEYS[i]) end
+            for _, id in ipairs(ids) do table.insert(dels, 'share:' .. id) end
+            if not redis.acl_check_cmd('DEL', KEYS[3]) or
+               not redis.acl_check_cmd('SET', KEYS[1], 'complete') or
+               not redis.acl_check_cmd('SREM', KEYS[2], ARGV[1]) then
+                return redis.error_reply('NOPERM deletion preflight')
+            end
+            for _, key in ipairs(dels) do
+                if not redis.acl_check_cmd('DEL', key) then return redis.error_reply('NOPERM deletion preflight') end
+            end
+            for _, id in ipairs(ids) do
+                if not redis.acl_check_cmd('SREM', KEYS[4], id) then return redis.error_reply('NOPERM deletion preflight') end
+            end
+            for _, key in ipairs(dels) do redis.call('DEL', key) end
+            redis.call('SREM', KEYS[2], ARGV[1])
+            for _, id in ipairs(ids) do redis.call('SREM', KEYS[4], id) end
+            -- Keep the per-site share list until all index cleanup succeeded.
+            redis.call('DEL', KEYS[3])
+            redis.call('SET', KEYS[1], 'complete')
+            return 1
+        "#).key(format!("site-delete:{site}")).key("keys")
+            .key(format!("shares:{site}")).key("shares").key(data).arg(site)
+            .invoke_async::<i64>(&mut conn).await?;
+        Ok(())
     }
 
     pub async fn exists(&self, key: &str) -> KvResult<bool> {
@@ -394,6 +453,48 @@ impl Kv {
         Ok(n == 1)
     }
 
+    /// Best-effort callers may ignore cleanup errors, but never read errors.
+    /// Compare exact snapshots atomically, in batches of at most 128 fields.
+    /// Invalid expiry strings are retained, not treated as proven expired.
+    /// Atomic per batch, not across batches; an error may follow earlier deletions.
+    pub async fn hdel_expired_blocks(
+        &self,
+        name: &str,
+        snapshots: &[(String, String)],
+        now: i64,
+    ) -> KvResult<i64> {
+        let script = redis::Script::new(r#"
+            local removed = 0
+            for i = 2, #ARGV, 2 do
+                local old = ARGV[i + 1]
+                local expiry = tonumber(old)
+                if old ~= '0' and expiry and expiry <= tonumber(ARGV[1])
+                    and redis.call('HGET', KEYS[1], ARGV[i]) == old then
+                    removed = removed + redis.call('HDEL', KEYS[1], ARGV[i])
+                end
+            end
+            return removed
+        "#);
+        let mut removed = 0;
+        let mut conn = self.conn.clone();
+        for batch in snapshots.chunks(128) {
+            let mut invocation = script.prepare_invoke();
+            invocation.key(name).arg(now);
+            let mut count = 0;
+            for (field, old) in batch {
+                // Exact i64 comparison also guards Lua's floating-point rounding.
+                if old != "0" && old.parse::<i64>().is_ok_and(|expiry| expiry <= now) {
+                    invocation.arg(field).arg(old);
+                    count += 1;
+                }
+            }
+            if count != 0 {
+                removed += invocation.invoke_async::<i64>(&mut conn).await?;
+            }
+        }
+        Ok(removed)
+    }
+
     pub async fn hdel_fields(&self, name: &str, fields: &[&str]) -> KvResult<()> {
         if fields.is_empty() {
             return Ok(());
@@ -439,6 +540,39 @@ impl Kv {
 #[cfg(test)]
 mod atomic_tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
+    async fn expired_blocks_cas_batches() {
+        let kv = Kv::connect_redis(&std::env::var("CAP_TEST_REDIS_URL").expect("explicit isolated Redis required")).await.unwrap();
+        let name = format!("test:expired:{}:{}", std::process::id(), now_ms());
+        let now = 1_000;
+        // More than two batches, with renewed, unchanged and missing entries.
+        for i in 0..260 {
+            kv.hset_pairs(&name, &[(&format!("field:{i}"), "999".into())]).await.unwrap();
+        }
+        let mut snapshot: Vec<_> = kv.hgetall(&name).await.unwrap().into_iter().collect();
+        snapshot.sort();
+        kv.hset_pairs(&name, &[("field:0", "0".into()), ("field:1", "1001".into())]).await.unwrap();
+        kv.hdel_fields(&name, &["field:2"]).await.unwrap();
+        for (field, value) in [("permanent", "0"), ("future", "1001"), ("invalid", "broken"), ("boundary", "1000")] {
+            kv.hset_pairs(&name, &[(field, value.into())]).await.unwrap();
+            snapshot.push((field.into(), value.into()));
+        }
+        assert_eq!(kv.hdel_expired_blocks(&name, &snapshot, now).await.unwrap(), 258);
+        let remaining = kv.hgetall(&name).await.unwrap();
+        assert_eq!(remaining.len(), 5);
+        assert_eq!(remaining["field:0"], "0");
+        assert_eq!(remaining["field:1"], "1001");
+        assert_eq!(kv.hdel_expired_blocks(&name, &snapshot, now).await.unwrap(), 0);
+        // Avoid rounded Lua numbers deleting a future i64 timestamp.
+        kv.hset_pairs(&name, &[("large", i64::MAX.to_string())]).await.unwrap();
+        assert_eq!(kv.hdel_expired_blocks(&name, &[("large".into(), i64::MAX.to_string())], i64::MAX - 1).await.unwrap(), 0);
+        kv.del(&name).await.unwrap();
+        kv.set(&name, "wrong type").await.unwrap();
+        assert!(kv.hdel_expired_blocks(&name, &snapshot, now).await.is_err());
+        kv.del(&name).await.unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]

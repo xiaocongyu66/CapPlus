@@ -142,6 +142,47 @@ pub fn err_response(code: ErrorCode, message: &str) -> Value {
     })
 }
 
+/// Invalid or over-budget stored PHC; distinct from a password mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPhc;
+
+/// Shared admin/legacy-secret policy. Bounds workspace, not process RSS.
+pub fn validate_argon2_phc(phc: &str) -> Result<argon2::PasswordHash<'_>, InvalidPhc> {
+    if phc.len() > 1024 { return Err(InvalidPhc); }
+    let parsed = argon2::PasswordHash::new(phc).map_err(|_| InvalidPhc)?;
+    argon2::Algorithm::try_from(parsed.algorithm).map_err(|_| InvalidPhc)?;
+    match parsed.version {
+        Some(16 | 19) => {},
+        _ => return Err(InvalidPhc),
+    }
+    // PHC costs must be explicit, not silently supplied by library defaults.
+    for name in ["m", "t", "p"] {
+        if parsed.params.get_decimal(name).is_none() {
+            return Err(InvalidPhc);
+        }
+    }
+    let mut salt_bytes = [0u8; 64];
+    let salt = parsed.salt.ok_or(InvalidPhc)?;
+    if salt.decode_b64(&mut salt_bytes).map_err(|_| InvalidPhc)?.len() < 8 {
+        return Err(InvalidPhc);
+    }
+    let params = argon2::Params::try_from(&parsed).map_err(|_| InvalidPhc)?;
+    if params.m_cost() > 65536 || params.t_cost() > 10 || params.p_cost() > 4
+        || parsed.salt.is_none() || parsed.hash.is_none()
+    { return Err(InvalidPhc); }
+    Ok(parsed)
+}
+
+pub fn verify_argon2(password: &str, phc: &str) -> Result<bool, InvalidPhc> {
+    use argon2::PasswordVerifier as _;
+    let parsed = validate_argon2_phc(phc)?;
+    match argon2::Argon2::default().verify_password(password.as_bytes(), &parsed) {
+        Ok(()) => Ok(true),
+        Err(argon2::password_hash::Error::Password) => Ok(false),
+        Err(_) => Err(InvalidPhc),
+    }
+}
+
 /// Outcome of checking a provided secret against the stored `secretHash`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretCheck {
@@ -167,14 +208,9 @@ pub fn check_secret(stored: &str, provided: &str) -> SecretCheck {
         return SecretCheck::Fast(bool::from(ok));
     }
     if stored.starts_with("$argon2") {
-        use argon2::PasswordVerifier as _;
-        let parsed = argon2::PasswordHash::new(stored);
-        return match parsed {
-            Ok(hash) => match argon2::Argon2::default().verify_password(provided.as_bytes(), &hash) {
-                Ok(()) => SecretCheck::Fast(true),
-                Err(_) => SecretCheck::Argon2Unsupported,
-            },
-            Err(_) => SecretCheck::Argon2Unsupported,
+        return match verify_argon2(provided, stored) {
+            Ok(true) => SecretCheck::Fast(true),
+            _ => SecretCheck::Argon2Unsupported,
         };
     }
     SecretCheck::Fast(false)
@@ -606,6 +642,30 @@ mod secret_tests {
             .to_string();
         assert_eq!(check_secret(&stored, "sk-legacy-secret"), SecretCheck::Fast(true));
         assert_eq!(check_secret(&stored, "nope"), SecretCheck::Argon2Unsupported);
+    }
+
+    #[test]
+    fn phc_policy_rejects_invalid_and_over_budget_without_work() {
+        let salt = SaltString::encode_b64(b"policy-test-salt").unwrap();
+        let stored = Argon2::default().hash_password(b"x", &salt).unwrap().to_string();
+        for (from, to) in [("m=19456", "m=65537"), ("t=2", "t=11"),
+            ("p=1", "p=5"), ("v=19", "v=20"), ("argon2id", "scrypt")] {
+            let invalid = stored.replace(from, to);
+            assert_ne!(invalid, stored);
+            assert!(validate_argon2_phc(&invalid).is_err(), "{invalid}");
+        }
+        for missing in ["m=19456,", "t=2,", ",p=1"] {
+            assert!(validate_argon2_phc(&stored.replace(missing, "")).is_err());
+        }
+        let short_salt = stored.replace(salt.as_str(), "YWJjZA");
+        assert!(validate_argon2_phc(&short_salt).is_err());
+        assert!(validate_argon2_phc(&"x".repeat(1025)).is_err());
+        assert!(validate_argon2_phc("$argon2id$v=19$m=32,t=1,p=1").is_err());
+        let legacy = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13,
+            argon2::Params::new(65536, 3, 4, None).unwrap())
+            .hash_password(b"legacy", &salt).unwrap().to_string();
+        assert_eq!(verify_argon2("legacy", &legacy), Ok(true));
+        assert_eq!(verify_argon2("wrong", &legacy), Ok(false));
     }
 
     #[test]

@@ -35,7 +35,7 @@ fn config_mobile() -> Value {
         "difficulty": 3, "challengeCount": 50, "saltSize": 32,
         "instrumentation": true, "obfuscationLevel": 3,
         "blockAutomatedBrowsers": false, "ratelimitMax": 50,
-        "ratelimitDuration": 10000, "corsOrigins": null,
+        "ratelimitDuration": 10000, "corsOrigins": ["mobile.example.com"],
         "blockNonBrowserUA": false, "requiredHeaders": null,
     })
 }
@@ -56,7 +56,7 @@ fn config_cdn() -> Value {
         "protocol": "sha256-pow", "difficulty": 3, "challengeCount": 40,
         "saltSize": 32, "instrumentation": false, "obfuscationLevel": 2,
         "blockAutomatedBrowsers": false, "ratelimitMax": null,
-        "ratelimitDuration": null, "corsOrigins": null,
+        "ratelimitDuration": null, "corsOrigins": ["docs.example.com"],
         "blockNonBrowserUA": false, "requiredHeaders": null,
     })
 }

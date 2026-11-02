@@ -121,13 +121,13 @@ pub(crate) async fn list(store: &AdminStore, site_key: &str) -> crate::AdminResp
 
     let now = util::now_ms();
     let mut out: Vec<Value> = Vec::new();
-    let mut stale: Vec<String> = Vec::new();
+    let mut stale: Vec<(String, String)> = Vec::new();
 
     for (field, value) in raw {
         let permanent = value == "0";
         let expires = value.parse::<i64>().unwrap_or(0);
         if !permanent && expires <= now {
-            stale.push(field);
+            stale.push((field, value));
             continue;
         }
         let (kind, target) = if let Some(rest) = field.strip_prefix("cidr:") {
@@ -148,11 +148,35 @@ pub(crate) async fn list(store: &AdminStore, site_key: &str) -> crate::AdminResp
     }
 
     if !stale.is_empty() {
-        let refs: Vec<&str> = stale.iter().map(String::as_str).collect();
-        let _ = store.hdel_fields(&format!("blocked:{site_key}"), &refs).await;
+        let _ = store.hdel_expired_blocks(&format!("blocked:{site_key}"), &stale, now).await;
     }
 
     ok(Value::Array(out))
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
+    async fn blocked_admin_expiry_cas() {
+        let store = AdminStore::connect(&std::env::var("CAP_TEST_REDIS_URL").expect("explicit isolated Redis required")).await.unwrap();
+        let site = format!("test:admin-expiry:{}:{}", std::process::id(), util::now_ms());
+        let name = format!("blocked:{site}");
+        store.hset_pairs(&name, &[("192.0.2.1", "1".into()), ("192.0.2.2", "1".into())]).await.unwrap();
+        let snapshot: Vec<_> = store.hgetall(&name).await.unwrap().into_iter().collect();
+        store.hset_pairs(&name, &[("192.0.2.1", "0".into())]).await.unwrap();
+        assert_eq!(store.hdel_expired_blocks(&name, &snapshot, util::now_ms()).await.unwrap(), 1);
+        let response = list(&store, &site).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.as_array().unwrap().len(), 1);
+        assert_eq!(store.hget(&name, "192.0.2.1").await.unwrap().as_deref(), Some("0"));
+        store.del(&name).await.unwrap();
+        store.set(&name, "wrong type").await.unwrap();
+        assert_eq!(list(&store, &site).await.status, 500);
+        store.del(&name).await.unwrap();
+    }
 }
 
 /// `GET /keys/:sk/geo-stats` — country / ASN / platform / OS tallies.
