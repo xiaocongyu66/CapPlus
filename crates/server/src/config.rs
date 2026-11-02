@@ -111,6 +111,9 @@ pub struct ProxySection {
     /// Intermediate proxy hops to peel from XFF (CAP_TRUSTED_PROXY_CIDRS).
     /// Does not grant trust to the immediate peer or bypass the proxy secret.
     pub trusted_proxy_cidrs: Vec<String>,
+    /// Direct peers allowed without a secret (CAP_TRUSTED_PEER_CIDRS).
+    /// Does not authorize intermediate XFF hops or bypass a configured secret.
+    pub trusted_peer_cidrs: Vec<String>,
     /// Header carrying the real client IP (`RATELIMIT_IP_HEADER`).
     pub ip_header: String,
 }
@@ -139,6 +142,9 @@ pub struct Settings {
     /// Intermediate proxy hops to peel from XFF (CAP_TRUSTED_PROXY_CIDRS).
     /// Does not grant trust to the immediate peer or bypass the proxy secret.
     pub trusted_proxy_cidrs: Vec<String>,
+    /// Direct peers allowed without a secret (CAP_TRUSTED_PEER_CIDRS).
+    /// Does not authorize intermediate XFF hops or bypass a configured secret.
+    pub trusted_peer_cidrs: Vec<String>,
     pub require_verify_session: bool,
 }
 
@@ -242,13 +248,35 @@ fn validate_proxy(proxy: &ProxySection) -> Result<(), String> {
         axum::http::HeaderName::from_bytes(proxy.ip_header.as_bytes())
             .map_err(|_| "invalid RATELIMIT_IP_HEADER / proxy.ip_header".to_string())?;
     }
-    for net in &proxy.trusted_proxy_cidrs {
+    validate_proxy_cidrs("trusted_proxy_cidrs", &proxy.trusted_proxy_cidrs)?;
+    validate_proxy_cidrs("trusted_peer_cidrs", &proxy.trusted_peer_cidrs)?;
+    if proxy.trust_proxy && proxy.proxy_secret.is_empty() && proxy.trusted_peer_cidrs.is_empty() {
+        return Err("trust_proxy requires proxy_secret or explicit trusted_peer_cidrs".into());
+    }
+    if !proxy.proxy_secret.is_empty() && proxy.proxy_secret.trim().is_empty() {
+        return Err("proxy_secret must not contain only whitespace".into());
+    }
+    Ok(())
+}
+
+fn validate_proxy_cidrs(name: &str, cidrs: &[String]) -> Result<(), String> {
+    for net in cidrs {
         let base = net.split('/').next().unwrap_or("");
-        if !crate::http_util::cidr_match(net, base) {
-            return Err(format!("invalid trusted proxy CIDR: {net:?}"));
+        let valid_prefix = net.split_once('/').is_none_or(|(_, prefix)| {
+            !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_digit())
+        });
+        if !valid_prefix || !crate::http_util::cidr_match(net, base) {
+            return Err(format!("invalid {name} CIDR: {net:?}"));
         }
     }
     Ok(())
+}
+
+fn parse_proxy_cidrs(name: &str, value: &str) -> Result<Vec<String>, String> {
+    // An explicitly empty env or empty element is an error, not a fallback.
+    let cidrs: Vec<_> = value.split(',').map(|s| s.trim().to_string()).collect();
+    validate_proxy_cidrs(name, &cidrs)?;
+    Ok(cidrs)
 }
 
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -389,9 +417,10 @@ pub fn init() -> Result<Settings, String> {
         proxy.ip_header = header;
     }
     if let Some(value) = strict_env("CAP_TRUSTED_PROXY_CIDRS")? {
-        // Empty elements (including an empty variable) are errors, not a
-        // silently truncated trust list. Use [] in TOML for the default.
-        proxy.trusted_proxy_cidrs = value.split(',').map(|s| s.trim().to_string()).collect();
+        proxy.trusted_proxy_cidrs = parse_proxy_cidrs("CAP_TRUSTED_PROXY_CIDRS", &value)?;
+    }
+    if let Some(value) = strict_env("CAP_TRUSTED_PEER_CIDRS")? {
+        proxy.trusted_peer_cidrs = parse_proxy_cidrs("CAP_TRUSTED_PEER_CIDRS", &value)?;
     }
     validate_proxy(&proxy)?;
 
@@ -428,6 +457,7 @@ pub fn init() -> Result<Settings, String> {
         proxy_secret: proxy.proxy_secret,
         require_network_fingerprint: proxy.require_network_fingerprint,
         trusted_proxy_cidrs: proxy.trusted_proxy_cidrs,
+        trusted_peer_cidrs: proxy.trusted_peer_cidrs,
         require_verify_session: proxy_env_bool(
             "CAP_REQUIRE_VSESS",
             file.server.verify_session.unwrap_or(true),
@@ -469,6 +499,73 @@ mod tests {
         assert!(
             toml::from_str::<FileConfig>("[proxy]\nrequire_network_fingerprint = 'true'").is_err()
         );
+    }
+
+    #[test]
+    fn peer_allowlist_is_required_only_without_secret() {
+        let mut proxy = ProxySection::default();
+        assert!(!proxy.trust_proxy);
+        assert!(validate_proxy(&proxy).is_ok());
+        proxy.trust_proxy = true;
+        assert!(validate_proxy(&proxy).is_err());
+        proxy.trusted_proxy_cidrs = vec!["10.0.0.0/8".into()];
+        assert!(validate_proxy(&proxy).is_err());
+        proxy.trusted_peer_cidrs = vec!["127.0.0.1/32".into(), "::ffff:10.0.0.1/128".into()];
+        assert!(validate_proxy(&proxy).is_ok());
+        proxy.require_network_fingerprint = true;
+        assert!(validate_proxy(&proxy).is_err());
+        proxy.proxy_secret = "secret".into();
+        assert!(validate_proxy(&proxy).is_ok());
+        proxy.trusted_peer_cidrs.clear();
+        assert!(validate_proxy(&proxy).is_ok());
+        proxy.require_network_fingerprint = false;
+        proxy.proxy_secret = "  ".into();
+        assert!(validate_proxy(&proxy).is_err());
+    }
+
+    #[test]
+    fn peer_and_hop_cidr_configuration_is_strict() {
+        for name in ["CAP_TRUSTED_PEER_CIDRS", "CAP_TRUSTED_PROXY_CIDRS"] {
+            for value in [
+                "",
+                " ",
+                ",",
+                "127.0.0.1,",
+                ",::1",
+                "::1,,127.0.0.1",
+                "bad",
+                "10.0.0.0/33",
+                "::/129",
+                "10.0.0.0/24/1",
+                "::1/",
+                "::1/-1",
+                "::1/+128",
+                "10.0.0.1/+32",
+            ] {
+                assert!(parse_proxy_cidrs(name, value).is_err(), "{name}: {value:?}");
+            }
+            assert_eq!(
+                parse_proxy_cidrs(name, " 127.0.0.1/32 , ::1/128 ").unwrap(),
+                vec!["127.0.0.1/32", "::1/128"]
+            );
+        }
+        for field in ["trusted_peer_cidrs", "trusted_proxy_cidrs"] {
+            for value in ["['']", "['bad']", "['::/129']", "[' 127.0.0.1 ']"] {
+                let file: FileConfig =
+                    toml::from_str(&format!("[proxy]\n{field} = {value}")).unwrap();
+                assert!(validate_proxy(&file.proxy).is_err());
+            }
+            for value in ["'127.0.0.1'", "[1]", "false"] {
+                assert!(
+                    toml::from_str::<FileConfig>(&format!("[proxy]\n{field} = {value}")).is_err()
+                );
+            }
+        }
+        let file: FileConfig = toml::from_str(
+            "[proxy]\ntrust_proxy = true\ntrusted_peer_cidrs = ['127.0.0.1', '::1/128']",
+        )
+        .unwrap();
+        assert!(validate_proxy(&file.proxy).is_ok());
     }
 
     #[cfg(unix)]

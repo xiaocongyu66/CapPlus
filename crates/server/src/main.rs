@@ -81,7 +81,6 @@ struct AppState {
     embed_widget_url: String,
     admin: Option<cap_admin::AdminStore>,
     admin_cfg: Arc<cap_admin::AdminConfig>,
-    assets: Arc<cap_assets::AssetCache>,
     releases: Arc<cap_assets::ReleaseStore>,
     kv: cap_kv::Kv,
     ipdb: Arc<cap_ipdb::IpDb>,
@@ -557,20 +556,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cap_admin::AdminStore::new(kv.clone()))
     };
 
-    let assets = Arc::new(cap_assets::AssetCache::new());
     if cfg.cdn_fallback {
-        let asset_cfg = cap_assets::AssetConfig {
-            cache_host: cfg.cache_host.clone(),
-            widget_version: cfg.widget_version.clone(),
-            wasm_version: cfg.wasm_version.clone(),
-        };
-        asset_cfg.warn_on_latest();
-        cap_assets::spawn_refresher(
-            assets.clone(),
-            asset_cfg,
-            Some(cfg.redis_url.clone()),
-            cap_assets::DEFAULT_REFRESH_INTERVAL,
-        );
+        eprintln!("[cap] ENABLE_ASSETS_SERVER/CDN fallback is deprecated and ignored; assets use the selected release or the embedded bundle");
     }
 
     let ipdb = Arc::new(
@@ -619,7 +606,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         embed_widget_url,
         admin: admin_store,
         admin_cfg: Arc::new(admin_cfg),
-        assets,
         releases,
         kv,
         ipdb,

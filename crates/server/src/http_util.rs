@@ -34,10 +34,22 @@ pub(crate) fn is_loopback_or_private(addr: &str) -> bool {
 
 pub(crate) fn proxy_trusted(headers: &HeaderMap, peer: &str) -> bool {
     let cfg = settings();
-    proxy_trusted_with(headers, peer, cfg.trust_proxy, &cfg.proxy_secret)
+    proxy_trusted_with(
+        headers,
+        peer,
+        cfg.trust_proxy,
+        &cfg.proxy_secret,
+        &cfg.trusted_peer_cidrs,
+    )
 }
 
-fn proxy_trusted_with(headers: &HeaderMap, peer: &str, enabled: bool, secret: &str) -> bool {
+fn proxy_trusted_with(
+    headers: &HeaderMap,
+    peer: &str,
+    enabled: bool,
+    secret: &str,
+    peer_cidrs: &[String],
+) -> bool {
     if !enabled {
         return false;
     }
@@ -60,7 +72,7 @@ fn proxy_trusted_with(headers: &HeaderMap, peer: &str, enabled: bool, secret: &s
                     == 0
             })
             .unwrap_or(false),
-        _ => is_loopback_or_private(peer),
+        _ => canonical_ip(peer).is_some_and(|ip| peer_cidrs.iter().any(|net| cidr_match(net, &ip))),
     }
 }
 
@@ -657,15 +669,106 @@ mod tests {
     }
 
     #[test]
+    fn direct_peer_and_intermediate_trust_are_isolated() {
+        let peers = vec!["10.0.0.1/32".into(), "::1/128".into()];
+        let hops = vec!["192.168.0.0/24".into()];
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.7, 192.168.0.2"),
+        );
+        for peer in [
+            "127.0.0.1",
+            "10.0.0.2",
+            "172.16.0.1",
+            "192.168.0.2",
+            "169.254.0.1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.2",
+            "not-an-ip",
+            "",
+        ] {
+            let trusted = proxy_trusted_with(&h, peer, true, "", &peers);
+            assert!(!trusted, "{peer}");
+            assert_eq!(
+                client_ip_with(&h, peer, trusted, "", &hops),
+                canonical_ip(peer).unwrap_or_else(|| peer.into())
+            );
+        }
+        for peer in ["10.0.0.1", "::ffff:10.0.0.1", "::1"] {
+            assert!(!proxy_trusted_with(&h, peer, true, "", &[]));
+            assert!(!proxy_trusted_with(&h, peer, false, "", &peers));
+            let trusted = proxy_trusted_with(&h, peer, true, "", &peers);
+            assert!(trusted);
+            assert_eq!(client_ip_with(&h, peer, trusted, "", &hops), "203.0.113.7");
+            assert_eq!(client_ip_with(&h, peer, trusted, "", &[]), "192.168.0.2");
+        }
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.7, 10.0.0.1"),
+        );
+        // A directly authorized peer is not automatically an authorized XFF hop.
+        assert_eq!(client_ip_with(&h, "::1", true, "", &hops), "10.0.0.1");
+        assert!(proxy_trusted_with(
+            &h,
+            "192.0.2.9",
+            true,
+            "",
+            &["::ffff:192.0.2.0/120".into()]
+        ));
+    }
+
+    #[test]
+    fn duplicate_or_bad_secret_cannot_use_peer_allowlist() {
+        let peers = vec!["127.0.0.1/32".into()];
+        let mut h = HeaderMap::new();
+        for value in ["wrong", "", "secret, secret"] {
+            h.insert("x-cap-proxy-secret", HeaderValue::from_str(value).unwrap());
+            assert!(!proxy_trusted_with(&h, "127.0.0.1", true, "secret", &peers));
+        }
+        h.insert(
+            "x-cap-proxy-secret",
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert!(!proxy_trusted_with(&h, "127.0.0.1", true, "secret", &peers));
+        h.insert("x-cap-proxy-secret", HeaderValue::from_static("secret"));
+        assert!(proxy_trusted_with(&h, "127.0.0.1", true, "secret", &peers));
+        h.append("x-cap-proxy-secret", HeaderValue::from_static("secret"));
+        for secret in ["secret", ""] {
+            let trusted = proxy_trusted_with(&h, "127.0.0.1", true, secret, &peers);
+            assert!(!trusted);
+            assert_eq!(
+                network_signals_with(&h, trusted, secret, true),
+                Err(NetworkSignalError::Required)
+            );
+        }
+    }
+
+    #[test]
     fn proxy_secret_and_ip_headers_do_not_expand_trust() {
         let mut h = HeaderMap::new();
-        assert!(!proxy_trusted_with(&h, "127.0.0.1", true, "secret"));
-        assert!(!proxy_trusted_with(&h, "203.0.113.1", true, ""));
-        assert!(proxy_trusted_with(&h, "127.0.0.1", true, ""));
+        let peers = vec!["127.0.0.1/32".into()];
+        assert!(!proxy_trusted_with(&h, "127.0.0.1", true, "secret", &peers));
+        assert!(!proxy_trusted_with(&h, "203.0.113.1", true, "", &peers));
+        assert!(proxy_trusted_with(&h, "127.0.0.1", true, "", &peers));
         h.insert("x-cap-proxy-secret", HeaderValue::from_static("secret"));
-        assert!(proxy_trusted_with(&h, "203.0.113.1", true, "secret"));
-        assert!(!proxy_trusted_with(&h, "127.0.0.1", false, "secret"));
-        assert!(!proxy_trusted_with(&h, "127.0.0.1", true, "wrong"));
+        assert!(proxy_trusted_with(
+            &h,
+            "203.0.113.1",
+            true,
+            "secret",
+            &peers
+        ));
+        assert!(!proxy_trusted_with(
+            &h,
+            "127.0.0.1",
+            false,
+            "secret",
+            &peers
+        ));
+        assert!(!proxy_trusted_with(&h, "127.0.0.1", true, "wrong", &peers));
         h.insert("x-forwarded-for", HeaderValue::from_static("6.6.6.6"));
         h.append("x-forwarded-for", HeaderValue::from_static("10.1.2.3"));
         assert_eq!(

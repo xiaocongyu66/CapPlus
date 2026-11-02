@@ -335,25 +335,32 @@ pub(crate) async fn get_ratelimit(store: &AdminStore) -> AdminResponse {
     }
 }
 
-pub(crate) async fn put_ratelimit(store: &AdminStore, body: &Value) -> AdminResponse {
-    let obj = body_object(body);
+fn parse_ratelimit(body: &Value) -> Result<Value, &'static str> {
+    let obj = body.as_object().ok_or("settings must be an object")?;
 
     if let Some(v) = obj.get("max").filter(|v| !v.is_null()) {
-        match v.as_f64() {
-            Some(n) if (1.0..=10_000.0).contains(&n) => {}
-            _ => return bad_request("max must be a number between 1 and 10000"),
+        match v.as_i64() {
+            Some(n) if (1..=10_000).contains(&n) => {}
+            _ => return Err("max must be an integer between 1 and 10000"),
         }
     }
     if let Some(v) = obj.get("duration").filter(|v| !v.is_null()) {
-        match v.as_f64() {
-            Some(n) if (1_000.0..=3_600_000.0).contains(&n) => {}
-            _ => return bad_request("duration must be a number between 1000 and 3600000"),
+        match v.as_i64() {
+            Some(n) if (1_000..=3_600_000).contains(&n) => {}
+            _ => return Err("duration must be an integer between 1000 and 3600000"),
         }
     }
 
     let max = obj.get("max").cloned().unwrap_or_else(|| json!(30));
     let duration = obj.get("duration").cloned().unwrap_or_else(|| json!(5000));
-    let new_settings = json!({ "max": max, "duration": duration });
+    Ok(json!({ "max": max, "duration": duration }))
+}
+
+pub(crate) async fn put_ratelimit(store: &AdminStore, body: &Value) -> AdminResponse {
+    let new_settings = match parse_ratelimit(body) {
+        Ok(value) => value,
+        Err(reason) => return bad_request(reason),
+    };
     if store
         .set("settings:ratelimit", &new_settings.to_string())
         .await
@@ -396,21 +403,28 @@ pub(crate) async fn get_filtering(store: &AdminStore) -> AdminResponse {
     }
 }
 
-pub(crate) async fn put_filtering(store: &AdminStore, body: &Value) -> AdminResponse {
-    let obj = body_object(body);
-    let block = obj
-        .get("blockNonBrowserUA")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+fn parse_filtering(body: &Value) -> Result<Value, &'static str> {
+    let obj = body.as_object().ok_or("settings must be an object")?;
+    let block = match obj.get("blockNonBrowserUA") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or("blockNonBrowserUA must be a boolean")?,
+    };
     let required_headers = match obj.get("requiredHeaders") {
         None | Some(Value::Null) => json!([]),
         Some(Value::Array(a)) if a.iter().all(|v| v.is_string()) => Value::Array(a.clone()),
-        Some(_) => return bad_request("requiredHeaders must be an array of strings"),
+        Some(_) => return Err("requiredHeaders must be an array of strings"),
     };
-    let new_settings = json!({
+    Ok(json!({
         "blockNonBrowserUA": block,
         "requiredHeaders": required_headers,
-    });
+    }))
+}
+
+pub(crate) async fn put_filtering(store: &AdminStore, body: &Value) -> AdminResponse {
+    let new_settings = match parse_filtering(body) {
+        Ok(value) => value,
+        Err(reason) => return bad_request(reason),
+    };
     if store
         .set("settings:filtering", &new_settings.to_string())
         .await
@@ -502,4 +516,59 @@ pub(crate) async fn integrity_post(store: &AdminStore, body: &Value) -> AdminRes
         "versions": { "widget": "latest", "wasm": "latest" },
     });
     ok(json!({ "success": true, "baseline": baseline }))
+}
+
+#[cfg(test)]
+mod security_settings_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated isolated CAP_TEST_REDIS_URL"]
+    async fn security_settings_write_status_and_persistence() {
+        let store = AdminStore::connect(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        for bad in [json!(null), json!({"max": 30.0}), json!({"duration": "5000"}), json!({"max": 0})] {
+            assert_eq!(put_ratelimit(&store, &bad).await.status, 400);
+        }
+        for bad in [json!(null), json!({"blockNonBrowserUA": "false"}), json!({"requiredHeaders": ["accept", 1]})] {
+            assert_eq!(put_filtering(&store, &bad).await.status, 400);
+        }
+        let rl = json!({"max": 30, "duration": 5000});
+        assert_eq!(put_ratelimit(&store, &rl).await.status, 200);
+        assert_eq!(read_json(&store, "settings:ratelimit").await.unwrap(), rl);
+        let filtering = json!({"blockNonBrowserUA": true, "requiredHeaders": ["accept-language"]});
+        assert_eq!(put_filtering(&store, &filtering).await.status, 200);
+        assert_eq!(read_json(&store, "settings:filtering").await.unwrap(), filtering);
+        assert_eq!(put_filtering(&store, &json!({"blockNonBrowserUA": null})).await.status, 200);
+        assert_eq!(read_json(&store, "settings:filtering").await.unwrap(),
+            json!({"blockNonBrowserUA": false, "requiredHeaders": []}));
+    }
+
+    #[test]
+    fn filtering_write_contract() {
+        for value in [json!(null), json!([]), json!({"blockNonBrowserUA": "false"}),
+            json!({"blockNonBrowserUA": 1}),
+            json!({"requiredHeaders": ["accept", 1]}), json!({"requiredHeaders": false})] {
+            assert!(parse_filtering(&value).is_err(), "{value}");
+        }
+        for value in [json!({}), json!({"requiredHeaders": null}), json!({"blockNonBrowserUA": null})] {
+            assert_eq!(parse_filtering(&value).unwrap(), json!({"blockNonBrowserUA": false, "requiredHeaders": []}));
+        }
+        let dashboard = json!({"blockNonBrowserUA": true, "requiredHeaders": ["accept-language"]});
+        assert_eq!(parse_filtering(&dashboard).unwrap(), dashboard);
+    }
+
+    #[test]
+    fn ratelimit_write_integer_bounds_and_null() {
+        assert_eq!(parse_ratelimit(&json!({})).unwrap(), json!({"max": 30, "duration": 5000}));
+        let nulls = json!({"max": null, "duration": null});
+        assert_eq!(parse_ratelimit(&nulls).unwrap(), nulls);
+        for value in [json!(null), json!([]), json!(true)] { assert!(parse_ratelimit(&value).is_err()); }
+        for (field, min, max) in [("max", 1, 10000), ("duration", 1000, 3600000)] {
+            for n in [min, max] { assert!(parse_ratelimit(&json!({field: n})).is_ok()); }
+            for bad in [json!(min - 1), json!(max + 1), json!(i64::MIN), json!(u64::MAX),
+                json!(1.5), json!(5000.0), json!("5000"), json!(false), json!([]), json!({})] {
+                assert!(parse_ratelimit(&json!({field: bad})).is_err(), "{field}: {bad}");
+            }
+        }
+    }
 }

@@ -42,9 +42,14 @@ default `redis://127.0.0.1:6379`).
 
 ### Reverse proxy: Caddy / Traefik / nginx
 
-Set `CAP_TRUST_PROXY=true` and `CAP_PROXY_SECRET=<random>` so the server uses
-the proxy's forwarded client IP (rightmost non-private hop) and refuses
-forwarded headers from anyone who does not present the secret.
+建议设置 `CAP_TRUST_PROXY=true` 和 `CAP_PROXY_SECRET=<random>`，并让反代覆盖
+`x-cap-proxy-secret`。配置 secret 后必须匹配，地址白名单不能绕过错误或缺失的 secret。
+
+无 secret 的部署必须显式设置 `CAP_TRUSTED_PEER_CIDRS`，例如仅本机反代使用
+`127.0.0.1/32,::1/128`。该名单只授权直接连接的代理；私网和回环地址不再自动可信。
+启用代理信任却未配置 secret 或直接来源名单会启动失败。
+`CAP_TRUSTED_PROXY_CIDRS` 仅指定 XFF 中可剥离的中间代理跳，不能替代直接来源名单。
+默认取最右客户端地址（包括私网客户端），仅剥离显式可信中间跳。
 
 ```caddyfile
 # Caddyfile
@@ -164,7 +169,12 @@ widget (`widget.js`, `cap_wasm.js`, `*.wasm`, `embed.js`, …). The server:
 2. keeps the original zip under `cappro/releases/<id>/source.zip`,
 3. obfuscates + encrypts every `.js` file automatically (idempotent — already
    protected files are left alone),
-4. serves the processed files from `/assets/*`, taking priority over the CDN.
+4. 从 `/assets/*` 提供当前选择的发布资源。未选择发布时使用二进制内嵌资源；
+   已选择发布缺文件返回 404，配置损坏返回 503，不从 CDN 或其他版本补齐。
+
+服务端不再启动后台 CDN 刷新。旧 `ENABLE_ASSETS_SERVER`、`CACHE_HOST`、
+`WIDGET_VERSION`、`WASM_VERSION` 配置不再触发该刷新；自定义 `EMBED_WIDGET_URL`
+仍可能指向外部资源，严格离线部署需自行确认其来源。
 
 Every older release stays on disk, so the panel can activate any of them
 (one-click rollback) or delete the ones no longer needed.

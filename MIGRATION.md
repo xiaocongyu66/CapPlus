@@ -14,6 +14,13 @@
 
 ---
 
+## 安全配置升级检查
+
+- 无 secret 的代理部署需配置 `CAP_TRUSTED_PEER_CIDRS`，范围只包含实际直连代理；仅配置中间跳名单不够。启用信任却无 secret 和直接名单时启动失败。
+- `settings:filtering` 的开关必须是 JSON boolean，请求头列表必须全是字符串；`settings:ratelimit` 的 max/duration 必须为整数。历史浮点值如 `30.0` 应迁移为 `30`，字符串布尔应修正，不能再依赖错误配置静默回退。
+- 配置不存在、合法字段级 null 保持兼容；顶层 null 和损坏配置返回不可用。运行时既有 max<=0 禁用、duration 最小1ms 语义保持，管理写入仍遵循原有正数范围。
+- `/assets/*` 仅使用面板选择的发布，未选择时使用当前二进制内嵌完整资源。显式发布缺文件返回404，配置损坏返回503，不跨来源补齐。后台 CDN 刷新已移除；自定义外部 widget URL 仍由部署者控制。
+
 ## 1. 能力对照
 
 | 能力 | Bun 版 | Rust 版 |
@@ -27,7 +34,7 @@
 | verified-embed（`/embed.js`、`/embed/:siteKey`） | ✅ | ✅ |
 | `/siteverify`（Turnstile 契约）、`/validate` | ✅ | ✅ |
 | 管理 API：login / keys / settings / sessions / apikeys / integrity / about | ✅ | ✅ |
-| 资产分发 `/assets/*` | ✅（Redis 缓存） | ✅（内存缓存 + 24h 刷新） |
+| 资产分发 `/assets/*` | ✅（Redis 缓存） | ✅（活动发布或二进制内嵌资源，无后台 CDN 刷新） |
 | IP 地理库、share links、demo 模式、登录限流 | ✅ | ❌（见 §6） |
 
 Rust 版**只支持 verified-embed**：`redeem` 必须来自 Cap 自己 origin 的 iframe
@@ -43,10 +50,12 @@ Rust 版**只支持 verified-embed**：`redeem` 必须来自 Cap 自己 origin �
 | `REDIS_URL` | 与 Bun 版共用同一个实例 |
 | `SERVER_PORT` | 监听端口（默认 3000） |
 | `ADMIN_KEY` | 管理密钥；不设则管理 API 返回 503 |
-| `ENABLE_ASSETS_SERVER=true` | 启动时从 CDN 拉取 widget/wasm 并缓存（`/assets/*`） |
-| `CACHE_HOST` / `WIDGET_VERSION` / `WASM_VERSION` | 资产来源（默认 jsDelivr / latest，生产请固定版本） |
+| `ENABLE_ASSETS_SERVER` | 已弃用并忽略，不再启动后台 CDN 刷新 |
+| `CACHE_HOST` / `WIDGET_VERSION` / `WASM_VERSION` | 保留旧配置解析，不再用于服务端资源下载 |
 | `EMBED_WIDGET_URL` | 覆盖 embed 页面里组件的 URL（默认 `/assets/widget.js`） |
-| `CAP_TRUST_PROXY` + `CAP_PROXY_SECRET` | 反代信任规则：无 secret 时只信任本机/内网对端 |
+| `CAP_TRUST_PROXY` + `CAP_PROXY_SECRET` | 启用反代信任；配置 secret 时必须正确匹配，地址名单不能绕过 |
+| `CAP_TRUSTED_PEER_CIDRS` | 无 secret 时必填的直接代理来源名单，逗号分隔；不再默认信任私网或回环 |
+| `CAP_TRUSTED_PROXY_CIDRS` | 仅用于剥离 XFF 中间代理跳，不能授权直接连接来源 |
 | `RUST_LOG` | 未使用；日志走 stderr（`[redeem] …`、`[cap] assets …`） |
 
 ---
@@ -59,7 +68,8 @@ Rust 版**只支持 verified-embed**：`redeem` 必须来自 Cap 自己 origin �
 Environment=REDIS_URL=redis://127.0.0.1:6379
 Environment=SERVER_PORT=3000
 Environment=ADMIN_KEY=change-me
-Environment=ENABLE_ASSETS_SERVER=true
+Environment=CAP_TRUST_PROXY=true
+Environment=CAP_TRUSTED_PEER_CIDRS=127.0.0.1/32,::1/128
 ExecStart=/usr/local/bin/cap-server
 Restart=always
 MemoryMax=128M

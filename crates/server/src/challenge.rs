@@ -18,7 +18,6 @@ use crate::integrity::{embed_parent, load_integrity, remember_challenge_env, sea
 use crate::{
     ensure_rsw_keypair, is_blocked, rate_allowed, rsw_minter, settings, v2, AppState,
     CHALLENGE_TTL_MS,
-    DEFAULT_RL_MAX, DEFAULT_RL_WINDOW_MS,
 };
 
 /// Append the generated instrumentation challenge (script + sealed meta) when
@@ -212,20 +211,12 @@ pub(crate) async fn challenge_inner(
             .into_response();
     }
     // Per-key limits win; otherwise the global `settings:ratelimit` applies.
-    let global_rl_raw = match st.cache.setting_checked(&st.kv, "settings:ratelimit").await {
+    let (max, window) = match st.cache.setting_optional(&st.kv, "settings:ratelimit").await
+        .and_then(|v| crate::cache::effective_ratelimit(v.as_ref(), &cfg)) {
         Ok(value) => value,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "store_unavailable"}))).into_response(),
     };
-    let global_rl = (!global_rl_raw.is_null()).then_some(global_rl_raw);
-    let max = cfg
-        .ratelimit_max
-        .or_else(|| global_rl.as_ref().and_then(|v| v.get("max").and_then(Value::as_i64)))
-        .unwrap_or(DEFAULT_RL_MAX);
-    let window = cfg
-        .ratelimit_duration
-        .or_else(|| global_rl.as_ref().and_then(|v| v.get("duration").and_then(Value::as_i64)))
-        .unwrap_or(DEFAULT_RL_WINDOW_MS);
     let allowed = rate_allowed(&st, &format!("challenge:{site_key}"), &ip, window, max).await;
     if !allowed {
         st.metrics.incr(

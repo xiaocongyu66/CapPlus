@@ -290,6 +290,45 @@ impl Kv {
         Ok(n == 1)
     }
 
+    /// Confirm a verified TOTP snapshot and claim the legacy counter marker in
+    /// one atomic operation. A completed rotation/disable rejects stale work;
+    /// a claim completed first remains a successful authentication.
+    pub async fn claim_totp(
+        &self,
+        name: &str,
+        expected_secret: &str,
+        counter: u64,
+        secs: i64,
+    ) -> KvResult<bool> {
+        let mut conn = self.conn.clone();
+        let n: i64 = redis::Script::new(r#"
+            local enabled = redis.call('HGET', KEYS[1], 'totpEnabled')
+            if not enabled then
+                if redis.call('HEXISTS', KEYS[1], 'totpSecret') == 1
+                    or redis.call('HEXISTS', KEYS[1], 'recovery') == 1
+                    or redis.call('HEXISTS', KEYS[1], 'recoveryVersion') == 1 then
+                    return redis.error_reply('missing TOTP enabled flag')
+                end
+                return 0
+            end
+            -- Explicit false is a supported disabled state, even with legacy material.
+            if enabled == 'false' then return 0 end
+            if enabled ~= 'true' then return redis.error_reply('invalid TOTP enabled flag') end
+            local secret = redis.call('HGET', KEYS[1], 'totpSecret')
+            if not secret or secret == '' then return redis.error_reply('missing TOTP secret') end
+            if secret ~= ARGV[1] then return 0 end
+            if redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[2]) then return 1 end
+            return 0
+        "#)
+        .key(name)
+        .key(format!("2fa:totp-used:{counter}"))
+        .arg(expected_secret)
+        .arg(secs.max(1))
+        .invoke_async(&mut conn)
+        .await?;
+        Ok(n == 1)
+    }
+
     /// Publish a verified setup only while its unique pending secret is still
     /// current. Setup replaces this generation token; disable deletes it;
     /// successful enable consumes it. Stale Argon work cannot re-enable 2FA.
@@ -400,6 +439,47 @@ impl Kv {
 #[cfg(test)]
 mod atomic_tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
+    async fn atomic_totp_claim() {
+        let kv = Kv::connect_redis(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        let name = &format!("totp-claim-test:{}", std::process::id());
+        let counter = 9_000_000_000;
+        let marker = &format!("2fa:totp-used:{counter}");
+        kv.hset_pairs(name, &[("totpEnabled", "true".into()), ("totpSecret", "old".into())]).await.unwrap();
+        // Deterministic interleaving: snapshot/verification precedes rotation,
+        // but its claim runs only after rotation has completed.
+        let snapshot = kv.hget(name, "totpSecret").await.unwrap().unwrap();
+        kv.hset_pairs(name, &[("totpSecret", "new".into())]).await.unwrap();
+        assert!(!kv.claim_totp(name, &snapshot, counter, 120).await.unwrap());
+        assert!(!kv.exists(marker).await.unwrap());
+        kv.hdel_fields(name, &["totpEnabled", "totpSecret"]).await.unwrap();
+        assert!(!kv.claim_totp(name, "new", counter, 120).await.unwrap());
+        kv.hset_pairs(name, &[("totpEnabled", "true".into()), ("totpSecret", "new".into())]).await.unwrap();
+        let (a, b) = tokio::join!(kv.claim_totp(name, "new", counter, 120), kv.claim_totp(name, "new", counter, 120));
+        assert_ne!(a.unwrap(), b.unwrap());
+        let ttl: i64 = kv.query(redis::cmd("TTL").arg(marker).clone()).await.unwrap();
+        assert!((1..=120).contains(&ttl));
+        // A later disable does not retract the completed claim or its marker.
+        kv.del(name).await.unwrap();
+        assert_eq!(kv.get(marker).await.unwrap().as_deref(), Some("1"));
+        kv.hset_pairs(name, &[("totpEnabled", "true".into()), ("totpSecret", "new".into())]).await.unwrap();
+        kv.set_ex(marker, "legacy", 80).await.unwrap();
+        assert!(!kv.claim_totp(name, "new", counter, 120).await.unwrap());
+        assert_eq!(kv.get(marker).await.unwrap().as_deref(), Some("legacy"));
+        let ttl: i64 = kv.query(redis::cmd("TTL").arg(marker).clone()).await.unwrap();
+        assert!((1..=80).contains(&ttl));
+        kv.hset_pairs(name, &[("totpEnabled", "broken".into())]).await.unwrap();
+        assert!(kv.claim_totp(name, "new", counter, 120).await.is_err());
+        kv.hdel_fields(name, &["totpEnabled"]).await.unwrap();
+        assert!(kv.claim_totp(name, "new", counter, 120).await.is_err());
+        kv.del(name).await.unwrap();
+        kv.set(name, "wrong type").await.unwrap();
+        assert!(kv.claim_totp(name, "new", counter, 120).await.is_err());
+        kv.del(name).await.unwrap();
+        kv.del(marker).await.unwrap();
+    }
 
     // Explicit opt-in only: never connect to a default or shared Redis.
     #[tokio::test]

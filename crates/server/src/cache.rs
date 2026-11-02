@@ -76,6 +76,57 @@ impl BlockList {
     }
 }
 
+/// `None` means absent storage; an explicitly stored null is invalid.
+fn settings_object(value: Option<&serde_json::Value>) -> Result<Option<&serde_json::Map<String, serde_json::Value>>, &'static str> {
+    value.map(|v| v.as_object().ok_or("setting_invalid")).transpose()
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Filtering {
+    pub block_ua: bool,
+    pub required_headers: Vec<String>,
+}
+
+pub(crate) fn parse_filtering(value: Option<&serde_json::Value>) -> Result<Filtering, &'static str> {
+    let Some(obj) = settings_object(value)? else { return Ok(Filtering::default()); };
+    let block_ua = match obj.get("blockNonBrowserUA") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v.as_bool().ok_or("setting_invalid")?,
+    };
+    let required_headers = match obj.get("requiredHeaders") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(v) => v.as_array().ok_or("setting_invalid")?.iter()
+            .map(|v| v.as_str().map(str::to_owned).ok_or("setting_invalid"))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok(Filtering { block_ua, required_headers })
+}
+
+/// Persisted limits allow signed i64 values: max <= 0 disables the limiter,
+/// and the runtime clamps duration to at least 1 ms. Admin writes stay stricter.
+pub(crate) fn parse_ratelimit(value: Option<&serde_json::Value>) -> Result<(i64, i64), &'static str> {
+    let obj = settings_object(value)?;
+    let integer = |name, default| match obj.and_then(|o| o.get(name)) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(v) => v.as_i64().ok_or("setting_invalid"),
+    };
+    Ok((integer("max", crate::DEFAULT_RL_MAX)?, integer("duration", crate::DEFAULT_RL_WINDOW_MS)?))
+}
+
+pub(crate) fn effective_filtering(value: Option<&serde_json::Value>, cfg: &cap_store::KeyConfig) -> Result<Filtering, &'static str> {
+    let mut global = parse_filtering(value)?;
+    global.block_ua = cfg.block_non_browser_ua.unwrap_or(global.block_ua);
+    if let Some(required) = &cfg.required_headers {
+        global.required_headers = required.clone();
+    }
+    Ok(global)
+}
+
+pub(crate) fn effective_ratelimit(value: Option<&serde_json::Value>, cfg: &cap_store::KeyConfig) -> Result<(i64, i64), &'static str> {
+    let (max, duration) = parse_ratelimit(value)?;
+    Ok((cfg.ratelimit_max.unwrap_or(max), cfg.ratelimit_duration.unwrap_or(duration)))
+}
+
 pub struct ConfigCache {
     keys: Cache<String, Option<Arc<KeyInfo>>>,
     settings: Cache<String, Option<serde_json::Value>>,
@@ -173,5 +224,94 @@ impl ConfigCache {
         self.keys.invalidate_all();
         self.settings.invalidate_all();
         self.blocked.invalidate_all();
+    }
+}
+
+#[cfg(test)]
+mod security_settings_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated isolated CAP_TEST_REDIS_URL"]
+    async fn security_settings_checked_storage_errors() {
+        let kv = Kv::connect_redis(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        let name = format!("test:settings:{}", cap_core::random_hex(16));
+        let cache = ConfigCache::new();
+        assert_eq!(cache.setting_optional(&kv, &name).await.unwrap(), None);
+        for raw in ["null", "[]", "{\"max\":\"30\"}", "{\"duration\":1.5}"] {
+            kv.set(&name, raw).await.unwrap();
+            cache.clear();
+            let value = cache.setting_optional(&kv, &name).await.unwrap();
+            assert!(parse_ratelimit(value.as_ref()).is_err());
+        }
+        kv.set(&name, "not json").await.unwrap();
+        cache.clear();
+        assert!(cache.setting_optional(&kv, &name).await.is_err());
+        kv.del(&name).await.unwrap();
+        kv.hset_pairs(&name, &[("wrong", "type".into())]).await.unwrap();
+        assert!(cache.setting_optional(&kv, &name).await.is_err());
+        kv.del(&name).await.unwrap();
+        kv.set(&name, "{}").await.unwrap();
+        assert!(parse_ratelimit(cache.setting_optional(&kv, &name).await.unwrap().as_ref()).is_ok());
+        kv.del(&name).await.unwrap();
+    }
+
+    #[test]
+    fn filtering_types_defaults_and_null() {
+        assert_eq!(parse_filtering(None).unwrap(), Filtering::default());
+        for value in [json!({}), json!({"requiredHeaders": null}), json!({"blockNonBrowserUA": null})] {
+            assert_eq!(parse_filtering(Some(&value)).unwrap(), Filtering::default());
+        }
+        for value in [Value::Null, json!([]), json!({"blockNonBrowserUA": "false"}),
+            json!({"blockNonBrowserUA": 0}),
+            json!({"requiredHeaders": ["accept", false]}), json!({"requiredHeaders": "accept"})] {
+            assert!(parse_filtering(Some(&value)).is_err(), "{value}");
+        }
+        assert_eq!(parse_filtering(Some(&json!({"blockNonBrowserUA": true, "requiredHeaders": ["accept"]}))).unwrap(),
+            Filtering { block_ua: true, required_headers: vec!["accept".into()] });
+    }
+
+    #[test]
+    fn ratelimit_integer_contract_and_disabled_runtime() {
+        let defaults = (crate::DEFAULT_RL_MAX, crate::DEFAULT_RL_WINDOW_MS);
+        assert_eq!(parse_ratelimit(None).unwrap(), defaults);
+        for value in [json!({}), json!({"max": null, "duration": null})] {
+            assert_eq!(parse_ratelimit(Some(&value)).unwrap(), defaults);
+        }
+        for field in ["max", "duration"] {
+            for bad in [json!(true), json!("30"), json!([]), json!({}), json!(30.0), json!(1.5), json!(u64::MAX)] {
+                assert!(parse_ratelimit(Some(&json!({field: bad}))).is_err());
+            }
+            for n in [i64::MIN, -1, 0, 1, i64::MAX] {
+                assert!(parse_ratelimit(Some(&json!({field: n}))).is_ok());
+            }
+        }
+        assert!(parse_ratelimit(Some(&Value::Null)).is_err());
+        let limiter = crate::ratelimit::LocalLimiter::new();
+        for max in [i64::MIN, -1, 0] {
+            let (max, duration) = parse_ratelimit(Some(&json!({"max": max, "duration": i64::MIN}))).unwrap();
+            for _ in 0..100 { assert!(limiter.hit("disabled", "127.0.0.1", duration, max)); }
+        }
+        // Nonpositive duration is clamped by the unchanged runtime, not rejected.
+        for duration in [i64::MIN, -1, 0, 1] {
+            assert!(limiter.hit(&duration.to_string(), "127.0.0.1", duration, 1));
+        }
+    }
+
+    #[test]
+    fn validate_global_before_key_override() {
+        let cfg = cap_store::KeyConfig {
+            block_non_browser_ua: Some(false), required_headers: Some(vec![]),
+            ratelimit_max: Some(0), ratelimit_duration: Some(-1),
+            ..Default::default()
+        };
+        assert!(effective_filtering(Some(&json!({"requiredHeaders": ["accept", 1]})), &cfg).is_err());
+        assert!(effective_filtering(Some(&json!({"blockNonBrowserUA": "false"})), &cfg).is_err());
+        assert!(effective_ratelimit(Some(&json!({"max": 1.5})), &cfg).is_err());
+        assert!(effective_ratelimit(Some(&json!({"duration": "5000"})), &cfg).is_err());
+        assert_eq!(effective_filtering(Some(&json!({"blockNonBrowserUA": true, "requiredHeaders": ["accept"]})), &cfg).unwrap(), Filtering::default());
+        assert_eq!(effective_ratelimit(Some(&json!({"max": 30, "duration": 5000})), &cfg).unwrap(), (0, -1));
+        assert_eq!(effective_ratelimit(None, &cap_store::KeyConfig::default()).unwrap(), (crate::DEFAULT_RL_MAX, crate::DEFAULT_RL_WINDOW_MS));
     }
 }

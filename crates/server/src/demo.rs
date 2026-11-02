@@ -221,26 +221,15 @@ pub(crate) fn is_browser_ua(ua: &str) -> bool {
 /// Per-key filtering: block non-browser UAs and requests missing the
 /// configured headers. Global settings apply unless the key overrides them.
 pub(crate) async fn filter_request(st: &AppState, cfg: &KeyConfig, headers: &HeaderMap, site_key: &str) -> Option<Response> {
-    let global = match st.cache.setting_checked(&st.kv, "settings:filtering").await {
+    let global = match st.cache.setting_optional(&st.kv, "settings:filtering").await
+        .and_then(|v| crate::cache::effective_filtering(v.as_ref(), cfg)) {
         Ok(global) => global,
         Err(_) => return Some((StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "store_unavailable"}))).into_response()),
     };
 
-    let block_ua = cfg
-        .block_non_browser_ua
-        .or_else(|| global.get("blockNonBrowserUA").and_then(Value::as_bool))
-        .unwrap_or(false);
-    let required: Vec<String> = cfg
-        .required_headers
-        .clone()
-        .or_else(|| {
-            global
-                .get("requiredHeaders")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        })
-        .unwrap_or_default();
+    let block_ua = global.block_ua;
+    let required = &global.required_headers;
 
     let ua = header_str(headers, "user-agent");
     let blocked = (block_ua && !is_browser_ua(&ua))

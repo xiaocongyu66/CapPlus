@@ -194,19 +194,27 @@ async fn check_second_factor_at(
         Ok(h) => h,
         Err(_) => return Err(crate::internal()),
     };
-    if h.get("totpEnabled").map(|v| v == "true") != Some(true) {
-        return Ok(true);
+    match h.get("totpEnabled").map(String::as_str) {
+        // Explicit false remains a supported disabled state even if a legacy
+        // writer retained secret/recovery fields. Missing is not equivalent.
+        Some("false") => return Ok(true),
+        None if !["totpSecret", "recovery", "recoveryVersion"]
+            .iter().any(|key| h.contains_key(*key)) => return Ok(true),
+        Some("true") => {
+            let valid_secret = h.get("totpSecret")
+                .and_then(|s| BASE32_NOPAD.decode(s.as_bytes()).ok())
+                .is_some_and(|bytes| !bytes.is_empty());
+            if !valid_secret { return Err(internal()); }
+        }
+        _ => return Err(internal()),
     }
 
     if let Some(code) = body.get("code").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
         if let Some(secret) = h.get("totpSecret") {
             if let Some(counter) = matching_counter(secret, code) {
-                // One login per time step: an observed code cannot be
-                // replayed inside its validity window. SET NX makes the
-                // claim atomic across concurrent logins.
-                let used_key = format!("2fa:totp-used:{counter}");
-                let ttl = STEP * (2 * DRIFT + 2);
-                if store.set_nx_ex(&used_key, "1", ttl).await.unwrap_or(false) {
+                // Recheck the current enabled flag and verified secret in the
+                // same script that claims the existing replay marker.
+                if confirm_totp(store, name, secret, counter).await? {
                     return Ok(true);
                 }
             }
@@ -252,13 +260,28 @@ async fn check_second_factor_at(
     ))
 }
 
+async fn confirm_totp(
+    store: &AdminStore,
+    name: &str,
+    secret: &str,
+    counter: u64,
+) -> Result<bool, crate::AdminResponse> {
+    store.claim_totp(name, secret, counter, STEP * (2 * DRIFT + 2))
+        .await.map_err(|_| internal())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Production intentionally shares counter markers across secret rotations.
+    // Serialize Redis login tests that exercise that global marker namespace.
+    static LOGIN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
     async fn recovery_login_concurrency() {
+        let _guard = LOGIN_TEST_LOCK.lock().await;
         let store = AdminStore::connect(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
         let name = &format!("test:2fa:{}", util::random_hex(16));
         let a = util::argon2_hash_async("recovery-a").await.unwrap();
@@ -290,6 +313,63 @@ mod tests {
         let totp = json!({"code": hotp(&secret, counter).unwrap()});
         assert!(matches!(check_second_factor_at(&store, &totp, name).await, Ok(true)));
         store.del(&format!("2fa:totp-used:{counter}")).await.unwrap();
+        store.del(name).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CAP_TEST_REDIS_URL pointing to an isolated Redis"]
+    async fn totp_state_and_login() {
+        let _guard = LOGIN_TEST_LOCK.lock().await;
+        let store = AdminStore::connect(&std::env::var("CAP_TEST_REDIS_URL").unwrap()).await.unwrap();
+        let name = &format!("test:totp-state:{}", util::random_hex(16));
+        let empty = json!({});
+        assert!(matches!(check_second_factor_at(&store, &empty, name).await, Ok(true)));
+        let secret = new_secret();
+        store.hset_pairs(name, &[("totpPending", secret.clone())]).await.unwrap();
+        assert!(matches!(check_second_factor_at(&store, &empty, name).await, Ok(true)));
+        for field in ["totpSecret", "recovery", "recoveryVersion"] {
+            store.hset_pairs(name, &[(field, "".into())]).await.unwrap();
+            assert_eq!(check_second_factor_at(&store, &empty, name).await.err().unwrap().status, 500);
+            store.hdel_fields(name, &[field]).await.unwrap();
+        }
+        for flag in ["", "TRUE", "0", "garbage", "true"] {
+            store.hset_pairs(name, &[("totpEnabled", flag.into())]).await.unwrap();
+            assert_eq!(check_second_factor_at(&store, &empty, name).await.err().unwrap().status, 500);
+        }
+        for bad in ["", "invalid base32"] {
+            store.hset_pairs(name, &[("totpSecret", bad.into())]).await.unwrap();
+            assert_eq!(check_second_factor_at(&store, &empty, name).await.err().unwrap().status, 500);
+        }
+        store.hset_pairs(name, &[("totpEnabled", "false".into()), ("recovery", "legacy".into())]).await.unwrap();
+        assert!(matches!(check_second_factor_at(&store, &empty, name).await, Ok(true)));
+        // Use the real publication primitive for initial pending -> enabled.
+        assert!(store.publish_totp(name, &secret, "[]").await.unwrap());
+        assert_eq!(check_second_factor_at(&store, &empty, name).await.err().unwrap().status, 401);
+        let counter = (util::now_secs() / STEP) as u64;
+        let code = json!({"code": hotp(&secret, counter).unwrap()});
+        let (a, b) = tokio::join!(check_second_factor_at(&store, &code, name), check_second_factor_at(&store, &code, name));
+        assert_ne!(matches!(a, Ok(true)), matches!(b, Ok(true)));
+        assert_eq!(check_second_factor_at(&store, &code, name).await.err().unwrap().status, 401);
+        // Six-digit codes can collide across counters; pick an expired code
+        // that is not coincidentally also valid in today's acceptance window.
+        let expired_code = (10..100).map(|age| hotp(&secret, counter - age).unwrap())
+            .find(|code| !verify(&secret, code)).unwrap();
+        let expired = json!({"code": expired_code});
+        assert_eq!(check_second_factor_at(&store, &expired, name).await.err().unwrap().status, 401);
+        store.del(&format!("2fa:totp-used:{counter}")).await.unwrap();
+        // Pause the production flow after code verification, then complete
+        // rotation/disable before resuming the atomic confirmation.
+        let verified_counter = matching_counter(&secret, code["code"].as_str().unwrap()).unwrap();
+        store.hset_pairs(name, &[("totpPending", new_secret())]).await.unwrap();
+        let pending = store.hget(name, "totpPending").await.unwrap().unwrap();
+        assert!(store.publish_totp(name, &pending, "[]").await.unwrap());
+        assert!(matches!(confirm_totp(&store, name, &secret, verified_counter).await, Ok(false)));
+        assert!(!store.exists(&format!("2fa:totp-used:{verified_counter}")).await.unwrap());
+        store.del(name).await.unwrap();
+        assert!(matches!(confirm_totp(&store, name, &pending, verified_counter).await, Ok(false)));
+        store.set(name, "wrong type").await.unwrap();
+        assert_eq!(confirm_totp(&store, name, &pending, verified_counter).await.err().unwrap().status, 500);
+        assert_eq!(check_second_factor_at(&store, &empty, name).await.err().unwrap().status, 500);
         store.del(name).await.unwrap();
     }
 
