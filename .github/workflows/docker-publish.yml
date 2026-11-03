@@ -56,7 +56,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          push: true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.source=https://github.com/xiaocongyu66/CapPlus
             org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
