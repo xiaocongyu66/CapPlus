@@ -97,20 +97,15 @@ pub(crate) async fn redeem(
     }
     // Typed credential extraction rejects duplicate credential fields rather
     // than letting a JSON map silently choose the last value.
-    #[derive(serde::Deserialize)]
-    struct CredentialInput {
-        #[serde(rename = "businessToken")]
-        business_token: String,
-    }
-    let Ok(credential_input) = serde_json::from_slice::<CredentialInput>(&body) else {
-        return crate::business::failure(StatusCode::BAD_REQUEST, "business_token_required");
-    };
-    if credential_input.business_token.len() > cap_core::business::MAX_BUSINESS_TOKEN_BYTES {
-        return crate::business::failure(StatusCode::BAD_REQUEST, "invalid_business_token");
-    }
     let Ok(payload) = parse_redeem_body(&body) else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_body"}))).into_response();
     };
+    let Some(credential) = payload.get("businessToken").and_then(Value::as_str) else {
+        return crate::business::failure(StatusCode::BAD_REQUEST, "business_token_required");
+    };
+    if credential.len() > cap_core::business::MAX_BUSINESS_TOKEN_BYTES {
+        return crate::business::failure(StatusCode::BAD_REQUEST, "invalid_business_token");
+    }
     let token = payload.get("token").and_then(Value::as_str).unwrap_or("");
     if token.is_empty() || token.len() > 512 * 1024 {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing_token"}))).into_response();
@@ -155,9 +150,6 @@ pub(crate) async fn redeem(
     {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "scope_mismatch"}))).into_response();
     }
-    let Some(credential) = payload.get("businessToken").and_then(Value::as_str) else {
-        return crate::business::failure(StatusCode::BAD_REQUEST, "business_token_required");
-    };
     let business = match crate::business::checked_credential(&st, &site_key, &key.jwt_secret, credential).await {
         Ok(claims) => claims,
         Err(response) => return *response,
@@ -713,6 +705,28 @@ mod tests {
         assert!(super::parse_redeem_body(deep.as_bytes()).is_err());
         let shallow = format!("{{\"x\":{}0{}}}", "[".repeat(16), "]".repeat(16));
         assert!(super::parse_redeem_body(shallow.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn strict_parse_is_the_only_business_token_source() {
+        let body = br#"{"token":"t","solutions":[1],"businessToken":"credential"}"#;
+        let payload = super::parse_redeem_body(body).unwrap();
+        assert_eq!(payload.get("businessToken").and_then(serde_json::Value::as_str), Some("credential"));
+        for body in [
+            br#"{"token":"t","solutions":[1]}"#.as_slice(),
+            br#"{"token":"t","solutions":[1],"businessToken":null}"#,
+            br#"{"token":"t","solutions":[1],"businessToken":42}"#,
+            br#"{"token":"t","solutions":[1],"businessToken":["x"]}"#,
+            br#"{"businessToken":"a","businessToken":"a"}"#,
+            br#"{"businessToken":"a","nested":{"businessToken":"x","businessToken":"y"}}"#,
+        ] {
+            // Missing/non-string credentials must not be readable from the
+            // lenient duplicate-tolerant serde_json::Value parser alone.
+            let credential = super::parse_redeem_body(body)
+                .ok()
+                .and_then(|p| p.get("businessToken").and_then(serde_json::Value::as_str).map(str::len));
+            assert!(credential.is_none() || serde_json::from_slice::<serde_json::Value>(body).is_err());
+        }
     }
 
     #[tokio::test]
