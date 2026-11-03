@@ -7,7 +7,6 @@ COPY crates ./crates
 COPY frontend ./frontend
 COPY widget-dist ./widget-dist
 COPY widget-source/package.json widget-source/bun.lock widget-source/_build_only.mjs ./widget-source/
-COPY wasm-source/src/rust/Cargo.toml ./wasm-source/src/rust/
 # Widget-node_modules is not present here, so build.rs embeds the tracked,
 # CI-tested widget-dist artifacts instead of rebuilding them.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
