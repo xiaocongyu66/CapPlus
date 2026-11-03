@@ -1,0 +1,117 @@
+name: Publish Docker image
+
+# Only runs after Linux CI succeeded for this exact main commit, so untested
+# code is never published. Pull requests do not trigger publishing.
+on:
+  workflow_run:
+    workflows: ["Linux CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/xiaocongyu66/capplus
+
+jobs:
+  publish:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      # Check out the commit CI verified, not whatever main points to now.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push per-architecture image by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/xiaocongyu66/CapPlus
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+            org.opencontainers.image.title=CapPlus cap-server
+          cache-from: type=gha,scope=publish-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=publish-${{ matrix.platform }}
+      - name: Record platform digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          test -n "$DIGEST"
+          printf '%s %s\n' "$PLATFORM" "$DIGEST" > "digest-${PLATFORM//\//-}.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: digest-*.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-architecture manifest
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          refs=()
+          for file in digests/digest-*.txt; do
+            read -r platform digest < "$file"
+            test -n "$platform" && test -n "$digest"
+            refs+=("$IMAGE@$digest")
+          done
+          test "${#refs[@]}" -eq 2
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" \
+            --tag "$IMAGE:sha-${SHA:0:7}" \
+            "${refs[@]}"
+          docker buildx imagetools inspect "$IMAGE:sha-${SHA:0:7}"

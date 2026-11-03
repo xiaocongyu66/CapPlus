@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: read
+# Publishing is a separate workflow so pull requests and forks never receive
+# packages or id-token write access, and only tested commits can be tagged.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
