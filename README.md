@@ -40,6 +40,31 @@ cappro/
 Storage is Redis (`storage.redis_url` in config.toml, else `REDIS_URL`,
 default `redis://127.0.0.1:6379`).
 
+### Docker
+
+```bash
+docker network create cap-net
+docker run -d --name cap-redis --network cap-net redis:7-alpine
+docker build -t cap-server .
+docker run -d --name cap \
+  --network cap-net \
+  -p 3000:3000 \
+  -v cap-data:/data \
+  -e REDIS_URL=redis://cap-redis:6379/0 \
+  cap-server
+```
+
+Use a password-protected or externally managed Redis for production; the URL
+host must match the Redis container name on the shared network.
+
+The image embeds the tracked, CI-tested `widget-dist` artifacts and the
+`frontend/` dashboard, runs as a non-root user (uid 10001), keeps all state in
+the `/data` volume (`CAPPRO_DIR`), and exposes `/health/live` as its health
+check. Redis is not bundled: pass `REDIS_URL` to a Redis 7+ instance reachable
+from the container (a Redis container on the same Docker network works, e.g.
+`REDIS_URL=redis://redis:6379/0`). The image is Debian bookworm (glibc) based, not static.
+CI builds both `linux/amd64` and `linux/arm64` images without pushing them.
+
 ### Reverse proxy: Caddy / Traefik / nginx
 
 建议设置 `CAP_TRUST_PROXY=true` 和 `CAP_PROXY_SECRET=<random>`，并让反代覆盖

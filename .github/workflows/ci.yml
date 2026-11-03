@@ -180,3 +180,76 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+  docker:
+    name: Docker image / ${{ matrix.platform }}
+    needs: [rust-test, browser-test]
+    # Native runner per architecture: no QEMU emulation of the Rust toolchain.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            output: cap-server-image-amd64.tar
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            output: cap-server-image-arm64.tar
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # Build only: no registry login or push. The same Dockerfile also builds
+      # locally with `docker build`; it embeds versioned widget-dist artifacts.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: cap-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Owned Redis for the container smoke test
+        run: |
+          docker network create cap-ci-net
+          docker run --detach --name cap-ci-redis --network cap-ci-net \
+            redis:7-alpine redis-server --save '' --appendonly no
+          for _ in $(seq 1 50); do
+            docker exec cap-ci-redis redis-cli ping 2>/dev/null | grep -qx PONG && break
+            sleep .2
+          done
+          docker exec cap-ci-redis redis-cli ping | grep -qx PONG
+      - name: Smoke-test container health and image contract
+        run: |
+          docker run --detach --name cap-ci --network cap-ci-net -p 127.0.0.1::3000 \
+            -e REDIS_URL="redis://cap-ci-redis:6379/0" \
+            --health-cmd='curl --fail --silent --show-error http://127.0.0.1:3000/health/live' \
+            --health-interval=2s --health-retries=15 --health-start-period=5s cap-server:ci
+          for _ in $(seq 1 60); do
+            state=$(docker inspect --format '{{.State.Health.Status}}' cap-ci)
+            [ "$state" = healthy ] && break
+            [ "$state" = unhealthy ] && { docker logs cap-ci; exit 1; }
+            sleep 2
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' cap-ci)" = healthy
+          docker exec cap-ci id -u | grep -qx 10001
+          docker exec cap-ci test -x /usr/local/bin/cap-server
+          docker exec cap-ci test -d /data
+          docker stop cap-ci
+      - name: Stop owned containers
+        if: always()
+        run: |
+          docker rm --force cap-ci cap-ci-redis 2>/dev/null || true
+          docker network rm cap-ci-net 2>/dev/null || true
+      - name: Export image for verification
+        run: docker save cap-server:ci -o "${{ matrix.output }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cap-server-docker-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: ${{ matrix.output }}
+          if-no-files-found: error
+          retention-days: 7
